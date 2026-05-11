@@ -1,8 +1,15 @@
 mod cpu;
+#[cfg(feature = "gpu")]
+mod gpu;
+
+#[cfg(test)]
+pub(crate) mod tests;
 
 use crate::Result;
 
 pub use cpu::{CpuDevice, CpuTensor};
+#[cfg(feature = "gpu")]
+pub use gpu::{GpuAdapterSelector, GpuDevice, GpuTensor};
 
 pub trait Tensor: Sized + Clone {
     type Device: Clone;

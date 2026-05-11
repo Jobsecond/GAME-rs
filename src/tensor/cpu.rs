@@ -953,179 +953,55 @@ fn erf_approx(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{CpuDevice, CpuTensor};
-    use crate::tensor::Tensor;
-
-    fn tensor(shape: &[usize], data: &[f32]) -> CpuTensor {
-        CpuTensor::from_data(data, shape, &CpuDevice).expect("tensor should build")
-    }
-
-    fn assert_close(actual: &[f32], expected: &[f32]) {
-        assert_eq!(
-            actual.len(),
-            expected.len(),
-            "length mismatch: actual={actual:?} expected={expected:?}"
-        );
-        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
-            let diff = (actual - expected).abs();
-            assert!(
-                diff <= 1e-4,
-                "value mismatch at index {index}: actual={actual} expected={expected} diff={diff}"
-            );
-        }
-    }
-
-    fn assert_tensor(tensor: &CpuTensor, shape: &[usize], expected: &[f32]) {
-        assert_eq!(tensor.shape(), shape);
-        let actual = tensor.to_vec().expect("export should succeed");
-        assert_close(&actual, expected);
-    }
+    use crate::tensor::tests;
 
     #[test]
     fn layout_ops_preserve_view_semantics() {
-        let base = tensor(&[3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let head = base.clone().slice(0, 0, 1).unwrap();
-        let tail = base.clone().slice(0, 1, 3).unwrap();
-        let transposed = tail.clone().transpose(0, 1).unwrap();
-        let compact = transposed.clone().contiguous().unwrap();
-        let reshaped = compact.reshape(&[4]).unwrap();
-        let joined = CpuTensor::concat(&[&head, &tail], 0).unwrap();
-
-        assert_tensor(&tail, &[2, 2], &[3.0, 4.0, 5.0, 6.0]);
-        assert_tensor(&transposed, &[2, 2], &[3.0, 5.0, 4.0, 6.0]);
-        assert_tensor(&reshaped, &[4], &[3.0, 5.0, 4.0, 6.0]);
-        assert_tensor(&joined, &[3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        tests::run_layout_ops_preserve_view_semantics::<CpuTensor>(&CpuDevice);
     }
 
     #[test]
     fn broadcast_add_and_mul_match_expected_values() {
-        let lhs = tensor(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let rhs = tensor(&[3], &[10.0, 20.0, 30.0]);
-        let mul = tensor(&[3], &[1.0, 2.0, 3.0]);
-
-        let added = lhs.clone().add(&rhs).unwrap();
-        let multiplied = lhs.mul(&mul).unwrap();
-
-        assert_tensor(&added, &[2, 3], &[11.0, 22.0, 33.0, 14.0, 25.0, 36.0]);
-        assert_tensor(&multiplied, &[2, 3], &[1.0, 4.0, 9.0, 4.0, 10.0, 18.0]);
+        tests::run_broadcast_add_and_mul_match_expected_values::<CpuTensor>(&CpuDevice);
     }
 
     #[test]
     fn matmul_supports_2d_and_batched_3d_inputs() {
-        let lhs = tensor(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let rhs = tensor(&[3, 2], &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
-        let product = lhs.matmul(&rhs).unwrap();
-        assert_tensor(&product, &[2, 2], &[58.0, 64.0, 139.0, 154.0]);
-
-        let batched_lhs = tensor(&[2, 2, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-        let batched_rhs = tensor(&[2, 2, 1], &[10.0, 20.0, 30.0, 40.0]);
-        let batched = batched_lhs.matmul(&batched_rhs).unwrap();
-        assert_tensor(&batched, &[2, 2, 1], &[50.0, 110.0, 390.0, 530.0]);
+        tests::run_matmul_supports_2d_and_batched_3d_inputs::<CpuTensor>(&CpuDevice);
     }
 
     #[test]
     fn linear_applies_weight_rows_and_optional_bias() {
-        let x = tensor(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let weight = tensor(
-            &[4, 3],
-            &[
-                1.0, 0.0, 0.0, //
-                0.0, 1.0, 0.0, //
-                0.0, 0.0, 1.0, //
-                1.0, 1.0, 1.0,
-            ],
-        );
-        let bias = tensor(&[4], &[0.5, -0.5, 1.0, 2.0]);
-
-        let out = x.linear(&weight, Some(&bias)).unwrap();
-        assert_tensor(&out, &[2, 4], &[1.5, 1.5, 4.0, 8.0, 4.5, 4.5, 7.0, 17.0]);
+        tests::run_linear_applies_weight_rows_and_optional_bias::<CpuTensor>(&CpuDevice);
     }
 
     #[test]
     fn normalization_and_activation_ops_match_reference_values() {
-        let norm_x = tensor(&[2, 2], &[1.0, 2.0, 3.0, 4.0]);
-        let norm_weight = tensor(&[2], &[1.0, 2.0]);
-        let normed = norm_x.rms_norm(&norm_weight, 0.0).unwrap();
-        assert_tensor(
-            &normed,
-            &[2, 2],
-            &[0.6324555, 2.529822, 0.84852815, 2.2627418],
-        );
-
-        let sigmoid = tensor(&[3], &[-1.0, 0.0, 1.0]).sigmoid().unwrap();
-        assert_tensor(&sigmoid, &[3], &[0.26894143, 0.5, 0.7310586]);
-
-        let gelu = tensor(&[3], &[-1.0, 0.0, 1.0]).gelu().unwrap();
-        assert_tensor(&gelu, &[3], &[-0.15865529, 0.0, 0.8413447]);
-
-        let softmax = tensor(&[2, 2], &[1.0, 2.0, 3.0, 4.0]).softmax(-1).unwrap();
-        assert_tensor(
-            &softmax,
-            &[2, 2],
-            &[0.26894143, 0.7310586, 0.26894143, 0.7310586],
-        );
+        tests::run_normalization_and_activation_ops_match_reference_values::<CpuTensor>(&CpuDevice);
     }
 
     #[test]
     fn rope_rotates_each_head_using_global_positions() {
-        let x = tensor(&[1, 2, 4], &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0]);
-        let y = x.rope(&[0, 1], 4, 1, 4, 10_000.0).unwrap();
-
-        let expected = vec![
-            1.0,
-            0.0,
-            0.0,
-            1.0,
-            1.0f32.cos(),
-            1.0f32.sin(),
-            -0.01f32.sin(),
-            0.01f32.cos(),
-        ];
-        assert_tensor(&y, &[1, 2, 4], &expected);
+        tests::run_rope_rotates_each_head_using_global_positions::<CpuTensor>(&CpuDevice);
     }
 
     #[test]
     fn region_rope_splits_global_and_region_rotation_halves() {
-        let x = tensor(&[1, 2, 4], &[1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]);
-        let y = x.region_rope(&[0, 1], &[2, 3], 4, 1, 4, 10_000.0).unwrap();
-
-        let expected = vec![
-            1.0,
-            0.0,
-            2.0f32.cos(),
-            2.0f32.sin(),
-            1.0f32.cos(),
-            1.0f32.sin(),
-            3.0f32.cos(),
-            3.0f32.sin(),
-        ];
-        assert_tensor(&y, &[1, 2, 4], &expected);
+        tests::run_region_rope_splits_global_and_region_rotation_halves::<CpuTensor>(&CpuDevice);
     }
 
     #[test]
     fn depthwise_conv_applies_per_channel_kernels() {
-        let input = tensor(&[4, 2], &[1.0, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0]);
-        let kernel = tensor(&[2, 3], &[1.0, 0.0, -1.0, 1.0, 1.0, 1.0]);
-        let bias = tensor(&[2], &[1.0, -1.0]);
-
-        let out = input.conv1d_dw(&kernel, Some(&bias), 1, 1).unwrap();
-        assert_tensor(
-            &out,
-            &[4, 2],
-            &[-1.0, 29.0, -1.0, 59.0, -1.0, 89.0, 4.0, 69.0],
-        );
+        tests::run_depthwise_conv_applies_per_channel_kernels::<CpuTensor>(&CpuDevice);
     }
 
     #[test]
     fn embedding_and_repeat_return_expected_rows() {
-        let table = tensor(&[3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let embedded = CpuTensor::embedding(&table, &[2, 0]).unwrap();
-        assert_tensor(&embedded, &[2, 2], &[5.0, 6.0, 1.0, 2.0]);
+        tests::run_embedding_and_repeat_return_expected_rows::<CpuTensor>(&CpuDevice);
+    }
 
-        let repeated = embedded.repeat(0, 3).unwrap();
-        assert_tensor(
-            &repeated,
-            &[6, 2],
-            &[5.0, 6.0, 1.0, 2.0, 5.0, 6.0, 1.0, 2.0, 5.0, 6.0, 1.0, 2.0],
-        );
+    #[test]
+    fn roundtrip_matches_uploaded_values() {
+        tests::run_roundtrip::<CpuTensor>(&CpuDevice);
     }
 }

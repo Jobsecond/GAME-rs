@@ -3,8 +3,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand, ValueEnum};
-use game_crabml::{BackboneConfig, Error, LoadedGgufModel, LoadedTensor, Result, load_gguf};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use game_crabml::{
+    BackboneConfig, Error, GpuAdapterSelector, LoadedGgufModel, LoadedTensor, Result, load_gguf,
+};
 use serde_json::{Map, Value, json};
 
 #[derive(Debug, Parser)]
@@ -37,7 +39,22 @@ enum Command {
         output: PathBuf,
 
         input: PathBuf,
+
+        #[command(flatten)]
+        gpu: GpuSelectorArgs,
     },
+}
+
+#[derive(Debug, Args, Default, Clone)]
+struct GpuSelectorArgs {
+    #[arg(long = "gpu-name")]
+    gpu_name: Option<String>,
+
+    #[arg(long = "gpu-vendor-id", value_parser = parse_u32_auto)]
+    gpu_vendor_id: Option<u32>,
+
+    #[arg(long = "gpu-device-id", value_parser = parse_u32_auto)]
+    gpu_device_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -70,11 +87,13 @@ fn run() -> Result<()> {
             model,
             output,
             input,
+            gpu,
         } => Err(Error::message(format!(
-            "`extract` is not implemented yet. Phase 1 currently supports GGUF inspection only. model={}, output={}, input={}",
+            "`extract` is not implemented yet. Phase 1 currently supports GGUF inspection only. model={}, output={}, input={}, gpu={}",
             model.display(),
             output.display(),
-            input.display()
+            input.display(),
+            describe_gpu_selector(&gpu.into_selector())
         ))),
     }
 }
@@ -576,4 +595,65 @@ fn format_bytes(bytes: u64) -> String {
 
 fn display_or_dash(value: &str) -> &str {
     if value.is_empty() { "-" } else { value }
+}
+
+fn parse_u32_auto(value: &str) -> std::result::Result<u32, String> {
+    let value = value.trim();
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16).map_err(|err| format!("invalid hex value `{value}`: {err}"))
+    } else {
+        value
+            .parse::<u32>()
+            .map_err(|err| format!("invalid integer value `{value}`: {err}"))
+    }
+}
+
+impl GpuSelectorArgs {
+    fn into_selector(self) -> Option<GpuAdapterSelector> {
+        if self.gpu_name.is_none() && self.gpu_vendor_id.is_none() && self.gpu_device_id.is_none() {
+            return None;
+        }
+
+        Some(GpuAdapterSelector {
+            name_substring: self.gpu_name,
+            vendor_id: self.gpu_vendor_id,
+            device_id: self.gpu_device_id,
+            backend: None,
+            device_type: None,
+        })
+    }
+}
+
+fn describe_gpu_selector(selector: &Option<GpuAdapterSelector>) -> String {
+    match selector {
+        None => "none".to_owned(),
+        Some(selector) => {
+            let mut parts = Vec::new();
+            if let Some(name) = selector.name_substring.as_deref() {
+                parts.push(format!("name={name}"));
+            }
+            if let Some(vendor_id) = selector.vendor_id {
+                parts.push(format!("vendor=0x{vendor_id:04x}"));
+            }
+            if let Some(device_id) = selector.device_id {
+                parts.push(format!("device=0x{device_id:04x}"));
+            }
+            parts.join(", ")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_u32_auto;
+
+    #[test]
+    fn parse_u32_auto_accepts_decimal_and_hex() {
+        assert_eq!(parse_u32_auto("1234").unwrap(), 1234);
+        assert_eq!(parse_u32_auto("0x10de").unwrap(), 0x10de);
+        assert_eq!(parse_u32_auto("0X2484").unwrap(), 0x2484);
+    }
 }
