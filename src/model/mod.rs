@@ -75,6 +75,11 @@ impl Model {
         self.inner.config()
     }
 
+    #[cfg(feature = "gpu")]
+    pub fn gpu_adapter_info(&self) -> Option<wgpu::AdapterInfo> {
+        self.inner.gpu_adapter_info()
+    }
+
     pub fn infer(&self, waveform: &[f32], params: &InferParams) -> Result<InferResult> {
         let seed = if params.seed == 0 {
             random::<u64>()
@@ -145,6 +150,14 @@ impl ModelDispatch {
             Self::Cpu(inner) => inner.config(),
             #[cfg(feature = "gpu")]
             Self::Gpu(inner) => inner.config(),
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn gpu_adapter_info(&self) -> Option<wgpu::AdapterInfo> {
+        match self {
+            Self::Cpu(_) => None,
+            Self::Gpu(inner) => Some(inner.device.adapter_info().clone()),
         }
     }
 

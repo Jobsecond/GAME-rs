@@ -14,9 +14,13 @@ struct LayoutParams {
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
 @group(0) @binding(2) var<storage, read> params: LayoutParams;
 
+fn flat_index(gid: vec3<u32>) -> u32 {
+    return gid.x + gid.y * 65535u * 64u;
+}
+
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let flat = gid.x;
+    let flat = flat_index(gid);
     if (flat >= params.out_len) {
         return;
     }

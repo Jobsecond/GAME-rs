@@ -353,6 +353,7 @@ dependencies = [
  "pollster",
  "rand",
  "rand_mt",
+ "rayon",
  "realfft",
  "serde_json",
  "wgpu",

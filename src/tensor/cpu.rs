@@ -1,6 +1,8 @@
 use std::f32::consts::SQRT_2;
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use crate::{Error, Result};
 
 use super::Tensor;
@@ -80,12 +82,16 @@ impl CpuTensor {
                 .sum::<usize>()
     }
 
-    fn unary_op(self, op_name: &str, mut f: impl FnMut(f32) -> f32) -> Result<Self> {
+    fn unary_op(self, op_name: &str, f: impl Fn(f32) -> f32 + Send + Sync) -> Result<Self> {
         let shape = self.shape.clone();
         let device = self.device.clone();
         let mut data = self.into_contiguous_vec()?;
-        for value in &mut data {
-            *value = f(*value);
+        if should_parallelize(data.len()) {
+            data.par_iter_mut().for_each(|value| *value = f(*value));
+        } else {
+            for value in &mut data {
+                *value = f(*value);
+            }
         }
         Self::from_owned(data, shape, device)
             .map_err(|err| Error::message(format!("failed to build result for {op_name}: {err}")))
@@ -95,7 +101,7 @@ impl CpuTensor {
         self,
         rhs: &Self,
         op_name: &str,
-        mut f: impl FnMut(f32, f32) -> f32,
+        f: impl Fn(f32, f32) -> f32 + Send + Sync,
     ) -> Result<Self> {
         let lhs_shape = self.shape.clone();
         let lhs_strides = contiguous_strides(&lhs_shape);
@@ -110,11 +116,17 @@ impl CpuTensor {
         let mut out = vec![0.0; checked_num_elements(&out_shape)?];
         let out_rank = out_shape.len();
 
-        for_each_index(&out_shape, |coords, flat| {
-            let lhs_index = broadcast_offset(coords, &lhs_shape, &lhs_strides, out_rank);
-            let rhs_index = broadcast_offset(coords, &rhs_shape, &rhs_strides, out_rank);
-            out[flat] = f(lhs_data[lhs_index], rhs_data[rhs_index]);
-        });
+        if lhs_shape == out_shape && rhs_shape == out_shape && should_parallelize(out.len()) {
+            out.par_iter_mut().enumerate().for_each(|(flat, value)| {
+                *value = f(lhs_data[flat], rhs_data[flat]);
+            });
+        } else {
+            for_each_index(&out_shape, |coords, flat| {
+                let lhs_index = broadcast_offset(coords, &lhs_shape, &lhs_strides, out_rank);
+                let rhs_index = broadcast_offset(coords, &rhs_shape, &rhs_strides, out_rank);
+                out[flat] = f(lhs_data[lhs_index], rhs_data[rhs_index]);
+            });
+        }
 
         Self::from_owned(out, out_shape, device)
             .map_err(|err| Error::message(format!("failed to build result for {op_name}: {err}")))
@@ -348,13 +360,27 @@ impl Tensor for CpuTensor {
                 }
 
                 let mut out = vec![0.0; m * n];
-                for row in 0..m {
-                    for col in 0..n {
-                        let mut sum = 0.0;
-                        for kk in 0..k {
-                            sum += lhs[row * k + kk] * rhs_data[kk * n + col];
+                if should_parallelize(out.len()) && n > 0 {
+                    out.par_chunks_mut(n)
+                        .enumerate()
+                        .for_each(|(row, out_row)| {
+                            for (col, value) in out_row.iter_mut().enumerate() {
+                                let mut sum = 0.0;
+                                for kk in 0..k {
+                                    sum += lhs[row * k + kk] * rhs_data[kk * n + col];
+                                }
+                                *value = sum;
+                            }
+                        });
+                } else {
+                    for row in 0..m {
+                        for col in 0..n {
+                            let mut sum = 0.0;
+                            for kk in 0..k {
+                                sum += lhs[row * k + kk] * rhs_data[kk * n + col];
+                            }
+                            out[row * n + col] = sum;
                         }
-                        out[row * n + col] = sum;
                     }
                 }
                 Self::from_owned(out, vec![m, n], device)
@@ -370,17 +396,35 @@ impl Tensor for CpuTensor {
                 }
 
                 let mut out = vec![0.0; batch * m * n];
-                for b in 0..batch {
-                    for row in 0..m {
-                        for col in 0..n {
-                            let mut sum = 0.0;
-                            for kk in 0..k {
-                                let lhs_index = (b * m + row) * k + kk;
-                                let rhs_index = (b * rhs_k + kk) * n + col;
-                                sum += lhs[lhs_index] * rhs_data[rhs_index];
+                if should_parallelize(out.len()) && n > 0 {
+                    out.par_chunks_mut(n)
+                        .enumerate()
+                        .for_each(|(row_index, out_row)| {
+                            let b = row_index / m;
+                            let row = row_index % m;
+                            for (col, value) in out_row.iter_mut().enumerate() {
+                                let mut sum = 0.0;
+                                for kk in 0..k {
+                                    let lhs_index = (b * m + row) * k + kk;
+                                    let rhs_index = (b * rhs_k + kk) * n + col;
+                                    sum += lhs[lhs_index] * rhs_data[rhs_index];
+                                }
+                                *value = sum;
                             }
-                            let out_index = (b * m + row) * n + col;
-                            out[out_index] = sum;
+                        });
+                } else {
+                    for b in 0..batch {
+                        for row in 0..m {
+                            for col in 0..n {
+                                let mut sum = 0.0;
+                                for kk in 0..k {
+                                    let lhs_index = (b * m + row) * k + kk;
+                                    let rhs_index = (b * rhs_k + kk) * n + col;
+                                    sum += lhs[lhs_index] * rhs_data[rhs_index];
+                                }
+                                let out_index = (b * m + row) * n + col;
+                                out[out_index] = sum;
+                            }
                         }
                     }
                 }
@@ -430,15 +474,33 @@ impl Tensor for CpuTensor {
         let bias_data = bias.map(CpuTensor::to_vec).transpose()?;
         let mut out = vec![0.0; rows * out_dim];
 
-        for row in 0..rows {
-            for out_idx in 0..out_dim {
-                let mut sum = bias_data
-                    .as_ref()
-                    .map_or(0.0, |bias_values| bias_values[out_idx]);
-                for in_idx in 0..in_dim {
-                    sum += input[row * in_dim + in_idx] * weight_data[out_idx * in_dim + in_idx];
+        if should_parallelize(out.len()) && out_dim > 0 {
+            out.par_chunks_mut(out_dim)
+                .enumerate()
+                .for_each(|(row, out_row)| {
+                    for (out_idx, value) in out_row.iter_mut().enumerate() {
+                        let mut sum = bias_data
+                            .as_ref()
+                            .map_or(0.0, |bias_values| bias_values[out_idx]);
+                        for in_idx in 0..in_dim {
+                            sum += input[row * in_dim + in_idx]
+                                * weight_data[out_idx * in_dim + in_idx];
+                        }
+                        *value = sum;
+                    }
+                });
+        } else {
+            for row in 0..rows {
+                for out_idx in 0..out_dim {
+                    let mut sum = bias_data
+                        .as_ref()
+                        .map_or(0.0, |bias_values| bias_values[out_idx]);
+                    for in_idx in 0..in_dim {
+                        sum +=
+                            input[row * in_dim + in_idx] * weight_data[out_idx * in_dim + in_idx];
+                    }
+                    out[row * out_dim + out_idx] = sum;
                 }
-                out[row * out_dim + out_idx] = sum;
             }
         }
 
@@ -470,16 +532,27 @@ impl Tensor for CpuTensor {
             return Self::from_owned(data, shape, device);
         }
 
-        let rows = data.len() / feature_dim;
-        for row in 0..rows {
-            let row_start = row * feature_dim;
-            let row_end = row_start + feature_dim;
-            let row_slice = &mut data[row_start..row_end];
-            let mean_square =
-                row_slice.iter().map(|value| value * value).sum::<f32>() / feature_dim as f32;
-            let inv_rms = 1.0 / (mean_square + eps).sqrt();
-            for (value, scale) in row_slice.iter_mut().zip(&weight_data) {
-                *value *= inv_rms * scale;
+        if should_parallelize(data.len()) {
+            data.par_chunks_mut(feature_dim).for_each(|row_slice| {
+                let mean_square =
+                    row_slice.iter().map(|value| value * value).sum::<f32>() / feature_dim as f32;
+                let inv_rms = 1.0 / (mean_square + eps).sqrt();
+                for (value, scale) in row_slice.iter_mut().zip(&weight_data) {
+                    *value *= inv_rms * scale;
+                }
+            });
+        } else {
+            let rows = data.len() / feature_dim;
+            for row in 0..rows {
+                let row_start = row * feature_dim;
+                let row_end = row_start + feature_dim;
+                let row_slice = &mut data[row_start..row_end];
+                let mean_square =
+                    row_slice.iter().map(|value| value * value).sum::<f32>() / feature_dim as f32;
+                let inv_rms = 1.0 / (mean_square + eps).sqrt();
+                for (value, scale) in row_slice.iter_mut().zip(&weight_data) {
+                    *value *= inv_rms * scale;
+                }
             }
         }
 
@@ -511,28 +584,60 @@ impl Tensor for CpuTensor {
         let outer = plain_num_elements(&shape[..axis]);
         let inner = plain_num_elements(&shape[axis + 1..]);
 
-        for outer_index in 0..outer {
-            for inner_index in 0..inner {
-                let base = outer_index * axis_len * inner + inner_index;
-                let mut max_value = f32::NEG_INFINITY;
-                for axis_index in 0..axis_len {
-                    let value = data[base + axis_index * inner];
-                    if value > max_value {
-                        max_value = value;
+        if outer == 0 || inner == 0 {
+            return Self::from_owned(data, shape, device);
+        }
+
+        let outer_block = axis_len * inner;
+        if should_parallelize(data.len()) {
+            data.par_chunks_mut(outer_block).for_each(|outer_chunk| {
+                for inner_index in 0..inner {
+                    let mut max_value = f32::NEG_INFINITY;
+                    for axis_index in 0..axis_len {
+                        let value = outer_chunk[axis_index * inner + inner_index];
+                        if value > max_value {
+                            max_value = value;
+                        }
+                    }
+
+                    let mut sum = 0.0;
+                    for axis_index in 0..axis_len {
+                        let index = axis_index * inner + inner_index;
+                        let value = (outer_chunk[index] - max_value).exp();
+                        outer_chunk[index] = value;
+                        sum += value;
+                    }
+
+                    for axis_index in 0..axis_len {
+                        let index = axis_index * inner + inner_index;
+                        outer_chunk[index] /= sum;
                     }
                 }
+            });
+        } else {
+            for outer_index in 0..outer {
+                for inner_index in 0..inner {
+                    let base = outer_index * outer_block + inner_index;
+                    let mut max_value = f32::NEG_INFINITY;
+                    for axis_index in 0..axis_len {
+                        let value = data[base + axis_index * inner];
+                        if value > max_value {
+                            max_value = value;
+                        }
+                    }
 
-                let mut sum = 0.0;
-                for axis_index in 0..axis_len {
-                    let index = base + axis_index * inner;
-                    let value = (data[index] - max_value).exp();
-                    data[index] = value;
-                    sum += value;
-                }
+                    let mut sum = 0.0;
+                    for axis_index in 0..axis_len {
+                        let index = base + axis_index * inner;
+                        let value = (data[index] - max_value).exp();
+                        data[index] = value;
+                        sum += value;
+                    }
 
-                for axis_index in 0..axis_len {
-                    let index = base + axis_index * inner;
-                    data[index] /= sum;
+                    for axis_index in 0..axis_len {
+                        let index = base + axis_index * inner;
+                        data[index] /= sum;
+                    }
                 }
             }
         }
@@ -556,16 +661,32 @@ impl Tensor for CpuTensor {
         let mut data = self.into_contiguous_vec()?;
         let seq_len = shape[1];
 
-        for head in 0..num_heads {
-            for (token, position) in positions.iter().copied().enumerate() {
-                let base = (head * seq_len + token) * head_dim;
-                apply_rope_chunk(
-                    &mut data[base..base + head_dim],
-                    0,
-                    rope_dims,
-                    position as f32,
-                    theta,
-                );
+        let head_block = seq_len * head_dim;
+        if should_parallelize(data.len()) && head_block > 0 {
+            data.par_chunks_mut(head_block).for_each(|head_slice| {
+                for (token, position) in positions.iter().copied().enumerate() {
+                    let base = token * head_dim;
+                    apply_rope_chunk(
+                        &mut head_slice[base..base + head_dim],
+                        0,
+                        rope_dims,
+                        position as f32,
+                        theta,
+                    );
+                }
+            });
+        } else {
+            for head in 0..num_heads {
+                for (token, position) in positions.iter().copied().enumerate() {
+                    let base = (head * seq_len + token) * head_dim;
+                    apply_rope_chunk(
+                        &mut data[base..base + head_dim],
+                        0,
+                        rope_dims,
+                        position as f32,
+                        theta,
+                    );
+                }
             }
         }
 
@@ -597,12 +718,24 @@ impl Tensor for CpuTensor {
         let mut data = self.into_contiguous_vec()?;
         let seq_len = shape[1];
 
-        for head in 0..num_heads {
-            for token in 0..seq_len {
-                let base = (head * seq_len + token) * head_dim;
-                let head_slice = &mut data[base..base + head_dim];
-                apply_rope_chunk(head_slice, 0, half, global_pos[token] as f32, theta);
-                apply_rope_chunk(head_slice, half, half, region_ids[token] as f32, theta);
+        let head_block = seq_len * head_dim;
+        if should_parallelize(data.len()) && head_block > 0 {
+            data.par_chunks_mut(head_block).for_each(|head_slice| {
+                for token in 0..seq_len {
+                    let base = token * head_dim;
+                    let token_slice = &mut head_slice[base..base + head_dim];
+                    apply_rope_chunk(token_slice, 0, half, global_pos[token] as f32, theta);
+                    apply_rope_chunk(token_slice, half, half, region_ids[token] as f32, theta);
+                }
+            });
+        } else {
+            for head in 0..num_heads {
+                for token in 0..seq_len {
+                    let base = (head * seq_len + token) * head_dim;
+                    let head_slice = &mut data[base..base + head_dim];
+                    apply_rope_chunk(head_slice, 0, half, global_pos[token] as f32, theta);
+                    apply_rope_chunk(head_slice, half, half, region_ids[token] as f32, theta);
+                }
             }
         }
 
@@ -667,24 +800,49 @@ impl Tensor for CpuTensor {
         let bias_data = bias.map(CpuTensor::to_vec).transpose()?;
         let mut out = vec![0.0; out_time * channels];
 
-        for out_t in 0..out_time {
-            for channel in 0..channels {
-                let mut sum = bias_data
-                    .as_ref()
-                    .map_or(0.0, |bias_values| bias_values[channel]);
-                for kernel_index in 0..kernel_size {
-                    let input_index = out_t * stride + kernel_index;
-                    if input_index < padding {
-                        continue;
+        if should_parallelize(out.len()) && channels > 0 {
+            out.par_chunks_mut(channels)
+                .enumerate()
+                .for_each(|(out_t, out_row)| {
+                    for (channel, value) in out_row.iter_mut().enumerate() {
+                        let mut sum = bias_data
+                            .as_ref()
+                            .map_or(0.0, |bias_values| bias_values[channel]);
+                        for kernel_index in 0..kernel_size {
+                            let input_index = out_t * stride + kernel_index;
+                            if input_index < padding {
+                                continue;
+                            }
+                            let input_t = input_index - padding;
+                            if input_t >= time {
+                                continue;
+                            }
+                            sum += input[input_t * channels + channel]
+                                * kernel_data[channel * kernel_size + kernel_index];
+                        }
+                        *value = sum;
                     }
-                    let input_t = input_index - padding;
-                    if input_t >= time {
-                        continue;
+                });
+        } else {
+            for out_t in 0..out_time {
+                for channel in 0..channels {
+                    let mut sum = bias_data
+                        .as_ref()
+                        .map_or(0.0, |bias_values| bias_values[channel]);
+                    for kernel_index in 0..kernel_size {
+                        let input_index = out_t * stride + kernel_index;
+                        if input_index < padding {
+                            continue;
+                        }
+                        let input_t = input_index - padding;
+                        if input_t >= time {
+                            continue;
+                        }
+                        sum += input[input_t * channels + channel]
+                            * kernel_data[channel * kernel_size + kernel_index];
                     }
-                    sum += input[input_t * channels + channel]
-                        * kernel_data[channel * kernel_size + kernel_index];
+                    out[out_t * channels + channel] = sum;
                 }
-                out[out_t * channels + channel] = sum;
             }
         }
 
@@ -770,6 +928,10 @@ fn checked_num_elements(shape: &[usize]) -> Result<usize> {
 
 fn plain_num_elements(shape: &[usize]) -> usize {
     shape.iter().copied().product()
+}
+
+fn should_parallelize(len: usize) -> bool {
+    len >= 16_384 && rayon::current_num_threads() > 1
 }
 
 fn contiguous_strides(shape: &[usize]) -> Vec<usize> {

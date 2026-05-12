@@ -78,6 +78,14 @@ struct ExtractArgs {
     #[arg(long, default_value_t = 0)]
     seed: u64,
 
+    #[arg(
+        long = "max-chunk-seconds",
+        default_value_t = DEFAULT_MAX_CHUNK_SECONDS,
+        value_parser = parse_positive_usize,
+        help = "hard-split sliced audio chunks longer than this many seconds"
+    )]
+    max_chunk_seconds: usize,
+
     #[command(flatten)]
     gpu: GpuSelectorArgs,
 
@@ -114,6 +122,8 @@ enum ExtractDevice {
     Cpu,
     Gpu,
 }
+
+const DEFAULT_MAX_CHUNK_SECONDS: usize = 60;
 
 fn main() -> ExitCode {
     match run() {
@@ -157,14 +167,10 @@ fn extract(args: ExtractArgs) -> Result<()> {
             ..SlicerConfig::default()
         },
     )?;
-    let max_chunk_seconds = match model.backend() {
-        Backend::Cpu => 60usize,
-        Backend::Gpu => 5usize,
-    };
     let chunks = split_long_chunks(
         &chunks,
         waveform.sample_rate,
-        waveform.sample_rate.saturating_mul(max_chunk_seconds),
+        waveform.sample_rate.saturating_mul(args.max_chunk_seconds),
     )?;
     let total_frames = MelExtractor::from_inference_config(&model.config().inference)?
         .num_frames(waveform.samples.len());
@@ -191,6 +197,18 @@ fn extract(args: ExtractArgs) -> Result<()> {
         );
     }
     eprintln!("backend: {}", backend_name(model.backend()));
+    #[cfg(feature = "gpu")]
+    if let Some(adapter) = model.gpu_adapter_info() {
+        eprintln!(
+            "gpu: {} (backend={}, type={}, vendor=0x{:04x}, device=0x{:04x})",
+            adapter.name,
+            wgpu_backend_name(adapter.backend),
+            wgpu_device_type_name(adapter.device_type),
+            adapter.vendor,
+            adapter.device
+        );
+    }
+    eprintln!("max_chunk_seconds: {}", args.max_chunk_seconds);
     eprintln!("chunks: {}", result.chunk_count);
     eprintln!("frames: {}", total_frames);
     eprintln!("notes: {}", result.notes.len());
@@ -321,6 +339,29 @@ fn backend_name(backend: Backend) -> &'static str {
     match backend {
         Backend::Cpu => "cpu",
         Backend::Gpu => "gpu",
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn wgpu_backend_name(backend: wgpu::Backend) -> &'static str {
+    match backend {
+        wgpu::Backend::Empty => "empty",
+        wgpu::Backend::Vulkan => "vulkan",
+        wgpu::Backend::Metal => "metal",
+        wgpu::Backend::Dx12 => "dx12",
+        wgpu::Backend::Gl => "gl",
+        wgpu::Backend::BrowserWebGpu => "webgpu",
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn wgpu_device_type_name(device_type: wgpu::DeviceType) -> &'static str {
+    match device_type {
+        wgpu::DeviceType::Other => "other",
+        wgpu::DeviceType::IntegratedGpu => "integrated",
+        wgpu::DeviceType::DiscreteGpu => "discrete",
+        wgpu::DeviceType::VirtualGpu => "virtual",
+        wgpu::DeviceType::Cpu => "cpu",
     }
 }
 
@@ -837,6 +878,17 @@ fn parse_u32_auto(value: &str) -> std::result::Result<u32, String> {
     }
 }
 
+fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
+    let value = value.trim();
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|err| format!("invalid integer value `{value}`: {err}"))?;
+    if parsed == 0 {
+        return Err("value must be greater than 0".to_owned());
+    }
+    Ok(parsed)
+}
+
 impl GpuSelectorArgs {
     fn has_any(&self) -> bool {
         self.gpu_name.is_some() || self.gpu_vendor_id.is_some() || self.gpu_device_id.is_some()
@@ -856,9 +908,19 @@ impl GpuSelectorArgs {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
 
-    use super::{ExtractFormat, infer_extract_format, parse_u32_auto};
+    use clap::Parser;
+    use game_crabml::{
+        Backend, Error, InferParams, Model, Note, SlicerConfig, prepare_wav_for_inference,
+        slice_waveform, split_long_chunks,
+    };
+
+    use super::{
+        Cli, Command, DEFAULT_MAX_CHUNK_SECONDS, ExtractFormat, infer_extract_format,
+        parse_u32_auto, run_chunked_extract,
+    };
 
     #[test]
     fn parse_u32_auto_accepts_decimal_and_hex() {
@@ -882,5 +944,403 @@ mod tests {
             Some(ExtractFormat::Csv)
         );
         assert_eq!(infer_extract_format(Path::new("notes.unknown")), None);
+    }
+
+    #[test]
+    fn extract_cli_uses_default_max_chunk_seconds() {
+        let cli = Cli::try_parse_from([
+            "game-crabml",
+            "extract",
+            "-m",
+            "model.gguf",
+            "-o",
+            "notes.txt",
+            "input.wav",
+        ])
+        .unwrap();
+
+        let Command::Extract(args) = cli.command else {
+            panic!("expected extract command");
+        };
+        assert_eq!(args.max_chunk_seconds, DEFAULT_MAX_CHUNK_SECONDS);
+    }
+
+    #[test]
+    fn extract_cli_accepts_custom_max_chunk_seconds() {
+        let cli = Cli::try_parse_from([
+            "game-crabml",
+            "extract",
+            "-m",
+            "model.gguf",
+            "-o",
+            "notes.txt",
+            "--max-chunk-seconds",
+            "5",
+            "input.wav",
+        ])
+        .unwrap();
+
+        let Command::Extract(args) = cli.command else {
+            panic!("expected extract command");
+        };
+        assert_eq!(args.max_chunk_seconds, 5);
+    }
+
+    #[test]
+    fn extract_cli_rejects_zero_max_chunk_seconds() {
+        let err = Cli::try_parse_from([
+            "game-crabml",
+            "extract",
+            "-m",
+            "model.gguf",
+            "-o",
+            "notes.txt",
+            "--max-chunk-seconds",
+            "0",
+            "input.wav",
+        ])
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("--max-chunk-seconds"),
+            "unexpected clap error: {err}"
+        );
+    }
+
+    #[test]
+    #[ignore = "real-model CPU regression with local assets; run with `cargo test --release -- --ignored --nocapture`"]
+    fn vocal2_cpu_extract_loosely_matches_expected_output() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let model_path = root.join("assets").join("models").join("large.gguf");
+        let audio_path = root
+            .join("assets")
+            .join("audio")
+            .join("vocal2-44100-16bit-1ch.wav");
+        let expected_path = root
+            .join("assets")
+            .join("expected_output")
+            .join("vocal2-44100-16bit-1ch.txt");
+
+        if let Some(missing) = [&model_path, &audio_path, &expected_path]
+            .into_iter()
+            .find(|path| !path.exists())
+        {
+            eprintln!(
+                "skipping vocal2 real-model regression: missing {}",
+                missing.display()
+            );
+            return;
+        }
+
+        let model = Model::load(&model_path, Backend::Cpu).unwrap();
+        let waveform =
+            prepare_wav_for_inference(&audio_path, model.config().inference.audio_sample_rate)
+                .unwrap();
+        let chunks = slice_waveform(
+            &waveform.samples,
+            &SlicerConfig {
+                sample_rate: waveform.sample_rate,
+                ..SlicerConfig::default()
+            },
+        )
+        .unwrap();
+        let chunks = split_long_chunks(
+            &chunks,
+            waveform.sample_rate,
+            waveform.sample_rate * DEFAULT_MAX_CHUNK_SECONDS,
+        )
+        .unwrap();
+        let params = InferParams {
+            seed: 1,
+            ..InferParams::default()
+        };
+        let actual = run_chunked_extract(&model, &chunks, &params).unwrap();
+        let expected = parse_expected_notes(&expected_path).unwrap();
+        let metrics = compare_notes_by_frame(
+            &expected,
+            &actual.notes,
+            model.config().inference.timestep(),
+        );
+
+        eprintln!(
+            "vocal2 CPU regression: expected_notes={} actual_notes={} expected_frames={} actual_frames={} voicedness_match={:.4} pitch_mae={:.4} pitch_le_0_5={:.4}",
+            expected.len(),
+            actual.notes.len(),
+            metrics.expected_frames,
+            metrics.actual_frames,
+            metrics.voicedness_match_rate,
+            metrics.voiced_pitch_mae,
+            metrics.voiced_pitch_within_half_semitone_rate
+        );
+
+        // This reference may come from a quantized checkpoint and split/merge
+        // notes are acceptable, so compare at frame granularity with loose
+        // tolerances instead of requiring note-for-note identity.
+        assert!(
+            metrics.frame_count_delta <= 4,
+            "frame count drift too large: expected {} frames, got {}",
+            metrics.expected_frames,
+            metrics.actual_frames
+        );
+        assert!(
+            metrics.voicedness_match_rate >= 0.97,
+            "frame voiced/unvoiced agreement too low: {:.4}",
+            metrics.voicedness_match_rate
+        );
+        assert!(
+            metrics.voiced_pitch_mae <= 0.25,
+            "voiced-frame pitch MAE too high: {:.4}",
+            metrics.voiced_pitch_mae
+        );
+        assert!(
+            metrics.voiced_pitch_within_half_semitone_rate >= 0.92,
+            "too few voiced frames are within 0.5 semitone: {:.4}",
+            metrics.voiced_pitch_within_half_semitone_rate
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "gpu")]
+    #[ignore = "real-model CPU-vs-GPU regression on current audios with shared default chunking; run with `cargo test --release current_audio_cpu_gpu_shared_chunking_regression -- --ignored --nocapture`"]
+    fn current_audio_cpu_gpu_shared_chunking_regression() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for audio_name in ["vocal1-48000-16bit-2ch.wav", "vocal2-44100-16bit-1ch.wav"] {
+            assert_real_model_cpu_gpu_regression_case(&root, audio_name, DEFAULT_MAX_CHUNK_SECONDS);
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn assert_real_model_cpu_gpu_regression_case(
+        root: &Path,
+        audio_name: &str,
+        max_chunk_seconds: usize,
+    ) {
+        let audio_path = root.join("assets").join("audio").join(audio_name);
+        if !audio_path.exists() {
+            eprintln!(
+                "skipping CPU-vs-GPU regression: missing {}",
+                audio_path.display()
+            );
+            return;
+        }
+
+        let cpu = run_real_model_extract_with_shared_chunking(
+            root,
+            &audio_path,
+            Backend::Cpu,
+            max_chunk_seconds,
+        )
+        .unwrap();
+        let gpu = run_real_model_extract_with_shared_chunking(
+            root,
+            &audio_path,
+            Backend::Gpu,
+            max_chunk_seconds,
+        )
+        .unwrap();
+        let metrics = compare_notes_by_frame(&cpu.notes, &gpu.notes, cpu.timestep);
+
+        eprintln!(
+            "{audio_name} CPU-vs-GPU shared chunking: cpu_notes={} gpu_notes={} cpu_frames={} gpu_frames={} voicedness_match={:.4} pitch_mae={:.4} pitch_le_0_5={:.4}",
+            cpu.notes.len(),
+            gpu.notes.len(),
+            metrics.expected_frames,
+            metrics.actual_frames,
+            metrics.voicedness_match_rate,
+            metrics.voiced_pitch_mae,
+            metrics.voiced_pitch_within_half_semitone_rate
+        );
+
+        assert!(
+            metrics.frame_count_delta <= 1,
+            "{audio_name}: frame count drift too large: cpu {} gpu {}",
+            metrics.expected_frames,
+            metrics.actual_frames
+        );
+        assert!(
+            metrics.voicedness_match_rate >= 0.985,
+            "{audio_name}: frame voiced/unvoiced agreement too low: {:.4}",
+            metrics.voicedness_match_rate
+        );
+        assert!(
+            metrics.voiced_pitch_mae <= 0.15,
+            "{audio_name}: voiced-frame pitch MAE too high: {:.4}",
+            metrics.voiced_pitch_mae
+        );
+        assert!(
+            metrics.voiced_pitch_within_half_semitone_rate >= 0.94,
+            "{audio_name}: too few voiced frames are within 0.5 semitone: {:.4}",
+            metrics.voiced_pitch_within_half_semitone_rate
+        );
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct FrameComparisonMetrics {
+        expected_frames: usize,
+        actual_frames: usize,
+        frame_count_delta: usize,
+        voicedness_match_rate: f32,
+        voiced_pitch_mae: f32,
+        voiced_pitch_within_half_semitone_rate: f32,
+    }
+
+    fn parse_expected_notes(path: &Path) -> std::io::Result<Vec<Note>> {
+        let text = fs::read_to_string(path)?;
+        let mut notes = Vec::new();
+        for (line_index, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            let mut parts = line.split('\t');
+            let offset = parts
+                .next()
+                .ok_or_else(|| invalid_expected_output(line_index, "missing offset"))?
+                .parse::<f32>()
+                .map_err(|_| invalid_expected_output(line_index, "invalid offset"))?;
+            let duration = parts
+                .next()
+                .ok_or_else(|| invalid_expected_output(line_index, "missing duration"))?
+                .parse::<f32>()
+                .map_err(|_| invalid_expected_output(line_index, "invalid duration"))?;
+            let pitch = parts
+                .next()
+                .ok_or_else(|| invalid_expected_output(line_index, "missing pitch"))?;
+            if parts.next().is_some() {
+                return Err(invalid_expected_output(line_index, "too many columns"));
+            }
+
+            let (pitch_midi, voiced) = if pitch == "rest" {
+                (0.0, false)
+            } else {
+                (
+                    pitch
+                        .parse::<f32>()
+                        .map_err(|_| invalid_expected_output(line_index, "invalid pitch"))?,
+                    true,
+                )
+            };
+
+            notes.push(Note {
+                offset_seconds: offset,
+                duration_seconds: duration,
+                pitch_midi,
+                voiced,
+            });
+        }
+        Ok(notes)
+    }
+
+    struct RealModelExtractResult {
+        notes: Vec<Note>,
+        timestep: f32,
+    }
+
+    fn run_real_model_extract_with_shared_chunking(
+        root: &Path,
+        audio_path: &Path,
+        backend: Backend,
+        max_chunk_seconds: usize,
+    ) -> Result<RealModelExtractResult, Error> {
+        let model_path = root.join("assets").join("models").join("large.gguf");
+        let model = Model::load(&model_path, backend)?;
+        let waveform =
+            prepare_wav_for_inference(audio_path, model.config().inference.audio_sample_rate)?;
+        let chunks = slice_waveform(
+            &waveform.samples,
+            &SlicerConfig {
+                sample_rate: waveform.sample_rate,
+                ..SlicerConfig::default()
+            },
+        )?;
+        let chunks = split_long_chunks(
+            &chunks,
+            waveform.sample_rate,
+            waveform.sample_rate.saturating_mul(max_chunk_seconds),
+        )?;
+        let params = InferParams {
+            seed: 1,
+            ..InferParams::default()
+        };
+        let result = run_chunked_extract(&model, &chunks, &params)?;
+        Ok(RealModelExtractResult {
+            notes: result.notes,
+            timestep: model.config().inference.timestep(),
+        })
+    }
+
+    fn invalid_expected_output(line_index: usize, reason: &str) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("expected output line {}: {reason}", line_index + 1),
+        )
+    }
+
+    fn compare_notes_by_frame(
+        expected: &[Note],
+        actual: &[Note],
+        timestep: f32,
+    ) -> FrameComparisonMetrics {
+        let expected_frames = expand_notes_to_frames(expected, timestep);
+        let actual_frames = expand_notes_to_frames(actual, timestep);
+        let common = expected_frames.len().min(actual_frames.len());
+        let total = expected_frames.len().max(actual_frames.len());
+        let mut voicedness_matches = 0usize;
+        let mut voiced_frame_count = 0usize;
+        let mut voiced_pitch_abs_sum = 0.0f32;
+        let mut voiced_pitch_within_half = 0usize;
+
+        for index in 0..common {
+            match (expected_frames[index], actual_frames[index]) {
+                (None, None) => {
+                    voicedness_matches += 1;
+                }
+                (Some(expected_pitch), Some(actual_pitch)) => {
+                    voicedness_matches += 1;
+                    voiced_frame_count += 1;
+                    let diff = (expected_pitch - actual_pitch).abs();
+                    voiced_pitch_abs_sum += diff;
+                    if diff <= 0.5 {
+                        voiced_pitch_within_half += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        FrameComparisonMetrics {
+            expected_frames: expected_frames.len(),
+            actual_frames: actual_frames.len(),
+            frame_count_delta: expected_frames.len().abs_diff(actual_frames.len()),
+            voicedness_match_rate: ratio(voicedness_matches, total),
+            voiced_pitch_mae: if voiced_frame_count == 0 {
+                0.0
+            } else {
+                voiced_pitch_abs_sum / voiced_frame_count as f32
+            },
+            voiced_pitch_within_half_semitone_rate: ratio(
+                voiced_pitch_within_half,
+                voiced_frame_count,
+            ),
+        }
+    }
+
+    fn expand_notes_to_frames(notes: &[Note], timestep: f32) -> Vec<Option<f32>> {
+        let mut frames = Vec::new();
+        for note in notes {
+            let frame_count = ((note.duration_seconds / timestep).round() as i32).max(0) as usize;
+            let value = note.voiced.then_some(note.pitch_midi);
+            frames.extend(std::iter::repeat_n(value, frame_count));
+        }
+        frames
+    }
+
+    fn ratio(numerator: usize, denominator: usize) -> f32 {
+        if denominator == 0 {
+            0.0
+        } else {
+            numerator as f32 / denominator as f32
+        }
     }
 }

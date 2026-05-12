@@ -7,6 +7,10 @@ use super::weights::{
     PjacWeights, ResidualGluWeights,
 };
 
+// Chunk attention score rows so temporary score tensors stay bounded on both
+// CPU and GPU backends.
+const MAX_ATTENTION_SCORE_ELEMENTS: usize = 4_000_000;
+
 #[derive(Clone, Debug)]
 pub struct JointAttentionOutput<T> {
     pub pool: T,
@@ -453,24 +457,114 @@ fn scaled_dot_product_attention<T: Tensor>(
             v.shape()
         )));
     }
+    if q.shape()[0] != k.shape()[0] || q.shape()[0] != v.shape()[0] {
+        return Err(Error::message(format!(
+            "scaled_dot_product_attention head count mismatch: q={:?}, k={:?}, v={:?}",
+            q.shape(),
+            k.shape(),
+            v.shape()
+        )));
+    }
+    if q.shape()[2] != k.shape()[2] || q.shape()[2] != v.shape()[2] {
+        return Err(Error::message(format!(
+            "scaled_dot_product_attention head dimension mismatch: q={:?}, k={:?}, v={:?}",
+            q.shape(),
+            k.shape(),
+            v.shape()
+        )));
+    }
+    if k.shape()[1] != v.shape()[1] {
+        return Err(Error::message(format!(
+            "scaled_dot_product_attention key/value sequence mismatch: k={:?}, v={:?}",
+            k.shape(),
+            v.shape()
+        )));
+    }
+
+    let query_len = q.shape()[1];
+    let key_len = k.shape()[1];
+    let query_chunk_len = choose_attention_query_chunk_len(q.shape()[0], query_len, key_len);
+    scaled_dot_product_attention_chunked(q, k, v, mask, head_dim, query_chunk_len)
+}
+
+fn scaled_dot_product_attention_chunked<T: Tensor>(
+    q: &T,
+    k: &T,
+    v: &T,
+    mask: Option<&T>,
+    head_dim: usize,
+    query_chunk_len: usize,
+) -> Result<T> {
+    let query_len = q.shape()[1];
     let scale = 1.0 / (head_dim as f32).sqrt();
     let k_t = k
         .clone()
         .transpose(1, 2)
         .map_err(|err| Error::message(format!("attention key transpose failed: {err}")))?;
-    let mut scores = q
-        .matmul(&k_t)
-        .and_then(|scores| scores.scale(scale))
-        .map_err(|err| Error::message(format!("attention score matmul failed: {err}")))?;
-    if let Some(mask) = mask {
-        scores = scores
-            .add(mask)
-            .map_err(|err| Error::message(format!("attention mask add failed: {err}")))?;
+
+    if query_chunk_len >= query_len {
+        let mut scores = q
+            .matmul(&k_t)
+            .and_then(|scores| scores.scale(scale))
+            .map_err(|err| Error::message(format!("attention score matmul failed: {err}")))?;
+        if let Some(mask) = mask {
+            scores = scores
+                .add(mask)
+                .map_err(|err| Error::message(format!("attention mask add failed: {err}")))?;
+        }
+        return scores
+            .softmax(-1)
+            .and_then(|probs| probs.matmul(v))
+            .map_err(|err| Error::message(format!("attention value matmul failed: {err}")));
     }
-    scores
-        .softmax(-1)
-        .and_then(|probs| probs.matmul(v))
-        .map_err(|err| Error::message(format!("attention value matmul failed: {err}")))
+
+    let mut outputs = Vec::new();
+    for start in (0..query_len).step_by(query_chunk_len) {
+        let end = (start + query_chunk_len).min(query_len);
+        let q_chunk = q
+            .clone()
+            .slice(1, start, end)
+            .map_err(|err| Error::message(format!("attention query chunk slice failed: {err}")))?;
+        let mask_chunk = match mask {
+            Some(mask) => Some(mask.clone().slice(0, start, end).map_err(|err| {
+                Error::message(format!("attention mask chunk slice failed: {err}"))
+            })?),
+            None => None,
+        };
+
+        let mut scores = q_chunk
+            .matmul(&k_t)
+            .and_then(|scores| scores.scale(scale))
+            .map_err(|err| Error::message(format!("attention score matmul failed: {err}")))?;
+        if let Some(mask_chunk) = mask_chunk.as_ref() {
+            scores = scores
+                .add(mask_chunk)
+                .map_err(|err| Error::message(format!("attention mask add failed: {err}")))?;
+        }
+        let chunk_output = scores
+            .softmax(-1)
+            .and_then(|probs| probs.matmul(v))
+            .map_err(|err| Error::message(format!("attention value matmul failed: {err}")))?;
+        outputs.push(chunk_output);
+    }
+
+    let refs = outputs.iter().collect::<Vec<_>>();
+    T::concat(&refs, 1)
+        .map_err(|err| Error::message(format!("attention output concat failed: {err}")))
+}
+
+fn choose_attention_query_chunk_len(num_heads: usize, query_len: usize, key_len: usize) -> usize {
+    if num_heads == 0 || query_len == 0 || key_len == 0 {
+        return query_len;
+    }
+
+    let score_elements = num_heads.saturating_mul(query_len).saturating_mul(key_len);
+    if score_elements <= MAX_ATTENTION_SCORE_ELEMENTS {
+        return query_len;
+    }
+
+    let rows = MAX_ATTENTION_SCORE_ELEMENTS / num_heads.saturating_mul(key_len).max(1);
+    rows.max(1).min(query_len)
 }
 
 fn validate_head_config(num_heads: usize, head_dim: usize) -> Result<()> {
@@ -491,4 +585,63 @@ fn validate_sequence_2d<T: Tensor>(label: &str, tensor: &T) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scaled_dot_product_attention_chunked;
+    use crate::{CpuDevice, CpuTensor, Tensor};
+
+    #[test]
+    fn chunked_attention_matches_full_attention_with_mask() {
+        let device = CpuDevice;
+        let q = CpuTensor::from_data(
+            &[
+                1.0, 0.0, 0.5, 0.5, 0.2, 0.8, 0.0, 1.0, //
+                0.3, 0.7, 0.6, 0.4, 0.9, 0.1, 0.4, 0.6,
+            ],
+            &[2, 4, 2],
+            &device,
+        )
+        .unwrap();
+        let k = CpuTensor::from_data(
+            &[
+                0.9, 0.1, 0.1, 0.9, 0.8, 0.2, 0.3, 0.7, //
+                0.2, 0.8, 0.7, 0.3, 0.4, 0.6, 0.6, 0.4,
+            ],
+            &[2, 4, 2],
+            &device,
+        )
+        .unwrap();
+        let v = CpuTensor::from_data(
+            &[
+                0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, //
+                0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1,
+            ],
+            &[2, 4, 2],
+            &device,
+        )
+        .unwrap();
+        let mask = CpuTensor::from_data(
+            &[
+                0.0, 0.0, -10_000.0, -10_000.0, //
+                0.0, 0.0, 0.0, -10_000.0, //
+                0.0, 0.0, 0.0, 0.0, //
+                -10_000.0, 0.0, 0.0, 0.0,
+            ],
+            &[4, 4],
+            &device,
+        )
+        .unwrap();
+
+        let full = scaled_dot_product_attention_chunked(&q, &k, &v, Some(&mask), 2, 4).unwrap();
+        let chunked = scaled_dot_product_attention_chunked(&q, &k, &v, Some(&mask), 2, 2).unwrap();
+
+        assert_eq!(full.shape(), chunked.shape());
+        let full_data = full.to_vec().unwrap();
+        let chunked_data = chunked.to_vec().unwrap();
+        for (lhs, rhs) in full_data.iter().zip(chunked_data.iter()) {
+            assert!((lhs - rhs).abs() <= 1e-6, "lhs={lhs} rhs={rhs}");
+        }
+    }
 }

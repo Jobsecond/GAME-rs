@@ -22,6 +22,10 @@ struct ArithmeticParams {
 @group(0) @binding(2) var<storage, read_write> dst: array<f32>;
 @group(0) @binding(3) var<storage, read> params: ArithmeticParams;
 
+fn flat_index(gid: vec3<u32>) -> u32 {
+    return gid.x + gid.y * 65535u * 64u;
+}
+
 fn coords_for(flat: u32) -> array<u32, 8> {
     var coords: array<u32, 8>;
     var remainder = flat;
@@ -82,7 +86,7 @@ fn erf_approx(x: f32) -> f32 {
 
 @compute @workgroup_size(64)
 fn add_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let flat = gid.x;
+    let flat = flat_index(gid);
     if (flat >= params.out_len) {
         return;
     }
@@ -94,7 +98,7 @@ fn add_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn mul_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let flat = gid.x;
+    let flat = flat_index(gid);
     if (flat >= params.out_len) {
         return;
     }
@@ -106,7 +110,7 @@ fn mul_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn scale_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let flat = gid.x;
+    let flat = flat_index(gid);
     if (flat >= params.out_len) {
         return;
     }
@@ -116,7 +120,7 @@ fn scale_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn sigmoid_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let flat = gid.x;
+    let flat = flat_index(gid);
     if (flat >= params.out_len) {
         return;
     }
@@ -127,7 +131,7 @@ fn sigmoid_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn gelu_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let flat = gid.x;
+    let flat = flat_index(gid);
     if (flat >= params.out_len) {
         return;
     }

@@ -10,6 +10,7 @@ use super::{CpuDevice, CpuTensor, Tensor};
 
 const MAX_DIMS: usize = 8;
 const ELEMENT_WORKGROUP_SIZE: u32 = 64;
+const MAX_DISPATCH_X: u32 = 65_535;
 const ROW_WORKGROUP_X: u32 = 8;
 const ROW_WORKGROUP_Y: u32 = 8;
 const ROPE_WORKGROUP_X: u32 = 32;
@@ -529,7 +530,7 @@ impl GpuTensor {
         lhs.device.dispatch_compute(
             pipeline,
             &[&lhs.buffer, &rhs.buffer, &out_buffer, &params_buffer],
-            (div_ceil_u32(params.out_len, ELEMENT_WORKGROUP_SIZE), 1, 1),
+            elementwise_workgroups(params.out_len),
             op_name,
             None,
         )?;
@@ -586,7 +587,7 @@ impl GpuTensor {
                 &out_buffer,
                 &params_buffer,
             ],
-            (div_ceil_u32(params.out_len, ELEMENT_WORKGROUP_SIZE), 1, 1),
+            elementwise_workgroups(params.out_len),
             op_name,
             None,
         )?;
@@ -716,7 +717,7 @@ impl Tensor for GpuTensor {
         self.device.dispatch_compute(
             &self.device.inner.pipelines.contiguous,
             &[&self.buffer, &out_buffer, &params_buffer],
-            (div_ceil_u32(params.out_len, ELEMENT_WORKGROUP_SIZE), 1, 1),
+            elementwise_workgroups(params.out_len),
             "contiguous",
             None,
         )?;
@@ -1684,6 +1685,13 @@ fn usize_to_u32(value: usize, label: &str) -> Result<u32> {
 
 fn div_ceil_u32(value: u32, divisor: u32) -> u32 {
     value.div_ceil(divisor)
+}
+
+fn elementwise_workgroups(out_len: u32) -> (u32, u32, u32) {
+    let total_x = div_ceil_u32(out_len, ELEMENT_WORKGROUP_SIZE);
+    let x = total_x.min(MAX_DISPATCH_X);
+    let y = div_ceil_u32(total_x, MAX_DISPATCH_X).max(1);
+    (x, y, 1)
 }
 
 #[cfg(test)]
