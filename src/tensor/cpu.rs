@@ -54,6 +54,17 @@ impl CpuTensor {
         self.strides == contiguous_strides(&self.shape)
     }
 
+    /// Returns a borrowed slice of the underlying data when the tensor is
+    /// dense and contiguous, avoiding a heap allocation.  Falls back to `None`
+    /// for transposed / sliced views, where callers should use `to_vec()`.
+    fn as_contiguous_slice(&self) -> Option<&[f32]> {
+        if self.is_dense_contiguous_view() {
+            Some(&self.data[self.offset..self.offset + self.num_elements()])
+        } else {
+            None
+        }
+    }
+
     fn has_compact_storage(&self) -> bool {
         self.offset == 0
             && self.is_dense_contiguous_view()
@@ -66,6 +77,15 @@ impl CpuTensor {
                 Ok(data) => data,
                 Err(data) => (*data).clone(),
             });
+        }
+
+        // Fast path for dense contiguous views with an offset (e.g., slices).
+        // The `export` fast path handles this too, but going through `export`
+        // requires allocating a zeroed buffer first; this avoids that.
+        if self.is_dense_contiguous_view() {
+            let offset = self.offset;
+            let len = self.num_elements();
+            return Ok(self.data[offset..offset + len].to_vec());
         }
 
         let mut out = vec![0.0; self.num_elements()];
@@ -110,7 +130,14 @@ impl CpuTensor {
 
         let rhs_shape = rhs.shape.clone();
         let rhs_strides = contiguous_strides(&rhs_shape);
-        let rhs_data = rhs.to_vec()?;
+        let rhs_owned;
+        let rhs_data: &[f32] = match rhs.as_contiguous_slice() {
+            Some(s) => s,
+            None => {
+                rhs_owned = rhs.to_vec()?;
+                &rhs_owned
+            }
+        };
 
         let out_shape = broadcast_shape(&lhs_shape, &rhs_shape)?;
         let mut out = vec![0.0; checked_num_elements(&out_shape)?];
@@ -209,9 +236,13 @@ impl Tensor for CpuTensor {
             )));
         }
 
-        for_each_index(&self.shape, |coords, flat| {
-            buf[flat] = self.data[self.raw_offset(coords)];
-        });
+        if self.is_dense_contiguous_view() {
+            buf.copy_from_slice(&self.data[self.offset..self.offset + buf.len()]);
+        } else {
+            for_each_index(&self.shape, |coords, flat| {
+                buf[flat] = self.data[self.raw_offset(coords)];
+            });
+        }
 
         Ok(())
     }
@@ -344,9 +375,24 @@ impl Tensor for CpuTensor {
     fn matmul(&self, rhs: &Self) -> Result<Self> {
         let lhs_shape = self.shape.clone();
         let rhs_shape = rhs.shape.clone();
-        let lhs = self.to_vec()?;
-        let rhs_data = rhs.to_vec()?;
         let device = self.device.clone();
+
+        let lhs_owned;
+        let lhs: &[f32] = match self.as_contiguous_slice() {
+            Some(s) => s,
+            None => {
+                lhs_owned = self.to_vec()?;
+                &lhs_owned
+            }
+        };
+        let rhs_owned;
+        let rhs_data: &[f32] = match rhs.as_contiguous_slice() {
+            Some(s) => s,
+            None => {
+                rhs_owned = rhs.to_vec()?;
+                &rhs_owned
+            }
+        };
 
         match (lhs_shape.len(), rhs_shape.len()) {
             (2, 2) => {
@@ -469,8 +515,23 @@ impl Tensor for CpuTensor {
         }
 
         let rows = plain_num_elements(&input_shape[..input_shape.len() - 1]);
-        let input = self.to_vec()?;
-        let weight_data = weight.to_vec()?;
+
+        let input_owned;
+        let input: &[f32] = match self.as_contiguous_slice() {
+            Some(s) => s,
+            None => {
+                input_owned = self.to_vec()?;
+                &input_owned
+            }
+        };
+        let weight_owned;
+        let weight_data: &[f32] = match weight.as_contiguous_slice() {
+            Some(s) => s,
+            None => {
+                weight_owned = weight.to_vec()?;
+                &weight_owned
+            }
+        };
         let bias_data = bias.map(CpuTensor::to_vec).transpose()?;
         let mut out = vec![0.0; rows * out_dim];
 
@@ -527,7 +588,14 @@ impl Tensor for CpuTensor {
         let shape = self.shape.clone();
         let device = self.device.clone();
         let mut data = self.into_contiguous_vec()?;
-        let weight_data = weight.to_vec()?;
+        let weight_owned;
+        let weight_data: &[f32] = match weight.as_contiguous_slice() {
+            Some(s) => s,
+            None => {
+                weight_owned = weight.to_vec()?;
+                &weight_owned
+            }
+        };
         if feature_dim == 0 {
             return Self::from_owned(data, shape, device);
         }
@@ -537,7 +605,7 @@ impl Tensor for CpuTensor {
                 let mean_square =
                     row_slice.iter().map(|value| value * value).sum::<f32>() / feature_dim as f32;
                 let inv_rms = 1.0 / (mean_square + eps).sqrt();
-                for (value, scale) in row_slice.iter_mut().zip(&weight_data) {
+                for (value, scale) in row_slice.iter_mut().zip(weight_data.iter()) {
                     *value *= inv_rms * scale;
                 }
             });
@@ -550,7 +618,7 @@ impl Tensor for CpuTensor {
                 let mean_square =
                     row_slice.iter().map(|value| value * value).sum::<f32>() / feature_dim as f32;
                 let inv_rms = 1.0 / (mean_square + eps).sqrt();
-                for (value, scale) in row_slice.iter_mut().zip(&weight_data) {
+                for (value, scale) in row_slice.iter_mut().zip(weight_data.iter()) {
                     *value *= inv_rms * scale;
                 }
             }
