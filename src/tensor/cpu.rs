@@ -178,6 +178,10 @@ impl Tensor for CpuTensor {
         Self::from_owned(vec![0.0; len], shape.to_vec(), device.clone())
     }
 
+    fn device(&self) -> &Self::Device {
+        &self.device
+    }
+
     fn shape(&self) -> &[usize] {
         &self.shape
     }

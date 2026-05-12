@@ -615,6 +615,10 @@ impl Tensor for GpuTensor {
         Self::from_owned(zeroes, shape.to_vec(), device.clone())
     }
 
+    fn device(&self) -> &Self::Device {
+        &self.device
+    }
+
     fn shape(&self) -> &[usize] {
         &self.shape
     }

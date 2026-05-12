@@ -16,6 +16,7 @@ pub trait Tensor: Sized + Clone {
 
     fn from_data(data: &[f32], shape: &[usize], device: &Self::Device) -> Result<Self>;
     fn zeros(shape: &[usize], device: &Self::Device) -> Result<Self>;
+    fn device(&self) -> &Self::Device;
     fn shape(&self) -> &[usize];
     fn export(&self, buf: &mut [f32]) -> Result<()>;
 

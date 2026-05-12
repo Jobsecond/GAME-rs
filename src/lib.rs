@@ -12,7 +12,10 @@ pub use error::{Error, Result};
 pub use gguf::{GGMLType, GGUFFile, GGUFFileLoader, GGUFMetadata, GGUFMetadataValue, GGUFVersion};
 pub use gguf_loader::{LoadedGgufModel, LoadedTensor, load_gguf};
 pub use mel::{MelConfig, MelExtractor};
-pub use model::{GameModelWeights, bind_model_weights};
+pub use model::{
+    EncoderOutputs, EstimatorOutputs, GameModelWeights, SegmenterOutputs, bind_model_weights,
+    build_joint_attn_mask, run_encoder, run_estimator, run_segmenter_step,
+};
 pub use tensor::{CpuDevice, CpuTensor, Tensor};
 #[cfg(feature = "gpu")]
 pub use tensor::{GpuAdapterSelector, GpuDevice, GpuTensor};
