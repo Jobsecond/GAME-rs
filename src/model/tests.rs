@@ -2,12 +2,13 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use super::{
-    bind_model_weights, build_joint_attn_mask, run_encoder, run_estimator, run_segmenter_step,
+    Backend, Model, bind_model_weights, build_joint_attn_mask, run_encoder, run_estimator,
+    run_segmenter_step,
 };
-use crate::config::{BackboneConfig, GameModelConfig};
+use crate::config::{BackboneConfig, GameModelConfig, InferenceConfig};
 use crate::gguf::{GGMLType, GGUFVersion};
 use crate::gguf_loader::{LoadedGgufModel, LoadedTensor};
-use crate::{CpuDevice, CpuTensor, Tensor};
+use crate::{CpuDevice, CpuTensor, InferParams, InjectedRng, Tensor};
 
 #[test]
 fn joint_attention_mask_matches_region_rules() {
@@ -87,6 +88,47 @@ fn estimator_returns_empty_logits_for_no_regions() {
 
     let estimator = run_estimator(&x_est, &[0, 0], &weights.estimator, &model.config).unwrap();
     assert_eq!(estimator.pool_logits.shape(), &[0, 5]);
+}
+
+#[test]
+fn model_infer_runs_end_to_end_on_cpu_backend() {
+    let model = Model::from_loaded_model(fake_loaded_model(), Backend::Cpu).unwrap();
+    let waveform = vec![0.0f32; 4];
+    let params = InferParams {
+        seed: 42,
+        d3pm_nsteps: 2,
+        boundary_threshold: 0.0,
+        note_threshold: 0.0,
+        ..Default::default()
+    };
+    let mut rng = InjectedRng::new(vec![0.1, 0.9, 0.2, 0.8]);
+
+    let result = model.infer_with_rng(&waveform, &params, &mut rng).unwrap();
+
+    assert_eq!(model.backend(), Backend::Cpu);
+    assert_eq!(result.num_frames, 1);
+    assert!(!result.notes.is_empty());
+    let total_duration = result
+        .notes
+        .iter()
+        .map(|note| note.duration_seconds)
+        .sum::<f32>();
+    assert!((total_duration - 0.5).abs() < 1e-6);
+    assert!(result.notes.iter().any(|note| note.duration_seconds > 0.0));
+    for note in &result.notes {
+        assert!(note.duration_seconds >= 0.0);
+        assert!(note.pitch_midi.is_finite());
+    }
+}
+
+#[test]
+fn model_infer_rejects_waveform_too_short_for_one_frame() {
+    let model = Model::from_loaded_model(fake_loaded_model(), Backend::Cpu).unwrap();
+    let params = InferParams::default();
+    let mut rng = InjectedRng::new(Vec::new());
+
+    let err = model.infer_with_rng(&[], &params, &mut rng).unwrap_err();
+    assert!(err.to_string().contains("waveform too short"));
 }
 
 fn cpu_tensor(data: &[f32], shape: &[usize]) -> CpuTensor {
@@ -221,6 +263,21 @@ fn fake_config() -> GameModelConfig {
         encoder,
         segmenter,
         estimator,
+        inference: InferenceConfig {
+            audio_sample_rate: 8,
+            hop_size: 4,
+            fft_size: 4,
+            win_size: 4,
+            n_mels: 3,
+            fmin: 0.0,
+            fmax: 4.0,
+            spectrogram_type: "mel".to_owned(),
+            midi_min: 60.0,
+            midi_max: 64.0,
+            midi_num_bins: 5,
+            midi_std: 1.0,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
