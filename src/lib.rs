@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod config;
 pub mod d3pm;
 pub mod decode;
@@ -12,6 +13,10 @@ pub mod rng;
 pub mod tensor;
 pub mod types;
 
+pub use audio::{
+    PreparedWaveform, SliceChunk, SlicerConfig, prepare_wav_for_inference, slice_waveform,
+    split_long_chunks,
+};
 pub use config::{BackboneConfig, GameModelConfig, InferenceConfig};
 pub use d3pm::{d3pm_time_schedule, remove_mutable_boundaries, remove_mutable_boundaries_into};
 pub use decode::{

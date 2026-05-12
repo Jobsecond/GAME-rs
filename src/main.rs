@@ -8,10 +8,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[cfg(feature = "gpu")]
 use game_crabml::GpuAdapterSelector;
 use game_crabml::{
-    BackboneConfig, Backend, Error, InferParams, LoadedGgufModel, LoadedTensor, MidiWriteOptions,
-    Model, Result, TextOutputFormat, TextWriteOptions, load_gguf, write_midi_file, write_text_file,
+    BackboneConfig, Backend, Error, InferParams, LoadedGgufModel, LoadedTensor, MelExtractor,
+    MidiWriteOptions, Model, Result, SliceChunk, SlicerConfig, TextOutputFormat, TextWriteOptions,
+    load_gguf, prepare_wav_for_inference, slice_waveform, split_long_chunks, write_midi_file,
+    write_text_file,
 };
-use hound::{SampleFormat, WavReader};
 use serde_json::{Map, Value, json};
 
 #[derive(Debug, Parser)]
@@ -147,7 +148,26 @@ fn extract(args: ExtractArgs) -> Result<()> {
 
     let format = resolve_extract_format(args.format, &args.output);
     let model = load_model_for_extract(&args.model, args.device, &args.gpu)?;
-    let waveform = load_wav_mono_f32(&args.input, model.config().inference.audio_sample_rate)?;
+    let waveform =
+        prepare_wav_for_inference(&args.input, model.config().inference.audio_sample_rate)?;
+    let chunks = slice_waveform(
+        &waveform.samples,
+        &SlicerConfig {
+            sample_rate: waveform.sample_rate,
+            ..SlicerConfig::default()
+        },
+    )?;
+    let max_chunk_seconds = match model.backend() {
+        Backend::Cpu => 60usize,
+        Backend::Gpu => 5usize,
+    };
+    let chunks = split_long_chunks(
+        &chunks,
+        waveform.sample_rate,
+        waveform.sample_rate.saturating_mul(max_chunk_seconds),
+    )?;
+    let total_frames = MelExtractor::from_inference_config(&model.config().inference)?
+        .num_frames(waveform.samples.len());
 
     let params = InferParams {
         language: args.language,
@@ -159,16 +179,48 @@ fn extract(args: ExtractArgs) -> Result<()> {
         seed: args.seed,
         ..InferParams::default()
     };
-    let result = model.infer(&waveform, &params)?;
+    let result = run_chunked_extract(&model, &chunks, &params)?;
 
     ensure_output_parent_dir(&args.output)?;
     write_extract_output(&args.output, format, &result.notes)?;
 
+    if waveform.was_resampled() || waveform.was_downmixed() {
+        eprintln!(
+            "audio: {} Hz/{} ch -> {} Hz mono",
+            waveform.source_sample_rate, waveform.source_channels, waveform.sample_rate
+        );
+    }
     eprintln!("backend: {}", backend_name(model.backend()));
-    eprintln!("frames: {}", result.num_frames);
+    eprintln!("chunks: {}", result.chunk_count);
+    eprintln!("frames: {}", total_frames);
     eprintln!("notes: {}", result.notes.len());
     eprintln!("wrote {}", args.output.display());
     Ok(())
+}
+
+struct ChunkedExtractResult {
+    notes: Vec<game_crabml::Note>,
+    chunk_count: usize,
+}
+
+fn run_chunked_extract(
+    model: &Model,
+    chunks: &[SliceChunk],
+    params: &InferParams,
+) -> Result<ChunkedExtractResult> {
+    let mut notes = Vec::new();
+    for chunk in chunks {
+        let result = model.infer(&chunk.waveform, params)?;
+        for mut note in result.notes {
+            note.offset_seconds += chunk.offset_seconds as f32;
+            notes.push(note);
+        }
+    }
+
+    Ok(ChunkedExtractResult {
+        notes,
+        chunk_count: chunks.len(),
+    })
 }
 
 fn write_extract_output(
@@ -254,61 +306,6 @@ fn load_auto_model(model_path: &Path) -> Result<Model> {
 #[cfg(not(feature = "gpu"))]
 fn load_auto_model(model_path: &Path) -> Result<Model> {
     Model::load(model_path, Backend::Cpu)
-}
-
-fn load_wav_mono_f32(path: &Path, expected_sample_rate: i32) -> Result<Vec<f32>> {
-    let mut reader = WavReader::open(path)
-        .map_err(|err| Error::message(format!("failed to open WAV {}: {err}", path.display())))?;
-    let spec = reader.spec();
-
-    if expected_sample_rate > 0 && spec.sample_rate != expected_sample_rate as u32 {
-        return Err(Error::message(format!(
-            "WAV sample rate {} != expected {} ({})",
-            spec.sample_rate,
-            expected_sample_rate,
-            path.display()
-        )));
-    }
-
-    let interleaved = match spec.sample_format {
-        SampleFormat::Float => reader
-            .samples::<f32>()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|err| {
-                Error::message(format!("failed to decode WAV {}: {err}", path.display()))
-            })?,
-        SampleFormat::Int => {
-            let bits = u32::from(spec.bits_per_sample);
-            let scale = 1u64.checked_shl(bits.saturating_sub(1)).ok_or_else(|| {
-                Error::message(format!(
-                    "unsupported WAV bit depth {} in {}",
-                    spec.bits_per_sample,
-                    path.display()
-                ))
-            })? as f32;
-
-            reader
-                .samples::<i32>()
-                .map(|sample| {
-                    sample.map(|value| value as f32 / scale).map_err(|err| {
-                        Error::message(format!("failed to decode WAV {}: {err}", path.display()))
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?
-        }
-    };
-
-    let channels = usize::from(spec.channels);
-    if channels == 1 {
-        return Ok(interleaved);
-    }
-
-    let frames = interleaved.len() / channels;
-    let mut mono = Vec::with_capacity(frames);
-    for frame in interleaved.chunks_exact(channels) {
-        mono.push(frame.iter().copied().sum::<f32>() / channels as f32);
-    }
-    Ok(mono)
 }
 
 fn ensure_output_parent_dir(path: &Path) -> Result<()> {
