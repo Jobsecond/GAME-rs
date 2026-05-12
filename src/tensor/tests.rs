@@ -58,6 +58,16 @@ pub(crate) fn run_layout_ops_preserve_view_semantics<T: Tensor>(device: &T::Devi
     assert_tensor(&transposed, &[2, 2], &[3.0, 5.0, 4.0, 6.0]);
     assert_tensor(&reshaped, &[4], &[3.0, 5.0, 4.0, 6.0]);
     assert_tensor(&joined, &[3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+    let left = tensor::<T>(&[2, 1], &[10.0, 20.0], device);
+    let mid = tensor::<T>(&[2, 2], &[30.0, 40.0, 50.0, 60.0], device);
+    let right = tensor::<T>(&[2, 1], &[70.0, 80.0], device);
+    let axis1 = T::concat(&[&left, &mid, &right], 1).unwrap();
+    assert_tensor(
+        &axis1,
+        &[2, 4],
+        &[10.0, 30.0, 40.0, 70.0, 20.0, 50.0, 60.0, 80.0],
+    );
 }
 
 pub(crate) fn run_broadcast_add_and_mul_match_expected_values<T: Tensor>(device: &T::Device) {
@@ -202,12 +212,15 @@ pub(crate) fn run_embedding_and_repeat_return_expected_rows<T: Tensor>(device: &
     let embedded = T::embedding(&table, &[2, 0]).unwrap();
     assert_tensor(&embedded, &[2, 2], &[5.0, 6.0, 1.0, 2.0]);
 
-    let repeated = embedded.repeat(0, 3).unwrap();
+    let repeated = embedded.clone().repeat(0, 3).unwrap();
     assert_tensor(
         &repeated,
         &[6, 2],
         &[5.0, 6.0, 1.0, 2.0, 5.0, 6.0, 1.0, 2.0, 5.0, 6.0, 1.0, 2.0],
     );
+
+    let axis1 = embedded.repeat(1, 2).unwrap();
+    assert_tensor(&axis1, &[2, 4], &[5.0, 6.0, 5.0, 6.0, 1.0, 2.0, 1.0, 2.0]);
 }
 
 pub(crate) fn run_gpu_against_cpu_reference<T: Tensor>(device: &T::Device) -> Result<()> {

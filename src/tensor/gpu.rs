@@ -6,7 +6,7 @@ use wgpu::util::DeviceExt;
 
 use crate::{Error, Result};
 
-use super::{CpuDevice, CpuTensor, Tensor};
+use super::Tensor;
 
 const MAX_DIMS: usize = 8;
 const ELEMENT_WORKGROUP_SIZE: u32 = 64;
@@ -40,6 +40,7 @@ struct GpuContext {
 
 struct Pipelines {
     contiguous: wgpu::ComputePipeline,
+    concat: wgpu::ComputePipeline,
     add: wgpu::ComputePipeline,
     mul: wgpu::ComputePipeline,
     scale: wgpu::ComputePipeline,
@@ -51,6 +52,9 @@ struct Pipelines {
     softmax: wgpu::ComputePipeline,
     rope: wgpu::ComputePipeline,
     region_rope: wgpu::ComputePipeline,
+    conv1d_dw: wgpu::ComputePipeline,
+    embedding: wgpu::ComputePipeline,
+    repeat: wgpu::ComputePipeline,
 }
 
 #[derive(Clone)]
@@ -73,6 +77,19 @@ struct LayoutParams {
     shape: [u32; MAX_DIMS],
     out_strides: [u32; MAX_DIMS],
     src_strides: [u32; MAX_DIMS],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ConcatParams {
+    part_len: u32,
+    inner: u32,
+    part_axis_len: u32,
+    out_axis_len: u32,
+    axis_offset: u32,
+    _reserved0: u32,
+    _reserved1: u32,
+    _reserved2: u32,
 }
 
 #[repr(C)]
@@ -105,11 +122,46 @@ struct MatmulParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct Conv1dDwParams {
+    time: u32,
+    channels: u32,
+    kernel_size: u32,
+    stride: u32,
+    padding: u32,
+    out_time: u32,
+    has_bias: u32,
+    _reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct EmbeddingParams {
+    out_len: u32,
+    dim: u32,
+    _reserved0: u32,
+    _reserved1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct LinearParams {
     rows: u32,
     in_dim: u32,
     out_dim: u32,
     has_bias: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct RepeatParams {
+    out_len: u32,
+    outer: u32,
+    axis_len: u32,
+    inner: u32,
+    repeat_n: u32,
+    _reserved0: u32,
+    _reserved1: u32,
+    _reserved2: u32,
 }
 
 #[repr(C)]
@@ -384,17 +436,6 @@ impl GpuTensor {
         })
     }
 
-    fn from_cpu_tensor(tensor: CpuTensor, device: &GpuDevice) -> Result<Self> {
-        let shape = tensor.shape().to_vec();
-        let data = tensor.to_vec()?;
-        Self::from_owned(data, shape, device.clone())
-    }
-
-    fn to_cpu_tensor(&self) -> Result<CpuTensor> {
-        let data = self.to_vec()?;
-        CpuTensor::from_data(&data, &self.shape, &CpuDevice)
-    }
-
     fn ensure_same_device(&self, other: &Self, op_name: &str) -> Result<()> {
         if !Arc::ptr_eq(&self.device.inner, &other.device.inner) {
             return Err(invalid_arg(format!(
@@ -457,33 +498,6 @@ impl GpuTensor {
         let strides = contiguous_strides(shape);
         let (_, packed_strides) = Self::pack_dims(shape, &strides)?;
         Ok(packed_strides)
-    }
-
-    fn cpu_fallback_unary(
-        self,
-        op_name: &str,
-        f: impl FnOnce(CpuTensor) -> Result<CpuTensor>,
-    ) -> Result<Self> {
-        let device = self.device.clone();
-        let tensor = self.to_cpu_tensor()?;
-        let out = f(tensor)
-            .map_err(|err| Error::message(format!("CPU fallback for {op_name} failed: {err}")))?;
-        Self::from_cpu_tensor(out, &device)
-    }
-
-    fn cpu_fallback_binary(
-        self,
-        rhs: &Self,
-        op_name: &str,
-        f: impl FnOnce(CpuTensor, &CpuTensor) -> Result<CpuTensor>,
-    ) -> Result<Self> {
-        self.ensure_same_device(rhs, op_name)?;
-        let device = self.device.clone();
-        let lhs = self.to_cpu_tensor()?;
-        let rhs_cpu = rhs.to_cpu_tensor()?;
-        let out = f(lhs, &rhs_cpu)
-            .map_err(|err| Error::message(format!("CPU fallback for {op_name} failed: {err}")))?;
-        Self::from_cpu_tensor(out, &device)
     }
 
     fn arithmetic(
@@ -760,14 +774,70 @@ impl Tensor for GpuTensor {
                 ));
             }
         }
+        let rank = parts[0].shape.len();
+        validate_axis(axis, rank, "concat")?;
+        let mut contiguous_parts = Vec::with_capacity(parts.len());
+        let mut out_shape = parts[0].shape.clone();
+        out_shape[axis] = 0;
 
-        let cpu_parts = parts
-            .iter()
-            .map(|part| part.to_cpu_tensor())
-            .collect::<Result<Vec<_>>>()?;
-        let cpu_refs = cpu_parts.iter().collect::<Vec<_>>();
-        let out = CpuTensor::concat(&cpu_refs, axis)?;
-        Self::from_cpu_tensor(out, &device)
+        for part in parts {
+            let contiguous = (*part).clone().contiguous()?;
+            if contiguous.shape.len() != rank {
+                return Err(invalid_arg(format!(
+                    "concat rank mismatch: expected rank {}, got shape {:?}",
+                    rank, contiguous.shape
+                )));
+            }
+            for dim in 0..rank {
+                if dim != axis && contiguous.shape[dim] != parts[0].shape[dim] {
+                    return Err(invalid_arg(format!(
+                        "concat shape mismatch on axis {}: expected non-concat dims {:?}, got {:?}",
+                        axis, parts[0].shape, contiguous.shape
+                    )));
+                }
+            }
+            out_shape[axis] += contiguous.shape[axis];
+            contiguous_parts.push(contiguous);
+        }
+
+        let out_len = checked_num_elements(&out_shape)?;
+        if out_len == 0 {
+            return Self::zeros(&out_shape, &device);
+        }
+
+        let inner = plain_num_elements(&out_shape[axis + 1..]);
+        let out_buffer = device.create_empty_storage_buffer(out_len, "gpu-concat-out")?;
+        let mut axis_offset = 0usize;
+        for part in &contiguous_parts {
+            let params = ConcatParams {
+                part_len: usize_to_u32(part.num_elements(), "concat part length")?,
+                inner: usize_to_u32(inner, "concat inner span")?,
+                part_axis_len: usize_to_u32(part.shape[axis], "concat part axis length")?,
+                out_axis_len: usize_to_u32(out_shape[axis], "concat output axis length")?,
+                axis_offset: usize_to_u32(axis_offset, "concat axis offset")?,
+                _reserved0: 0,
+                _reserved1: 0,
+                _reserved2: 0,
+            };
+            let params_buffer = device.create_storage_buffer_from_pod(&params, "gpu-concat-params");
+            device.dispatch_compute(
+                &device.inner.pipelines.concat,
+                &[&part.buffer, &out_buffer, &params_buffer],
+                elementwise_workgroups(params.part_len),
+                "concat",
+                None,
+            )?;
+            axis_offset += part.shape[axis];
+        }
+
+        Ok(Self {
+            buffer: out_buffer,
+            storage_elements: out_len,
+            shape: out_shape.clone(),
+            strides: contiguous_strides(&out_shape),
+            offset: 0,
+            device,
+        })
     }
 
     fn add(self, rhs: &Self) -> Result<Self> {
@@ -1219,25 +1289,221 @@ impl Tensor for GpuTensor {
         stride: usize,
         padding: usize,
     ) -> Result<Self> {
-        let device = self.device.clone();
-        self.cpu_fallback_binary(kernel, "conv1d_dw", |lhs, rhs| {
-            let bias_cpu = bias.map(GpuTensor::to_cpu_tensor).transpose()?;
-            lhs.conv1d_dw(rhs, bias_cpu.as_ref(), stride, padding)
-        })
-        .map(|mut tensor| {
-            tensor.device = device;
-            tensor
+        self.ensure_same_device(kernel, "conv1d_dw")?;
+        if stride == 0 {
+            return Err(invalid_arg("conv1d_dw requires stride > 0"));
+        }
+
+        let input = self.contiguous()?;
+        let kernel = kernel.clone().contiguous()?;
+        if input.shape.len() != 2 {
+            return Err(invalid_arg(format!(
+                "conv1d_dw expects input shape [time, channels], got {:?}",
+                input.shape
+            )));
+        }
+        if kernel.shape.len() != 2 {
+            return Err(invalid_arg(format!(
+                "conv1d_dw kernel must have shape [channels, kernel_size], got {:?}",
+                kernel.shape
+            )));
+        }
+
+        let (time, channels) = (input.shape[0], input.shape[1]);
+        let (kernel_channels, kernel_size) = (kernel.shape[0], kernel.shape[1]);
+        if channels != kernel_channels {
+            return Err(invalid_arg(format!(
+                "conv1d_dw channel mismatch: input {:?}, kernel {:?}",
+                input.shape, kernel.shape
+            )));
+        }
+        if kernel_size == 0 {
+            return Err(invalid_arg(
+                "conv1d_dw kernel size must be greater than zero",
+            ));
+        }
+
+        let bias_tensor = if let Some(bias) = bias {
+            input.ensure_same_device(bias, "conv1d_dw")?;
+            let bias = bias.clone().contiguous()?;
+            if bias.shape != [channels] {
+                return Err(invalid_arg(format!(
+                    "conv1d_dw bias must have shape [{channels}], got {:?}",
+                    bias.shape
+                )));
+            }
+            Some(bias)
+        } else {
+            None
+        };
+
+        let padded = time.saturating_add(padding.saturating_mul(2));
+        let out_time = if padded < kernel_size {
+            0
+        } else {
+            (padded - kernel_size) / stride + 1
+        };
+        let out_shape = vec![out_time, channels];
+        let out_len = checked_num_elements(&out_shape)?;
+        if out_len == 0 {
+            return Self::zeros(&out_shape, &input.device);
+        }
+
+        let params = Conv1dDwParams {
+            time: usize_to_u32(time, "conv1d_dw time")?,
+            channels: usize_to_u32(channels, "conv1d_dw channels")?,
+            kernel_size: usize_to_u32(kernel_size, "conv1d_dw kernel size")?,
+            stride: usize_to_u32(stride, "conv1d_dw stride")?,
+            padding: usize_to_u32(padding, "conv1d_dw padding")?,
+            out_time: usize_to_u32(out_time, "conv1d_dw output time")?,
+            has_bias: if bias_tensor.is_some() { 1 } else { 0 },
+            _reserved: 0,
+        };
+        let params_buffer = input
+            .device
+            .create_storage_buffer_from_pod(&params, "gpu-conv1d-dw-params");
+        let out_buffer = input
+            .device
+            .create_empty_storage_buffer(out_len, "gpu-conv1d-dw-out")?;
+        let bias_buffer = bias_tensor
+            .as_ref()
+            .map(|tensor| &tensor.buffer)
+            .unwrap_or(&input.device.inner.dummy_buffer);
+        input.device.dispatch_compute(
+            &input.device.inner.pipelines.conv1d_dw,
+            &[
+                &input.buffer,
+                &kernel.buffer,
+                bias_buffer,
+                &out_buffer,
+                &params_buffer,
+            ],
+            (
+                div_ceil_u32(params.channels, ROW_WORKGROUP_X),
+                div_ceil_u32(params.out_time, ROW_WORKGROUP_Y),
+                1,
+            ),
+            "conv1d_dw",
+            None,
+        )?;
+
+        Ok(Self {
+            buffer: out_buffer,
+            storage_elements: out_len,
+            shape: out_shape.clone(),
+            strides: contiguous_strides(&out_shape),
+            offset: 0,
+            device: input.device.clone(),
         })
     }
 
     fn embedding(table: &Self, indices: &[i32]) -> Result<Self> {
-        let table_cpu = table.to_cpu_tensor()?;
-        let out = CpuTensor::embedding(&table_cpu, indices)?;
-        Self::from_cpu_tensor(out, &table.device)
+        let table = table.clone().contiguous()?;
+        if table.shape.len() != 2 {
+            return Err(invalid_arg(format!(
+                "embedding table must have shape [rows, dim], got {:?}",
+                table.shape
+            )));
+        }
+
+        let rows = table.shape[0];
+        let dim = table.shape[1];
+        for &index in indices {
+            let source_row = usize::try_from(index)
+                .map_err(|_| invalid_arg(format!("embedding index {index} is negative")))?;
+            if source_row >= rows {
+                return Err(invalid_arg(format!(
+                    "embedding index {} is out of bounds for {} rows",
+                    source_row, rows
+                )));
+            }
+        }
+
+        let out_shape = vec![indices.len(), dim];
+        let out_len = checked_num_elements(&out_shape)?;
+        if out_len == 0 {
+            return Self::zeros(&out_shape, &table.device);
+        }
+
+        let params = EmbeddingParams {
+            out_len: usize_to_u32(out_len, "embedding output length")?,
+            dim: usize_to_u32(dim, "embedding dim")?,
+            _reserved0: 0,
+            _reserved1: 0,
+        };
+        let params_buffer = table
+            .device
+            .create_storage_buffer_from_pod(&params, "gpu-embedding-params");
+        let indices_buffer = table
+            .device
+            .create_storage_buffer_from_i32(indices, "gpu-embedding-indices");
+        let out_buffer = table
+            .device
+            .create_empty_storage_buffer(out_len, "gpu-embedding-out")?;
+        table.device.dispatch_compute(
+            &table.device.inner.pipelines.embedding,
+            &[&table.buffer, &indices_buffer, &out_buffer, &params_buffer],
+            elementwise_workgroups(params.out_len),
+            "embedding",
+            None,
+        )?;
+
+        Ok(Self {
+            buffer: out_buffer,
+            storage_elements: out_len,
+            shape: out_shape.clone(),
+            strides: contiguous_strides(&out_shape),
+            offset: 0,
+            device: table.device.clone(),
+        })
     }
 
     fn repeat(self, axis: usize, n: usize) -> Result<Self> {
-        self.cpu_fallback_unary("repeat", |tensor| tensor.repeat(axis, n))
+        let input = self.contiguous()?;
+        let rank = input.shape.len();
+        validate_axis(axis, rank, "repeat")?;
+
+        let mut out_shape = input.shape.clone();
+        out_shape[axis] = out_shape[axis]
+            .checked_mul(n)
+            .ok_or_else(|| invalid_arg("repeat axis size overflow"))?;
+        let out_len = checked_num_elements(&out_shape)?;
+        if out_len == 0 {
+            return Self::zeros(&out_shape, &input.device);
+        }
+
+        let params = RepeatParams {
+            out_len: usize_to_u32(out_len, "repeat output length")?,
+            outer: usize_to_u32(plain_num_elements(&input.shape[..axis]), "repeat outer")?,
+            axis_len: usize_to_u32(input.shape[axis], "repeat axis length")?,
+            inner: usize_to_u32(plain_num_elements(&input.shape[axis + 1..]), "repeat inner")?,
+            repeat_n: usize_to_u32(n, "repeat count")?,
+            _reserved0: 0,
+            _reserved1: 0,
+            _reserved2: 0,
+        };
+        let params_buffer = input
+            .device
+            .create_storage_buffer_from_pod(&params, "gpu-repeat-params");
+        let out_buffer = input
+            .device
+            .create_empty_storage_buffer(out_len, "gpu-repeat-out")?;
+        input.device.dispatch_compute(
+            &input.device.inner.pipelines.repeat,
+            &[&input.buffer, &out_buffer, &params_buffer],
+            elementwise_workgroups(params.out_len),
+            "repeat",
+            None,
+        )?;
+
+        Ok(Self {
+            buffer: out_buffer,
+            storage_elements: out_len,
+            shape: out_shape.clone(),
+            strides: contiguous_strides(&out_shape),
+            offset: 0,
+            device: input.device.clone(),
+        })
     }
 }
 
@@ -1250,6 +1516,10 @@ impl Pipelines {
         let arithmetic_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tensor-arithmetic-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/arithmetic.wgsl").into()),
+        });
+        let layout_ops_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("tensor-layout-ops-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/layout_ops.wgsl").into()),
         });
         let rms_norm_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tensor-rms-norm-shader"),
@@ -1274,6 +1544,7 @@ impl Pipelines {
 
         Self {
             contiguous: create_pipeline(device, &contiguous_module, "main", "tensor-contiguous"),
+            concat: create_pipeline(device, &layout_ops_module, "concat_main", "tensor-concat"),
             add: create_pipeline(device, &arithmetic_module, "add_main", "tensor-add"),
             mul: create_pipeline(device, &arithmetic_module, "mul_main", "tensor-mul"),
             scale: create_pipeline(device, &arithmetic_module, "scale_main", "tensor-scale"),
@@ -1290,6 +1561,19 @@ impl Pipelines {
                 "region_rope_main",
                 "tensor-region-rope",
             ),
+            conv1d_dw: create_pipeline(
+                device,
+                &layout_ops_module,
+                "conv1d_dw_main",
+                "tensor-conv1d-dw",
+            ),
+            embedding: create_pipeline(
+                device,
+                &layout_ops_module,
+                "embedding_main",
+                "tensor-embedding",
+            ),
+            repeat: create_pipeline(device, &layout_ops_module, "repeat_main", "tensor-repeat"),
         }
     }
 }
