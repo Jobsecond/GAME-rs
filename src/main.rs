@@ -1,8 +1,11 @@
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 #[cfg(feature = "gpu")]
@@ -13,6 +16,7 @@ use game_crabml::{
     load_gguf, prepare_wav_for_inference, slice_waveform, split_long_chunks, write_midi_file,
     write_text_file,
 };
+use log::{Level, info, warn};
 use serde_json::{Map, Value, json};
 
 #[derive(Debug, Parser)]
@@ -124,8 +128,10 @@ enum ExtractDevice {
 }
 
 const DEFAULT_MAX_CHUNK_SECONDS: usize = 60;
+static LOGGER_START: OnceLock<Instant> = OnceLock::new();
 
 fn main() -> ExitCode {
+    init_logging();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -156,24 +162,44 @@ fn extract(args: ExtractArgs) -> Result<()> {
         ));
     }
 
+    let mut progress = ExtractProgress::new(&args);
     let format = resolve_extract_format(args.format, &args.output);
-    let model = load_model_for_extract(&args.model, args.device, &args.gpu)?;
-    let waveform =
-        prepare_wav_for_inference(&args.input, model.config().inference.audio_sample_rate)?;
-    let chunks = slice_waveform(
-        &waveform.samples,
-        &SlicerConfig {
-            sample_rate: waveform.sample_rate,
-            ..SlicerConfig::default()
-        },
-    )?;
-    let chunks = split_long_chunks(
-        &chunks,
-        waveform.sample_rate,
-        waveform.sample_rate.saturating_mul(args.max_chunk_seconds),
-    )?;
-    let total_frames = MelExtractor::from_inference_config(&model.config().inference)?
-        .num_frames(waveform.samples.len());
+    progress.log_start(format);
+
+    progress.log_step_start("loading model");
+    let (model, load_elapsed) =
+        timed_result(|| load_model_for_extract(&args.model, args.device, &args.gpu))?;
+    progress.record_model_loaded(&model, load_elapsed);
+
+    progress.log_step_start("preparing audio");
+    let (waveform, audio_elapsed) = timed_result(|| {
+        prepare_wav_for_inference(&args.input, model.config().inference.audio_sample_rate)
+    })?;
+    progress.record_audio_prepared(&waveform, audio_elapsed);
+
+    let slicer_config = SlicerConfig {
+        sample_rate: waveform.sample_rate,
+        ..SlicerConfig::default()
+    };
+    progress.log_step_start("slicing audio on silence");
+    let (sliced_chunks, slice_elapsed) =
+        timed_result(|| slice_waveform(&waveform.samples, &slicer_config))?;
+    progress.record_slice_complete(&sliced_chunks, slice_elapsed);
+    progress.log_step_start("splitting long chunks");
+    let (chunks, split_elapsed) = timed_result(|| {
+        split_long_chunks(
+            &sliced_chunks,
+            waveform.sample_rate,
+            waveform.sample_rate.saturating_mul(args.max_chunk_seconds),
+        )
+    })?;
+    progress.record_split_complete(&chunks, split_elapsed, &waveform);
+
+    progress.log_step_start("initializing mel extractor");
+    let (mel_extractor, mel_setup_elapsed) =
+        timed_result(|| MelExtractor::from_inference_config(&model.config().inference))?;
+    let total_frames = mel_extractor.num_frames(waveform.samples.len());
+    progress.record_mel_setup(total_frames, mel_setup_elapsed);
 
     let params = InferParams {
         language: args.language,
@@ -185,34 +211,19 @@ fn extract(args: ExtractArgs) -> Result<()> {
         seed: args.seed,
         ..InferParams::default()
     };
-    let result = run_chunked_extract(&model, &chunks, &params)?;
+    progress.log_inference_start(chunks.len());
+    let (result, inference_elapsed) = timed_result(|| {
+        run_chunked_extract_with_progress(&model, &chunks, &params, &mut progress)
+    })?;
+    progress.record_inference_complete(&result, inference_elapsed);
 
-    ensure_output_parent_dir(&args.output)?;
-    write_extract_output(&args.output, format, &result.notes)?;
-
-    if waveform.was_resampled() || waveform.was_downmixed() {
-        eprintln!(
-            "audio: {} Hz/{} ch -> {} Hz mono",
-            waveform.source_sample_rate, waveform.source_channels, waveform.sample_rate
-        );
-    }
-    eprintln!("backend: {}", backend_name(model.backend()));
-    #[cfg(feature = "gpu")]
-    if let Some(adapter) = model.gpu_adapter_info() {
-        eprintln!(
-            "gpu: {} (backend={}, type={}, vendor=0x{:04x}, device=0x{:04x})",
-            adapter.name,
-            wgpu_backend_name(adapter.backend),
-            wgpu_device_type_name(adapter.device_type),
-            adapter.vendor,
-            adapter.device
-        );
-    }
-    eprintln!("max_chunk_seconds: {}", args.max_chunk_seconds);
-    eprintln!("chunks: {}", result.chunk_count);
-    eprintln!("frames: {}", total_frames);
-    eprintln!("notes: {}", result.notes.len());
-    eprintln!("wrote {}", args.output.display());
+    progress.log_step_start("writing output");
+    let (_, write_elapsed) = timed_result(|| {
+        ensure_output_parent_dir(&args.output)?;
+        write_extract_output(&args.output, format, &result.notes)
+    })?;
+    progress.record_output_written(&args.output, write_elapsed);
+    progress.print_summary(&waveform, &model, total_frames, &result);
     Ok(())
 }
 
@@ -221,18 +232,39 @@ struct ChunkedExtractResult {
     chunk_count: usize,
 }
 
+#[cfg(test)]
 fn run_chunked_extract(
     model: &Model,
     chunks: &[SliceChunk],
     params: &InferParams,
 ) -> Result<ChunkedExtractResult> {
+    run_chunked_extract_with_progress(model, chunks, params, &mut NoopExtractProgress)
+}
+
+fn run_chunked_extract_with_progress(
+    model: &Model,
+    chunks: &[SliceChunk],
+    params: &InferParams,
+    progress: &mut impl ExtractProgressLogger,
+) -> Result<ChunkedExtractResult> {
     let mut notes = Vec::new();
-    for chunk in chunks {
+    for (index, chunk) in chunks.iter().enumerate() {
+        let chunk_start = Instant::now();
+        let chunk_duration_seconds =
+            chunk.waveform.len() as f64 / model.config().inference.audio_sample_rate as f64;
+        progress.log_chunk_start(
+            index,
+            chunks.len(),
+            chunk.offset_seconds,
+            chunk_duration_seconds,
+        );
         let result = model.infer(&chunk.waveform, params)?;
+        let chunk_notes = result.notes.len();
         for mut note in result.notes {
             note.offset_seconds += chunk.offset_seconds as f32;
             notes.push(note);
         }
+        progress.log_chunk_complete(index, chunks.len(), chunk_notes, chunk_start.elapsed());
     }
 
     Ok(ChunkedExtractResult {
@@ -311,7 +343,7 @@ fn load_auto_model(model_path: &Path) -> Result<Model> {
         Ok(model) => Ok(model),
         Err(gpu_err) => match Model::load(model_path, Backend::Cpu) {
             Ok(model) => {
-                eprintln!("GPU backend unavailable ({gpu_err}); falling back to CPU.");
+                warn!("GPU backend unavailable ({gpu_err}); falling back to CPU");
                 Ok(model)
             }
             Err(cpu_err) => Err(Error::message(format!(
@@ -362,6 +394,364 @@ fn wgpu_device_type_name(device_type: wgpu::DeviceType) -> &'static str {
         wgpu::DeviceType::DiscreteGpu => "discrete",
         wgpu::DeviceType::VirtualGpu => "virtual",
         wgpu::DeviceType::Cpu => "cpu",
+    }
+}
+
+fn init_logging() {
+    LOGGER_START.get_or_init(Instant::now);
+    let env = env_logger::Env::default().default_filter_or("info");
+    let mut builder = env_logger::Builder::from_env(env);
+    builder.format_timestamp(None);
+    builder.format_module_path(false);
+    builder.format_target(false);
+    builder.format(|buf, record| {
+        let elapsed = LOGGER_START
+            .get()
+            .map(|start| format_duration(start.elapsed()))
+            .unwrap_or_else(|| "0.000s".to_owned());
+        writeln!(
+            buf,
+            "[{} +{}] {}",
+            log_level_name(record.level()),
+            elapsed,
+            record.args()
+        )
+    });
+    let _ = builder.try_init();
+}
+
+fn timed_result<T>(f: impl FnOnce() -> Result<T>) -> Result<(T, Duration)> {
+    let start = Instant::now();
+    let value = f()?;
+    Ok((value, start.elapsed()))
+}
+
+trait ExtractProgressLogger {
+    fn log_chunk_start(
+        &mut self,
+        chunk_index: usize,
+        chunk_count: usize,
+        offset_seconds: f64,
+        duration_seconds: f64,
+    );
+
+    fn log_chunk_complete(
+        &mut self,
+        chunk_index: usize,
+        chunk_count: usize,
+        chunk_notes: usize,
+        elapsed: Duration,
+    );
+}
+
+#[cfg(test)]
+struct NoopExtractProgress;
+
+#[cfg(test)]
+impl ExtractProgressLogger for NoopExtractProgress {
+    fn log_chunk_start(
+        &mut self,
+        _chunk_index: usize,
+        _chunk_count: usize,
+        _offset_seconds: f64,
+        _duration_seconds: f64,
+    ) {
+    }
+
+    fn log_chunk_complete(
+        &mut self,
+        _chunk_index: usize,
+        _chunk_count: usize,
+        _chunk_notes: usize,
+        _elapsed: Duration,
+    ) {
+    }
+}
+
+struct ExtractProgress<'a> {
+    args: &'a ExtractArgs,
+    started_at: Instant,
+    model_load_elapsed: Duration,
+    audio_prepare_elapsed: Duration,
+    slice_elapsed: Duration,
+    split_elapsed: Duration,
+    mel_setup_elapsed: Duration,
+    inference_elapsed: Duration,
+    write_elapsed: Duration,
+    original_chunk_count: usize,
+}
+
+impl<'a> ExtractProgress<'a> {
+    fn new(args: &'a ExtractArgs) -> Self {
+        Self {
+            args,
+            started_at: Instant::now(),
+            model_load_elapsed: Duration::ZERO,
+            audio_prepare_elapsed: Duration::ZERO,
+            slice_elapsed: Duration::ZERO,
+            split_elapsed: Duration::ZERO,
+            mel_setup_elapsed: Duration::ZERO,
+            inference_elapsed: Duration::ZERO,
+            write_elapsed: Duration::ZERO,
+            original_chunk_count: 0,
+        }
+    }
+
+    fn log_start(&self, format: ExtractFormat) {
+        info!(
+            "starting extract: input={} model={} output={} format={} requested_device={}",
+            self.args.input.display(),
+            self.args.model.display(),
+            self.args.output.display(),
+            extract_format_name(format),
+            self.args.device.map(extract_device_name).unwrap_or("auto")
+        );
+    }
+
+    fn log_step_start(&self, step_name: &str) {
+        info!("{step_name}...");
+    }
+
+    fn record_model_loaded(&mut self, model: &Model, elapsed: Duration) {
+        self.model_load_elapsed = elapsed;
+        info!(
+            "model loaded: backend={} elapsed={}",
+            backend_name(model.backend()),
+            format_duration(elapsed)
+        );
+        #[cfg(feature = "gpu")]
+        if let Some(adapter) = model.gpu_adapter_info() {
+            info!(
+                "gpu adapter: {} (backend={}, type={}, vendor=0x{:04x}, device=0x{:04x})",
+                adapter.name,
+                wgpu_backend_name(adapter.backend),
+                wgpu_device_type_name(adapter.device_type),
+                adapter.vendor,
+                adapter.device
+            );
+        }
+    }
+
+    fn record_audio_prepared(
+        &mut self,
+        waveform: &game_crabml::PreparedWaveform,
+        elapsed: Duration,
+    ) {
+        self.audio_prepare_elapsed = elapsed;
+        let input_seconds = if waveform.source_sample_rate == 0 {
+            0.0
+        } else {
+            waveform.samples.len() as f64 / waveform.sample_rate as f64
+        };
+        if waveform.was_resampled() || waveform.was_downmixed() {
+            info!(
+                "audio prepared: {} Hz/{} ch -> {} Hz mono, samples={}, duration={:.2}s, elapsed={}",
+                waveform.source_sample_rate,
+                waveform.source_channels,
+                waveform.sample_rate,
+                waveform.samples.len(),
+                input_seconds,
+                format_duration(elapsed)
+            );
+        } else {
+            info!(
+                "audio prepared: {} Hz mono, samples={}, duration={:.2}s, elapsed={}",
+                waveform.sample_rate,
+                waveform.samples.len(),
+                input_seconds,
+                format_duration(elapsed)
+            );
+        }
+    }
+
+    fn record_slice_complete(&mut self, sliced_chunks: &[SliceChunk], slice_elapsed: Duration) {
+        self.slice_elapsed = slice_elapsed;
+        self.original_chunk_count = sliced_chunks.len();
+        info!(
+            "silence slicing complete: chunks={} elapsed={}",
+            sliced_chunks.len(),
+            format_duration(slice_elapsed)
+        );
+    }
+
+    fn record_split_complete(
+        &mut self,
+        chunks: &[SliceChunk],
+        split_elapsed: Duration,
+        waveform: &game_crabml::PreparedWaveform,
+    ) {
+        self.split_elapsed = split_elapsed;
+        let max_samples = waveform
+            .sample_rate
+            .saturating_mul(self.args.max_chunk_seconds);
+        info!(
+            "long-chunk split complete: chunks={} max_chunk_seconds={} max_chunk_samples={} elapsed={}",
+            chunks.len(),
+            self.args.max_chunk_seconds,
+            max_samples,
+            format_duration(split_elapsed)
+        );
+    }
+
+    fn record_mel_setup(&mut self, total_frames: usize, elapsed: Duration) {
+        self.mel_setup_elapsed = elapsed;
+        info!(
+            "mel extractor ready: frames={} elapsed={}",
+            total_frames,
+            format_duration(elapsed)
+        );
+    }
+
+    fn log_inference_start(&self, chunk_count: usize) {
+        info!("running inference across {chunk_count} chunk(s)");
+    }
+
+    fn record_inference_complete(&mut self, result: &ChunkedExtractResult, elapsed: Duration) {
+        self.inference_elapsed = elapsed;
+        info!(
+            "inference complete: chunks={} notes={} elapsed={}",
+            result.chunk_count,
+            result.notes.len(),
+            format_duration(elapsed)
+        );
+    }
+
+    fn record_output_written(&mut self, output: &Path, elapsed: Duration) {
+        self.write_elapsed = elapsed;
+        info!(
+            "output written: path={} elapsed={}",
+            output.display(),
+            format_duration(elapsed)
+        );
+    }
+
+    fn print_summary(
+        &self,
+        waveform: &game_crabml::PreparedWaveform,
+        model: &Model,
+        total_frames: usize,
+        result: &ChunkedExtractResult,
+    ) {
+        if waveform.was_resampled() || waveform.was_downmixed() {
+            eprintln!(
+                "audio: {} Hz/{} ch -> {} Hz mono",
+                waveform.source_sample_rate, waveform.source_channels, waveform.sample_rate
+            );
+        } else {
+            eprintln!("audio: {} Hz mono", waveform.sample_rate);
+        }
+        eprintln!("backend: {}", backend_name(model.backend()));
+        #[cfg(feature = "gpu")]
+        if let Some(adapter) = model.gpu_adapter_info() {
+            eprintln!(
+                "gpu: {} (backend={}, type={}, vendor=0x{:04x}, device=0x{:04x})",
+                adapter.name,
+                wgpu_backend_name(adapter.backend),
+                wgpu_device_type_name(adapter.device_type),
+                adapter.vendor,
+                adapter.device
+            );
+        }
+        eprintln!("max_chunk_seconds: {}", self.args.max_chunk_seconds);
+        eprintln!("chunks: {}", result.chunk_count);
+        eprintln!("frames: {}", total_frames);
+        eprintln!("notes: {}", result.notes.len());
+        eprintln!("wrote {}", self.args.output.display());
+        eprintln!(
+            "elapsed_total: {}",
+            format_duration(self.started_at.elapsed())
+        );
+        eprintln!(
+            "elapsed_model_load: {}",
+            format_duration(self.model_load_elapsed)
+        );
+        eprintln!(
+            "elapsed_audio_prepare: {}",
+            format_duration(self.audio_prepare_elapsed)
+        );
+        eprintln!("elapsed_slice: {}", format_duration(self.slice_elapsed));
+        eprintln!(
+            "elapsed_long_chunk_split: {}",
+            format_duration(self.split_elapsed)
+        );
+        eprintln!(
+            "elapsed_mel_setup: {}",
+            format_duration(self.mel_setup_elapsed)
+        );
+        eprintln!(
+            "elapsed_inference: {}",
+            format_duration(self.inference_elapsed)
+        );
+        eprintln!(
+            "elapsed_output_write: {}",
+            format_duration(self.write_elapsed)
+        );
+        if self.original_chunk_count != 0 && self.original_chunk_count != result.chunk_count {
+            eprintln!("chunks_before_long_split: {}", self.original_chunk_count);
+        }
+    }
+}
+
+impl ExtractProgressLogger for ExtractProgress<'_> {
+    fn log_chunk_start(
+        &mut self,
+        chunk_index: usize,
+        chunk_count: usize,
+        offset_seconds: f64,
+        duration_seconds: f64,
+    ) {
+        info!(
+            "chunk {}/{}: infer start offset={:.2}s duration={:.2}s",
+            chunk_index + 1,
+            chunk_count,
+            offset_seconds,
+            duration_seconds
+        );
+    }
+
+    fn log_chunk_complete(
+        &mut self,
+        chunk_index: usize,
+        chunk_count: usize,
+        chunk_notes: usize,
+        elapsed: Duration,
+    ) {
+        info!(
+            "chunk {}/{}: infer done notes={} elapsed={}",
+            chunk_index + 1,
+            chunk_count,
+            chunk_notes,
+            format_duration(elapsed)
+        );
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    format!("{:.3}s", duration.as_secs_f64())
+}
+
+fn log_level_name(level: Level) -> &'static str {
+    match level {
+        Level::Error => "error",
+        Level::Warn => "warn",
+        Level::Info => "info",
+        Level::Debug => "debug",
+        Level::Trace => "trace",
+    }
+}
+
+fn extract_device_name(device: ExtractDevice) -> &'static str {
+    match device {
+        ExtractDevice::Cpu => "cpu",
+        ExtractDevice::Gpu => "gpu",
+    }
+}
+
+fn extract_format_name(format: ExtractFormat) -> &'static str {
+    match format {
+        ExtractFormat::Midi => "midi",
+        ExtractFormat::Txt => "txt",
+        ExtractFormat::Csv => "csv",
     }
 }
 
