@@ -377,22 +377,14 @@ impl Tensor for CpuTensor {
         let rhs_shape = rhs.shape.clone();
         let device = self.device.clone();
 
-        let lhs_owned;
-        let lhs: &[f32] = match self.as_contiguous_slice() {
-            Some(s) => s,
-            None => {
-                lhs_owned = self.to_vec()?;
-                &lhs_owned
-            }
-        };
-        let rhs_owned;
-        let rhs_data: &[f32] = match rhs.as_contiguous_slice() {
-            Some(s) => s,
-            None => {
-                rhs_owned = rhs.to_vec()?;
-                &rhs_owned
-            }
-        };
+        // Stride-aware data access: for 2D tensors we can pass the actual strides
+        // directly to sgemm, avoiding the expensive to_vec() coordinate walk on
+        // transposed views (e.g. k_t in attention).
+        //
+        // For the pointer to be valid the underlying Arc<Vec<f32>> storage must be
+        // a single contiguous allocation that the strides index into.  This is
+        // always true for tensors produced by `from_owned` / `transpose` / `slice`
+        // — the data is never scattered.
 
         match (lhs_shape.len(), rhs_shape.len()) {
             (2, 2) => {
@@ -405,29 +397,32 @@ impl Tensor for CpuTensor {
                     )));
                 }
 
+                let lhs_ptr = self.data[self.offset..].as_ptr();
+                let lhs_rs = self.strides[0] as isize;
+                let lhs_cs = self.strides[1] as isize;
+
+                let rhs_ptr = rhs.data[rhs.offset..].as_ptr();
+                let rhs_rs = rhs.strides[0] as isize;
+                let rhs_cs = rhs.strides[1] as isize;
+
                 let mut out = vec![0.0; m * n];
-                if should_parallelize(out.len()) && n > 0 {
-                    out.par_chunks_mut(n)
-                        .enumerate()
-                        .for_each(|(row, out_row)| {
-                            for (col, value) in out_row.iter_mut().enumerate() {
-                                let mut sum = 0.0;
-                                for kk in 0..k {
-                                    sum += lhs[row * k + kk] * rhs_data[kk * n + col];
-                                }
-                                *value = sum;
-                            }
-                        });
-                } else {
-                    for row in 0..m {
-                        for col in 0..n {
-                            let mut sum = 0.0;
-                            for kk in 0..k {
-                                sum += lhs[row * k + kk] * rhs_data[kk * n + col];
-                            }
-                            out[row * n + col] = sum;
-                        }
-                    }
+                unsafe {
+                    matrixmultiply::sgemm(
+                        m,
+                        k,
+                        n,
+                        1.0,
+                        lhs_ptr,
+                        lhs_rs,
+                        lhs_cs,
+                        rhs_ptr,
+                        rhs_rs,
+                        rhs_cs,
+                        0.0,
+                        out.as_mut_ptr(),
+                        n as isize,
+                        1,
+                    );
                 }
                 Self::from_owned(out, vec![m, n], device)
             }
@@ -442,35 +437,70 @@ impl Tensor for CpuTensor {
                 }
 
                 let mut out = vec![0.0; batch * m * n];
-                if should_parallelize(out.len()) && n > 0 {
-                    out.par_chunks_mut(n)
+                let batch_out_size = m * n;
+
+                // For 3D batched matmul, use stride-aware access.
+                // Batch stride is strides[0], inner matrix strides are strides[1..2].
+                let lhs_batch_stride = self.strides[0];
+                let lhs_rs = self.strides[1] as isize;
+                let lhs_cs = self.strides[2] as isize;
+
+                let rhs_batch_stride = rhs.strides[0];
+                let rhs_rs = rhs.strides[1] as isize;
+                let rhs_cs = rhs.strides[2] as isize;
+
+                if should_parallelize(out.len()) {
+                    // Parallelize across batches
+                    out.par_chunks_mut(batch_out_size)
                         .enumerate()
-                        .for_each(|(row_index, out_row)| {
-                            let b = row_index / m;
-                            let row = row_index % m;
-                            for (col, value) in out_row.iter_mut().enumerate() {
-                                let mut sum = 0.0;
-                                for kk in 0..k {
-                                    let lhs_index = (b * m + row) * k + kk;
-                                    let rhs_index = (b * rhs_k + kk) * n + col;
-                                    sum += lhs[lhs_index] * rhs_data[rhs_index];
-                                }
-                                *value = sum;
+                        .for_each(|(b, out_batch)| {
+                            let lhs_ptr =
+                                self.data[self.offset + b * lhs_batch_stride..].as_ptr();
+                            let rhs_ptr =
+                                rhs.data[rhs.offset + b * rhs_batch_stride..].as_ptr();
+                            unsafe {
+                                matrixmultiply::sgemm(
+                                    m,
+                                    k,
+                                    n,
+                                    1.0,
+                                    lhs_ptr,
+                                    lhs_rs,
+                                    lhs_cs,
+                                    rhs_ptr,
+                                    rhs_rs,
+                                    rhs_cs,
+                                    0.0,
+                                    out_batch.as_mut_ptr(),
+                                    n as isize,
+                                    1,
+                                );
                             }
                         });
                 } else {
                     for b in 0..batch {
-                        for row in 0..m {
-                            for col in 0..n {
-                                let mut sum = 0.0;
-                                for kk in 0..k {
-                                    let lhs_index = (b * m + row) * k + kk;
-                                    let rhs_index = (b * rhs_k + kk) * n + col;
-                                    sum += lhs[lhs_index] * rhs_data[rhs_index];
-                                }
-                                let out_index = (b * m + row) * n + col;
-                                out[out_index] = sum;
-                            }
+                        let lhs_ptr =
+                            self.data[self.offset + b * lhs_batch_stride..].as_ptr();
+                        let rhs_ptr =
+                            rhs.data[rhs.offset + b * rhs_batch_stride..].as_ptr();
+                        let out_offset = b * batch_out_size;
+                        unsafe {
+                            matrixmultiply::sgemm(
+                                m,
+                                k,
+                                n,
+                                1.0,
+                                lhs_ptr,
+                                lhs_rs,
+                                lhs_cs,
+                                rhs_ptr,
+                                rhs_rs,
+                                rhs_cs,
+                                0.0,
+                                out[out_offset..].as_mut_ptr(),
+                                n as isize,
+                                1,
+                            );
                         }
                     }
                 }
@@ -535,32 +565,41 @@ impl Tensor for CpuTensor {
         let bias_data = bias.map(CpuTensor::to_vec).transpose()?;
         let mut out = vec![0.0; rows * out_dim];
 
-        if should_parallelize(out.len()) && out_dim > 0 {
-            out.par_chunks_mut(out_dim)
-                .enumerate()
-                .for_each(|(row, out_row)| {
+        // Use sgemm for y = x @ W^T
+        // x is [rows, in_dim], W is [out_dim, in_dim], W^T is [in_dim, out_dim]
+        // Result is [rows, out_dim]
+        unsafe {
+            matrixmultiply::sgemm(
+                rows,
+                in_dim,
+                out_dim,
+                1.0,
+                input.as_ptr(),
+                in_dim as isize,
+                1,
+                weight_data.as_ptr(),
+                1,
+                in_dim as isize, // transposed stride
+                0.0,
+                out.as_mut_ptr(),
+                out_dim as isize,
+                1,
+            );
+        }
+
+        // Add bias if present
+        if let Some(bias_values) = &bias_data {
+            if should_parallelize(out.len()) && out_dim > 0 {
+                out.par_chunks_mut(out_dim).for_each(|out_row| {
                     for (out_idx, value) in out_row.iter_mut().enumerate() {
-                        let mut sum = bias_data
-                            .as_ref()
-                            .map_or(0.0, |bias_values| bias_values[out_idx]);
-                        for in_idx in 0..in_dim {
-                            sum += input[row * in_dim + in_idx]
-                                * weight_data[out_idx * in_dim + in_idx];
-                        }
-                        *value = sum;
+                        *value += bias_values[out_idx];
                     }
                 });
-        } else {
-            for row in 0..rows {
-                for out_idx in 0..out_dim {
-                    let mut sum = bias_data
-                        .as_ref()
-                        .map_or(0.0, |bias_values| bias_values[out_idx]);
-                    for in_idx in 0..in_dim {
-                        sum +=
-                            input[row * in_dim + in_idx] * weight_data[out_idx * in_dim + in_idx];
+            } else {
+                for row in 0..rows {
+                    for out_idx in 0..out_dim {
+                        out[row * out_dim + out_idx] += bias_values[out_idx];
                     }
-                    out[row * out_dim + out_idx] = sum;
                 }
             }
         }
