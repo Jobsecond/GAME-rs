@@ -1,16 +1,21 @@
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+#[cfg(feature = "gpu")]
+use game_crabml::GpuAdapterSelector;
 use game_crabml::{
-    BackboneConfig, Error, GpuAdapterSelector, LoadedGgufModel, LoadedTensor, Result, load_gguf,
+    BackboneConfig, Backend, Error, InferParams, LoadedGgufModel, LoadedTensor, MidiWriteOptions,
+    Model, Result, TextOutputFormat, TextWriteOptions, load_gguf, write_midi_file, write_text_file,
 };
+use hound::{SampleFormat, WavReader};
 use serde_json::{Map, Value, json};
 
 #[derive(Debug, Parser)]
-#[command(author, version, about = "Rust port scaffold for GAME GGUF inference")]
+#[command(author, version, about = "Rust port of GAME GGUF inference")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -18,31 +23,64 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Inspect {
-        #[arg(short = 'm', long = "model")]
-        model: PathBuf,
+    Inspect(InspectArgs),
+    Extract(ExtractArgs),
+}
 
-        #[arg(long, default_value_t = 8)]
-        show_tensors: usize,
+#[derive(Debug, Args)]
+struct InspectArgs {
+    #[arg(short = 'm', long = "model")]
+    model: PathBuf,
 
-        #[arg(long)]
-        tensor_prefix: Option<String>,
+    #[arg(long, default_value_t = 8)]
+    show_tensors: usize,
 
-        #[arg(long, value_enum, default_value_t = InspectFormat::Text)]
-        format: InspectFormat,
-    },
-    Extract {
-        #[arg(short = 'm', long = "model")]
-        model: PathBuf,
+    #[arg(long)]
+    tensor_prefix: Option<String>,
 
-        #[arg(short = 'o', long = "output")]
-        output: PathBuf,
+    #[arg(long, value_enum, default_value_t = InspectFormat::Text)]
+    format: InspectFormat,
+}
 
-        input: PathBuf,
+#[derive(Debug, Args)]
+struct ExtractArgs {
+    #[arg(short = 'm', long = "model")]
+    model: PathBuf,
 
-        #[command(flatten)]
-        gpu: GpuSelectorArgs,
-    },
+    #[arg(short = 'o', long = "output")]
+    output: PathBuf,
+
+    #[arg(long, value_enum)]
+    format: Option<ExtractFormat>,
+
+    #[arg(long, value_enum, help = "default: gpu if available, otherwise cpu")]
+    device: Option<ExtractDevice>,
+
+    #[arg(long, default_value_t = 0)]
+    language: i32,
+
+    #[arg(long = "d3pm-nsteps", default_value_t = 1)]
+    d3pm_nsteps: i32,
+
+    #[arg(long = "d3pm-t0", default_value_t = 0.0)]
+    d3pm_t0: f32,
+
+    #[arg(long = "boundary-threshold", default_value_t = 0.2)]
+    boundary_threshold: f32,
+
+    #[arg(long = "boundary-radius", default_value_t = 2)]
+    boundary_radius: i32,
+
+    #[arg(long = "note-threshold", default_value_t = 0.2)]
+    note_threshold: f32,
+
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+
+    #[command(flatten)]
+    gpu: GpuSelectorArgs,
+
+    input: PathBuf,
 }
 
 #[derive(Debug, Args, Default, Clone)]
@@ -63,6 +101,19 @@ enum InspectFormat {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ExtractFormat {
+    Midi,
+    Txt,
+    Csv,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ExtractDevice {
+    Cpu,
+    Gpu,
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -77,24 +128,202 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Inspect {
-            model,
-            show_tensors,
-            tensor_prefix,
-            format,
-        } => inspect(model, show_tensors, tensor_prefix, format),
-        Command::Extract {
-            model,
-            output,
-            input,
-            gpu,
-        } => Err(Error::message(format!(
-            "`extract` is not implemented yet. Phase 1 currently supports GGUF inspection only. model={}, output={}, input={}, gpu={}",
-            model.display(),
-            output.display(),
-            input.display(),
-            describe_gpu_selector(&gpu.into_selector())
-        ))),
+        Command::Inspect(args) => inspect(
+            args.model,
+            args.show_tensors,
+            args.tensor_prefix,
+            args.format,
+        ),
+        Command::Extract(args) => extract(args),
+    }
+}
+
+fn extract(args: ExtractArgs) -> Result<()> {
+    if matches!(args.device, Some(ExtractDevice::Cpu)) && args.gpu.has_any() {
+        return Err(Error::message(
+            "GPU selector flags cannot be used with `--device cpu`",
+        ));
+    }
+
+    let format = resolve_extract_format(args.format, &args.output);
+    let model = load_model_for_extract(&args.model, args.device, &args.gpu)?;
+    let waveform = load_wav_mono_f32(&args.input, model.config().inference.audio_sample_rate)?;
+
+    let params = InferParams {
+        language: args.language,
+        d3pm_t0: args.d3pm_t0,
+        d3pm_nsteps: args.d3pm_nsteps,
+        boundary_threshold: args.boundary_threshold,
+        boundary_radius: args.boundary_radius,
+        note_threshold: args.note_threshold,
+        seed: args.seed,
+        ..InferParams::default()
+    };
+    let result = model.infer(&waveform, &params)?;
+
+    ensure_output_parent_dir(&args.output)?;
+    write_extract_output(&args.output, format, &result.notes)?;
+
+    eprintln!("backend: {}", backend_name(model.backend()));
+    eprintln!("frames: {}", result.num_frames);
+    eprintln!("notes: {}", result.notes.len());
+    eprintln!("wrote {}", args.output.display());
+    Ok(())
+}
+
+fn write_extract_output(
+    path: &Path,
+    format: ExtractFormat,
+    notes: &[game_crabml::Note],
+) -> Result<()> {
+    match format {
+        ExtractFormat::Midi => write_midi_file(path, notes, &MidiWriteOptions::default()),
+        ExtractFormat::Txt => write_text_file(
+            path,
+            notes,
+            TextOutputFormat::Txt,
+            &TextWriteOptions::default(),
+        ),
+        ExtractFormat::Csv => write_text_file(
+            path,
+            notes,
+            TextOutputFormat::Csv,
+            &TextWriteOptions::default(),
+        ),
+    }
+}
+
+fn resolve_extract_format(format: Option<ExtractFormat>, output: &Path) -> ExtractFormat {
+    format
+        .or_else(|| infer_extract_format(output))
+        .unwrap_or(ExtractFormat::Midi)
+}
+
+fn infer_extract_format(output: &Path) -> Option<ExtractFormat> {
+    let extension = output.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "mid" | "midi" => Some(ExtractFormat::Midi),
+        "txt" => Some(ExtractFormat::Txt),
+        "csv" => Some(ExtractFormat::Csv),
+        _ => None,
+    }
+}
+
+fn load_model_for_extract(
+    model_path: &Path,
+    device: Option<ExtractDevice>,
+    gpu: &GpuSelectorArgs,
+) -> Result<Model> {
+    match device {
+        Some(ExtractDevice::Cpu) => Model::load(model_path, Backend::Cpu),
+        Some(ExtractDevice::Gpu) => load_gpu_model(model_path, gpu),
+        None if gpu.has_any() => load_gpu_model(model_path, gpu),
+        None => load_auto_model(model_path),
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn load_gpu_model(model_path: &Path, gpu: &GpuSelectorArgs) -> Result<Model> {
+    let selector = gpu.to_selector();
+    Model::load_with_gpu_selector(model_path, selector.as_ref())
+}
+
+#[cfg(not(feature = "gpu"))]
+fn load_gpu_model(_model_path: &Path, _gpu: &GpuSelectorArgs) -> Result<Model> {
+    Err(Error::message(
+        "GPU extraction requested but the `gpu` cargo feature is disabled",
+    ))
+}
+
+#[cfg(feature = "gpu")]
+fn load_auto_model(model_path: &Path) -> Result<Model> {
+    match Model::load_with_gpu_selector(model_path, None) {
+        Ok(model) => Ok(model),
+        Err(gpu_err) => match Model::load(model_path, Backend::Cpu) {
+            Ok(model) => {
+                eprintln!("GPU backend unavailable ({gpu_err}); falling back to CPU.");
+                Ok(model)
+            }
+            Err(cpu_err) => Err(Error::message(format!(
+                "failed to load model on GPU ({gpu_err}) and CPU fallback also failed ({cpu_err})"
+            ))),
+        },
+    }
+}
+
+#[cfg(not(feature = "gpu"))]
+fn load_auto_model(model_path: &Path) -> Result<Model> {
+    Model::load(model_path, Backend::Cpu)
+}
+
+fn load_wav_mono_f32(path: &Path, expected_sample_rate: i32) -> Result<Vec<f32>> {
+    let mut reader = WavReader::open(path)
+        .map_err(|err| Error::message(format!("failed to open WAV {}: {err}", path.display())))?;
+    let spec = reader.spec();
+
+    if expected_sample_rate > 0 && spec.sample_rate != expected_sample_rate as u32 {
+        return Err(Error::message(format!(
+            "WAV sample rate {} != expected {} ({})",
+            spec.sample_rate,
+            expected_sample_rate,
+            path.display()
+        )));
+    }
+
+    let interleaved = match spec.sample_format {
+        SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|err| {
+                Error::message(format!("failed to decode WAV {}: {err}", path.display()))
+            })?,
+        SampleFormat::Int => {
+            let bits = u32::from(spec.bits_per_sample);
+            let scale = 1u64.checked_shl(bits.saturating_sub(1)).ok_or_else(|| {
+                Error::message(format!(
+                    "unsupported WAV bit depth {} in {}",
+                    spec.bits_per_sample,
+                    path.display()
+                ))
+            })? as f32;
+
+            reader
+                .samples::<i32>()
+                .map(|sample| {
+                    sample.map(|value| value as f32 / scale).map_err(|err| {
+                        Error::message(format!("failed to decode WAV {}: {err}", path.display()))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+
+    let channels = usize::from(spec.channels);
+    if channels == 1 {
+        return Ok(interleaved);
+    }
+
+    let frames = interleaved.len() / channels;
+    let mut mono = Vec::with_capacity(frames);
+    for frame in interleaved.chunks_exact(channels) {
+        mono.push(frame.iter().copied().sum::<f32>() / channels as f32);
+    }
+    Ok(mono)
+}
+
+fn ensure_output_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(())
+}
+
+fn backend_name(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Cpu => "cpu",
+        Backend::Gpu => "gpu",
     }
 }
 
@@ -612,13 +841,14 @@ fn parse_u32_auto(value: &str) -> std::result::Result<u32, String> {
 }
 
 impl GpuSelectorArgs {
-    fn into_selector(self) -> Option<GpuAdapterSelector> {
-        if self.gpu_name.is_none() && self.gpu_vendor_id.is_none() && self.gpu_device_id.is_none() {
-            return None;
-        }
+    fn has_any(&self) -> bool {
+        self.gpu_name.is_some() || self.gpu_vendor_id.is_some() || self.gpu_device_id.is_some()
+    }
 
-        Some(GpuAdapterSelector {
-            name_substring: self.gpu_name,
+    #[cfg(feature = "gpu")]
+    fn to_selector(&self) -> Option<GpuAdapterSelector> {
+        self.has_any().then(|| GpuAdapterSelector {
+            name_substring: self.gpu_name.clone(),
             vendor_id: self.gpu_vendor_id,
             device_id: self.gpu_device_id,
             backend: None,
@@ -627,33 +857,33 @@ impl GpuSelectorArgs {
     }
 }
 
-fn describe_gpu_selector(selector: &Option<GpuAdapterSelector>) -> String {
-    match selector {
-        None => "none".to_owned(),
-        Some(selector) => {
-            let mut parts = Vec::new();
-            if let Some(name) = selector.name_substring.as_deref() {
-                parts.push(format!("name={name}"));
-            }
-            if let Some(vendor_id) = selector.vendor_id {
-                parts.push(format!("vendor=0x{vendor_id:04x}"));
-            }
-            if let Some(device_id) = selector.device_id {
-                parts.push(format!("device=0x{device_id:04x}"));
-            }
-            parts.join(", ")
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::parse_u32_auto;
+    use std::path::Path;
+
+    use super::{ExtractFormat, infer_extract_format, parse_u32_auto};
 
     #[test]
     fn parse_u32_auto_accepts_decimal_and_hex() {
         assert_eq!(parse_u32_auto("1234").unwrap(), 1234);
         assert_eq!(parse_u32_auto("0x10de").unwrap(), 0x10de);
         assert_eq!(parse_u32_auto("0X2484").unwrap(), 0x2484);
+    }
+
+    #[test]
+    fn infer_extract_format_from_output_extension() {
+        assert_eq!(
+            infer_extract_format(Path::new("notes.mid")),
+            Some(ExtractFormat::Midi)
+        );
+        assert_eq!(
+            infer_extract_format(Path::new("notes.txt")),
+            Some(ExtractFormat::Txt)
+        );
+        assert_eq!(
+            infer_extract_format(Path::new("notes.csv")),
+            Some(ExtractFormat::Csv)
+        );
+        assert_eq!(infer_extract_format(Path::new("notes.unknown")), None);
     }
 }

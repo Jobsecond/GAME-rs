@@ -5,7 +5,9 @@ pub mod error;
 pub mod gguf;
 pub mod gguf_loader;
 pub mod mel;
+pub mod midi_writer;
 pub mod model;
+pub mod output;
 pub mod rng;
 pub mod tensor;
 pub mod types;
@@ -20,10 +22,12 @@ pub use error::{Error, Result};
 pub use gguf::{GGMLType, GGUFFile, GGUFFileLoader, GGUFMetadata, GGUFMetadataValue, GGUFVersion};
 pub use gguf_loader::{LoadedGgufModel, LoadedTensor, load_gguf};
 pub use mel::{MelConfig, MelExtractor};
+pub use midi_writer::{MidiWriteOptions, encode_midi, write_midi_file};
 pub use model::{
     Backend, EncoderOutputs, EstimatorOutputs, GameModelWeights, Model, SegmenterOutputs,
     bind_model_weights, build_joint_attn_mask, run_encoder, run_estimator, run_segmenter_step,
 };
+pub use output::{TextOutputFormat, TextWriteOptions, format_notes_text, write_text_file};
 pub use rng::{InjectedRng, Mt19937Rng, RandomSource};
 pub use tensor::{CpuDevice, CpuTensor, Tensor};
 #[cfg(feature = "gpu")]
