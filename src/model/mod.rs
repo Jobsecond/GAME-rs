@@ -6,7 +6,9 @@ pub mod segmenter;
 pub mod weights;
 
 use std::path::Path;
+use std::time::Instant;
 
+use log::info;
 use rand::random;
 
 use crate::tensor::{CpuDevice, CpuTensor};
@@ -197,11 +199,15 @@ impl<T: Tensor> ModelInner<T> {
         params: &InferParams,
         rng: &mut R,
     ) -> Result<InferResult> {
+        let infer_start = Instant::now();
+
         let seq_len = self.mel_extractor.num_frames(waveform.len());
         if seq_len == 0 {
             return Err(Error::message("waveform too short for one mel frame"));
         }
 
+        // --- Mel extraction ---
+        let stage_start = Instant::now();
         let mel = self.mel_extractor.forward(waveform)?;
         let mel_tensor = T::from_data(
             &mel,
@@ -209,20 +215,34 @@ impl<T: Tensor> ModelInner<T> {
             &self.device,
         )
         .map_err(|err| Error::message(format!("failed to upload mel spectrogram: {err}")))?;
+        info!(
+            "  mel extraction: {:.3}s ({} frames)",
+            stage_start.elapsed().as_secs_f64(),
+            seq_len,
+        );
 
+        // --- Encoder ---
+        let stage_start = Instant::now();
         let encoder = run_encoder(
             &mel_tensor,
             &self.weights.spectrogram_projection,
             &self.weights.encoder,
             &self.config,
         )?;
+        info!(
+            "  encoder: {:.3}s",
+            stage_start.elapsed().as_secs_f64(),
+        );
 
+        // --- D3PM segmenter loop ---
+        let stage_start = Instant::now();
         let region_cycle_len = i32::try_from(positive_usize(
             "game.model.region_cycle_len",
             self.config.region_cycle_len,
         )?)
         .map_err(|_| Error::message("game.model.region_cycle_len exceeds i32::MAX"))?;
         let schedule = d3pm_schedule(params)?;
+        let n_d3pm_steps = schedule.len();
         let known = vec![0u8; seq_len];
         let mask = vec![1u8; seq_len];
         let mut boundaries = known.clone();
@@ -255,7 +275,14 @@ impl<T: Tensor> ModelInner<T> {
                 params.boundary_radius,
             )?;
         }
+        info!(
+            "  d3pm loop ({} steps): {:.3}s",
+            n_d3pm_steps,
+            stage_start.elapsed().as_secs_f64(),
+        );
 
+        // --- Region assignment ---
+        let stage_start = Instant::now();
         let regions = boundaries_to_regions(&boundaries, Some(&mask))?;
         let n_regions = max_region_id(&regions)?;
         let mut result = InferResult {
@@ -263,9 +290,24 @@ impl<T: Tensor> ModelInner<T> {
             num_frames: usize_to_i32("inference frame count", seq_len)?,
         };
         if n_regions == 0 {
+            info!(
+                "  region assignment: {:.3}s (0 regions, skipping estimator)",
+                stage_start.elapsed().as_secs_f64(),
+            );
+            info!(
+                "  infer total: {:.3}s",
+                infer_start.elapsed().as_secs_f64(),
+            );
             return Ok(result);
         }
+        info!(
+            "  region assignment: {:.3}s ({} regions)",
+            stage_start.elapsed().as_secs_f64(),
+            n_regions,
+        );
 
+        // --- Estimator ---
+        let stage_start = Instant::now();
         let pool_logits = run_estimator(
             &encoder.x_est,
             &regions,
@@ -273,6 +315,13 @@ impl<T: Tensor> ModelInner<T> {
             &self.config,
         )?
         .pool_logits;
+        info!(
+            "  estimator: {:.3}s",
+            stage_start.elapsed().as_secs_f64(),
+        );
+
+        // --- Pitch decode ---
+        let stage_start = Instant::now();
         let pool_probs = sigmoid_all(&export_tensor(&pool_logits)?);
         let bins = positive_usize(
             "game.model.estimator_out_dim",
@@ -301,6 +350,15 @@ impl<T: Tensor> ModelInner<T> {
             });
             offset_seconds += duration_seconds;
         }
+        info!(
+            "  pitch decode: {:.3}s",
+            stage_start.elapsed().as_secs_f64(),
+        );
+
+        info!(
+            "  infer total: {:.3}s",
+            infer_start.elapsed().as_secs_f64(),
+        );
 
         Ok(result)
     }
