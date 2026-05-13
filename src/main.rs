@@ -1399,7 +1399,7 @@ mod tests {
 
     #[test]
     #[ignore = "real-model CPU regression with local assets; run with `cargo test --release -- --ignored --nocapture`"]
-    fn vocal2_cpu_extract_loosely_matches_expected_output() {
+    fn vocal2_cpu_extract_matches_expected_output_fixture() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let model_path = root.join("assets").join("models").join("large.gguf");
         let audio_path = root
@@ -1463,9 +1463,9 @@ mod tests {
             metrics.voiced_pitch_within_half_semitone_rate
         );
 
-        // This reference may come from a quantized checkpoint and split/merge
-        // notes are acceptable, so compare at frame granularity with loose
-        // tolerances instead of requiring note-for-note identity.
+        // The checked-in expected-output fixture is a current extract snapshot,
+        // but keep frame-level tolerances so minor formatting or note grouping
+        // changes do not make this real-model regression unnecessarily brittle.
         assert!(
             metrics.frame_count_delta <= 4,
             "frame count drift too large: expected {} frames, got {}",
