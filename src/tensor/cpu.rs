@@ -572,40 +572,78 @@ impl Tensor for CpuTensor {
         let bias_data = bias.map(CpuTensor::to_vec).transpose()?;
         let mut out = vec![0.0; rows * out_dim];
 
-        // Use sgemm for y = x @ W^T
-        // x is [rows, in_dim], W is [out_dim, in_dim], W^T is [in_dim, out_dim]
-        // Result is [rows, out_dim]
-        unsafe {
-            matrixmultiply::sgemm(
-                rows,
-                in_dim,
-                out_dim,
-                1.0,
-                input.as_ptr(),
-                in_dim as isize,
-                1,
-                weight_data.as_ptr(),
-                1,
-                in_dim as isize, // transposed stride
-                0.0,
-                out.as_mut_ptr(),
-                out_dim as isize,
-                1,
-            );
-        }
+        // Large sequence-major linears dominate encoder / segmenter / estimator CPU time.
+        // Split independent row blocks across Rayon workers so multiple sgemm calls can
+        // run concurrently while sharing the same read-only weight matrix.
+        if should_parallelize_linear(rows, in_dim, out_dim) {
+            let row_chunk_len = choose_parallel_row_chunk_len(rows, out_dim);
+            out.par_chunks_mut(row_chunk_len * out_dim)
+                .enumerate()
+                .for_each(|(chunk_index, out_chunk)| {
+                    let row_start = chunk_index * row_chunk_len;
+                    let chunk_rows = out_chunk.len() / out_dim;
+                    unsafe {
+                        matrixmultiply::sgemm(
+                            chunk_rows,
+                            in_dim,
+                            out_dim,
+                            1.0,
+                            input.as_ptr().add(row_start * in_dim),
+                            in_dim as isize,
+                            1,
+                            weight_data.as_ptr(),
+                            1,
+                            in_dim as isize,
+                            0.0,
+                            out_chunk.as_mut_ptr(),
+                            out_dim as isize,
+                            1,
+                        );
+                    }
 
-        // Add bias if present
-        if let Some(bias_values) = &bias_data {
-            if should_parallelize(out.len()) && out_dim > 0 {
-                out.par_chunks_mut(out_dim).for_each(|out_row| {
-                    for (out_idx, value) in out_row.iter_mut().enumerate() {
-                        *value += bias_values[out_idx];
+                    if let Some(bias_values) = &bias_data {
+                        for out_row in out_chunk.chunks_mut(out_dim) {
+                            for (out_idx, value) in out_row.iter_mut().enumerate() {
+                                *value += bias_values[out_idx];
+                            }
+                        }
                     }
                 });
-            } else {
-                for row in 0..rows {
-                    for out_idx in 0..out_dim {
-                        out[row * out_dim + out_idx] += bias_values[out_idx];
+        } else {
+            // Use sgemm for y = x @ W^T
+            // x is [rows, in_dim], W is [out_dim, in_dim], W^T is [in_dim, out_dim]
+            // Result is [rows, out_dim]
+            unsafe {
+                matrixmultiply::sgemm(
+                    rows,
+                    in_dim,
+                    out_dim,
+                    1.0,
+                    input.as_ptr(),
+                    in_dim as isize,
+                    1,
+                    weight_data.as_ptr(),
+                    1,
+                    in_dim as isize, // transposed stride
+                    0.0,
+                    out.as_mut_ptr(),
+                    out_dim as isize,
+                    1,
+                );
+            }
+
+            if let Some(bias_values) = &bias_data {
+                if should_parallelize(out.len()) && out_dim > 0 {
+                    out.par_chunks_mut(out_dim).for_each(|out_row| {
+                        for (out_idx, value) in out_row.iter_mut().enumerate() {
+                            *value += bias_values[out_idx];
+                        }
+                    });
+                } else {
+                    for row in 0..rows {
+                        for out_idx in 0..out_dim {
+                            out[row * out_dim + out_idx] += bias_values[out_idx];
+                        }
                     }
                 }
             }
@@ -1046,6 +1084,23 @@ fn plain_num_elements(shape: &[usize]) -> usize {
 
 fn should_parallelize(len: usize) -> bool {
     len >= 16_384 && rayon::current_num_threads() > 1
+}
+
+fn should_parallelize_linear(rows: usize, in_dim: usize, out_dim: usize) -> bool {
+    if rayon::current_num_threads() <= 1 || rows < 2 || in_dim == 0 || out_dim == 0 {
+        return false;
+    }
+
+    let work = rows.saturating_mul(in_dim).saturating_mul(out_dim);
+    work >= 2_000_000 && rows.saturating_mul(out_dim) >= 16_384
+}
+
+fn choose_parallel_row_chunk_len(rows: usize, out_dim: usize) -> usize {
+    let threads = rayon::current_num_threads().max(1);
+    let target_tasks = threads.saturating_mul(2);
+    let by_tasks = rows.div_ceil(target_tasks);
+    let min_chunk_rows = 16_384usize.div_ceil(out_dim.max(1));
+    by_tasks.max(min_chunk_rows).max(1).min(rows)
 }
 
 fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
