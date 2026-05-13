@@ -1,4 +1,5 @@
 use crate::config::GameModelConfig;
+use crate::profiler::{scope, scope_with};
 use crate::{Error, Result, Tensor};
 
 use super::RMS_NORM_EPS;
@@ -18,6 +19,14 @@ pub fn run_estimator<T: Tensor>(
     weights: &EstimatorWeights<T>,
     cfg: &GameModelConfig,
 ) -> Result<EstimatorOutputs<T>> {
+    let _scope = scope_with("run_estimator", || {
+        format!(
+            "x_est={:?} regions={} layers={}",
+            x_est.shape(),
+            regions.len(),
+            weights.layers.len()
+        )
+    });
     validate_estimator_input(x_est, regions, cfg)?;
     if !cfg.estimator.use_rope {
         return Err(Error::message(
@@ -70,6 +79,7 @@ pub fn run_estimator<T: Tensor>(
         .map_err(|err| Error::message(format!("estimator mask allocation failed: {err}")))?;
 
     for layer in &weights.layers {
+        let _layer_scope = scope("run_estimator.layer", format!("pool={:?} x={:?}", pool.shape(), x.shape()));
         let out = jebf_block(
             &pool,
             &x,
@@ -86,11 +96,13 @@ pub fn run_estimator<T: Tensor>(
     }
 
     if let Some(output_norm) = weights.output_norm_pool.as_ref() {
+        let _norm_scope = scope("run_estimator.output_norm_pool", format!("pool={:?}", pool.shape()));
         pool = pool
             .rms_norm(output_norm, RMS_NORM_EPS)
             .map_err(|err| Error::message(format!("estimator pool output norm failed: {err}")))?;
     }
 
+    let _proj_scope = scope("run_estimator.output_proj_pool", format!("pool={:?}", pool.shape()));
     let pool_logits = pool
         .linear(
             &weights.output_proj_pool.weight,

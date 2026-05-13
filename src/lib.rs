@@ -9,6 +9,7 @@ pub mod mel;
 pub mod midi_writer;
 pub mod model;
 pub mod output;
+mod profiler;
 pub mod rng;
 pub mod tensor;
 pub mod types;

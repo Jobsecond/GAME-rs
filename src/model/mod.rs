@@ -11,6 +11,7 @@ use std::time::Instant;
 use log::info;
 use rand::random;
 
+use crate::profiler::cpu_profile_session;
 use crate::tensor::{CpuDevice, CpuTensor};
 #[cfg(feature = "gpu")]
 use crate::tensor::{GpuAdapterSelector, GpuDevice, GpuTensor};
@@ -170,7 +171,10 @@ impl ModelDispatch {
         rng: &mut R,
     ) -> Result<InferResult> {
         match self {
-            Self::Cpu(inner) => inner.infer_with_rng(waveform, params, rng),
+            Self::Cpu(inner) => {
+                let _profile = cpu_profile_session("model.infer.cpu");
+                inner.infer_with_rng(waveform, params, rng)
+            }
             #[cfg(feature = "gpu")]
             Self::Gpu(inner) => inner.infer_with_rng(waveform, params, rng),
         }

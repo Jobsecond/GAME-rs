@@ -1,3 +1,4 @@
+use crate::profiler::scope_with;
 use crate::{Error, Result, Tensor};
 
 use super::RMS_NORM_EPS;
@@ -6,6 +7,7 @@ use super::weights::{CgmlpWeights, GluFfnWeights};
 const BLOCKED_MASK_VALUE: f32 = -10_000.0;
 
 pub fn glu_ffn<T: Tensor>(x: &T, weights: &GluFfnWeights<T>) -> Result<T> {
+    let _scope = scope_with("glu_ffn", || format!("x={:?}", x.shape()));
     let hidden = x
         .linear(&weights.ln1.weight, Some(&weights.ln1.bias))
         .map_err(|err| Error::message(format!("glu_ffn ln1 failed: {err}")))?;
@@ -20,6 +22,7 @@ pub fn glu_ffn<T: Tensor>(x: &T, weights: &GluFfnWeights<T>) -> Result<T> {
 }
 
 pub fn cgmlp<T: Tensor>(x: &T, weights: &CgmlpWeights<T>) -> Result<T> {
+    let _scope = scope_with("cgmlp", || format!("x={:?}", x.shape()));
     let hidden = x
         .linear(&weights.pw1.weight, Some(&weights.pw1.bias))
         .and_then(Tensor::gelu)

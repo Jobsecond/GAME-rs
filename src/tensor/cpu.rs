@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
+use crate::profiler::op_scope_with;
 use crate::{Error, Result};
 
 use super::Tensor;
@@ -102,6 +103,37 @@ impl CpuTensor {
                 .sum::<usize>()
     }
 
+    fn copy_axis_block(
+        &self,
+        outer_index: usize,
+        axis: usize,
+        inner: usize,
+        dst: &mut [f32],
+    ) {
+        let rank = self.shape.len();
+        let axis_len = self.shape[axis];
+        let mut coords = vec![0usize; rank];
+        let mut rem = outer_index;
+        for dim in (0..axis).rev() {
+            let size = self.shape[dim];
+            coords[dim] = rem % size;
+            rem /= size;
+        }
+
+        for axis_index in 0..axis_len {
+            coords[axis] = axis_index;
+            for inner_index in 0..inner {
+                let mut suffix = inner_index;
+                for dim in (axis + 1..rank).rev() {
+                    let size = self.shape[dim];
+                    coords[dim] = suffix % size;
+                    suffix /= size;
+                }
+                dst[axis_index * inner + inner_index] = self.data[self.raw_offset(&coords)];
+            }
+        }
+    }
+
     fn unary_op(self, op_name: &str, f: impl Fn(f32) -> f32 + Send + Sync) -> Result<Self> {
         let shape = self.shape.clone();
         let device = self.device.clone();
@@ -123,13 +155,67 @@ impl CpuTensor {
         op_name: &str,
         f: impl Fn(f32, f32) -> f32 + Send + Sync,
     ) -> Result<Self> {
-        let lhs_shape = self.shape.clone();
-        let lhs_strides = contiguous_strides(&lhs_shape);
-        let device = self.device.clone();
-        let lhs_data = self.into_contiguous_vec()?;
-
+        let _profile = op_scope_with("cpu.binary_op", || {
+            format!(
+                "op={} lhs={:?} rhs={:?} lhs_contig={} rhs_contig={}",
+                op_name,
+                self.shape,
+                rhs.shape,
+                self.is_dense_contiguous_view(),
+                rhs.is_dense_contiguous_view()
+            )
+        });
         let rhs_shape = rhs.shape.clone();
+        let lhs_shape = self.shape.clone();
+        let out_shape = broadcast_shape(&lhs_shape, &rhs_shape)?;
+        let device = self.device.clone();
+
+        if lhs_shape == rhs_shape
+            && lhs_shape == out_shape
+            && lhs_shape.len() == 2
+            && self.strides[1] == 1
+            && rhs.strides[1] == 1
+        {
+            let cols = lhs_shape[1];
+            let rows = lhs_shape[0];
+            let mut out = vec![0.0; rows * cols];
+            if should_parallelize(out.len()) && cols > 0 {
+                out.par_chunks_mut(cols).enumerate().for_each(|(row, out_row)| {
+                    let lhs_base = self.offset + row * self.strides[0];
+                    let rhs_base = rhs.offset + row * rhs.strides[0];
+                    let lhs_row = &self.data[lhs_base..lhs_base + cols];
+                    let rhs_row = &rhs.data[rhs_base..rhs_base + cols];
+                    for col in 0..cols {
+                        out_row[col] = f(lhs_row[col], rhs_row[col]);
+                    }
+                });
+            } else {
+                for row in 0..rows {
+                    let lhs_base = self.offset + row * self.strides[0];
+                    let rhs_base = rhs.offset + row * rhs.strides[0];
+                    let lhs_row = &self.data[lhs_base..lhs_base + cols];
+                    let rhs_row = &rhs.data[rhs_base..rhs_base + cols];
+                    let out_row = &mut out[row * cols..(row + 1) * cols];
+                    for col in 0..cols {
+                        out_row[col] = f(lhs_row[col], rhs_row[col]);
+                    }
+                }
+            }
+            return Self::from_owned(out, out_shape, device).map_err(|err| {
+                Error::message(format!("failed to build result for {op_name}: {err}"))
+            });
+        }
+
+        let lhs_strides = contiguous_strides(&lhs_shape);
         let rhs_strides = contiguous_strides(&rhs_shape);
+        let input_owned;
+        let lhs_data: &[f32] = match self.as_contiguous_slice() {
+            Some(s) => s,
+            None => {
+                input_owned = self.to_vec()?;
+                &input_owned
+            }
+        };
         let rhs_owned;
         let rhs_data: &[f32] = match rhs.as_contiguous_slice() {
             Some(s) => s,
@@ -138,8 +224,6 @@ impl CpuTensor {
                 &rhs_owned
             }
         };
-
-        let out_shape = broadcast_shape(&lhs_shape, &rhs_shape)?;
         let mut out = vec![0.0; checked_num_elements(&out_shape)?];
         let out_rank = out_shape.len();
 
@@ -147,6 +231,69 @@ impl CpuTensor {
             out.par_iter_mut().enumerate().for_each(|(flat, value)| {
                 *value = f(lhs_data[flat], rhs_data[flat]);
             });
+        } else if let Some(block_len) = suffix_broadcast_block_len(&lhs_shape, &rhs_shape, &out_shape) {
+            let blocks = out.len() / block_len.max(1);
+            for block_index in 0..blocks {
+                let base = block_index * block_len;
+                for index in 0..block_len {
+                    out[base + index] = f(lhs_data[base + index], rhs_data[index]);
+                }
+            }
+        } else if let Some(block_len) = suffix_broadcast_block_len(&rhs_shape, &lhs_shape, &out_shape) {
+            let blocks = out.len() / block_len.max(1);
+            for block_index in 0..blocks {
+                let base = block_index * block_len;
+                for index in 0..block_len {
+                    out[base + index] = f(lhs_data[index], rhs_data[base + index]);
+                }
+            }
+        } else if let Some(last_dim) = trailing_feature_broadcast_dim(&lhs_shape, &rhs_shape, &out_shape) {
+            let rows = out.len() / last_dim;
+            if lhs_shape == out_shape {
+                if should_parallelize(out.len()) {
+                    out.par_chunks_mut(last_dim)
+                        .enumerate()
+                        .for_each(|(row, out_row)| {
+                            let lhs_row = &lhs_data[row * last_dim..(row + 1) * last_dim];
+                            for col in 0..last_dim {
+                                out_row[col] = f(lhs_row[col], rhs_data[col]);
+                            }
+                        });
+                } else {
+                    for row in 0..rows {
+                        let lhs_row = &lhs_data[row * last_dim..(row + 1) * last_dim];
+                        let out_row = &mut out[row * last_dim..(row + 1) * last_dim];
+                        for col in 0..last_dim {
+                            out_row[col] = f(lhs_row[col], rhs_data[col]);
+                        }
+                    }
+                }
+            } else if rhs_shape == out_shape {
+                if should_parallelize(out.len()) {
+                    out.par_chunks_mut(last_dim)
+                        .enumerate()
+                        .for_each(|(row, out_row)| {
+                            let rhs_row = &rhs_data[row * last_dim..(row + 1) * last_dim];
+                            for col in 0..last_dim {
+                                out_row[col] = f(lhs_data[col], rhs_row[col]);
+                            }
+                        });
+                } else {
+                    for row in 0..rows {
+                        let rhs_row = &rhs_data[row * last_dim..(row + 1) * last_dim];
+                        let out_row = &mut out[row * last_dim..(row + 1) * last_dim];
+                        for col in 0..last_dim {
+                            out_row[col] = f(lhs_data[col], rhs_row[col]);
+                        }
+                    }
+                }
+            } else {
+                for_each_index(&out_shape, |coords, flat| {
+                    let lhs_index = broadcast_offset(coords, &lhs_shape, &lhs_strides, out_rank);
+                    let rhs_index = broadcast_offset(coords, &rhs_shape, &rhs_strides, out_rank);
+                    out[flat] = f(lhs_data[lhs_index], rhs_data[rhs_index]);
+                });
+            }
         } else {
             for_each_index(&out_shape, |coords, flat| {
                 let lhs_index = broadcast_offset(coords, &lhs_shape, &lhs_strides, out_rank);
@@ -304,6 +451,16 @@ impl Tensor for CpuTensor {
     }
 
     fn concat(parts: &[&Self], axis: usize) -> Result<Self> {
+        let _profile = op_scope_with("cpu.concat", || {
+            format!(
+                "parts={} axis={} first_shape={:?} contiguous_parts={}/{}",
+                parts.len(),
+                axis,
+                parts.first().map(|part| part.shape.clone()).unwrap_or_default(),
+                parts.iter().filter(|part| part.is_dense_contiguous_view()).count(),
+                parts.len()
+            )
+        });
         if parts.is_empty() {
             return Err(invalid_arg("concat requires at least one tensor"));
         }
@@ -342,25 +499,134 @@ impl Tensor for CpuTensor {
 
         for part in parts {
             let part_block = part.shape[axis] * inner;
-            let part_owned;
-            let part_data: &[f32] = match part.as_contiguous_slice() {
-                Some(slice) => slice,
-                None => {
-                    part_owned = part.to_vec()?;
-                    &part_owned
-                }
-            };
             for outer_index in 0..outer {
-                let src_start = outer_index * part_block;
-                let src_end = src_start + part_block;
                 let dst_start = outer_index * out_axis_span + axis_offset * inner;
                 let dst_end = dst_start + part_block;
-                out[dst_start..dst_end].copy_from_slice(&part_data[src_start..src_end]);
+                if let Some(part_data) = part.as_contiguous_slice() {
+                    let src_start = outer_index * part_block;
+                    let src_end = src_start + part_block;
+                    out[dst_start..dst_end].copy_from_slice(&part_data[src_start..src_end]);
+                } else {
+                    part.copy_axis_block(
+                        outer_index,
+                        axis,
+                        inner,
+                        &mut out[dst_start..dst_end],
+                    );
+                }
             }
             axis_offset += part.shape[axis];
         }
 
         Self::from_owned(out, out_shape, device)
+    }
+
+    fn layout_for_attention_heads(self, num_heads: usize, head_dim: usize) -> Result<Self> {
+        let device = self.device.clone();
+        let _profile = op_scope_with("cpu.layout_for_attention_heads", || {
+            format!(
+                "shape={:?} num_heads={} head_dim={} contiguous={}",
+                self.shape,
+                num_heads,
+                head_dim,
+                self.is_dense_contiguous_view()
+            )
+        });
+        if self.shape.len() != 2 {
+            return Err(invalid_arg(format!(
+                "layout_for_attention_heads expects [seq_len, dim], got {:?}",
+                self.shape
+            )));
+        }
+
+        let seq_len = self.shape[0];
+        let dim = self.shape[1];
+        let expected = num_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| invalid_arg("attention projection dimension overflow"))?;
+        if dim != expected {
+            return Err(invalid_arg(format!(
+                "layout_for_attention_heads expected last dim {}, got {:?}",
+                expected, self.shape
+            )));
+        }
+
+        let input = self.into_contiguous_vec()?;
+        let mut out = vec![0.0; input.len()];
+        let head_block = seq_len * head_dim;
+        if should_parallelize(out.len()) && head_block > 0 {
+            out.par_chunks_mut(head_block)
+                .enumerate()
+                .for_each(|(head, out_head)| {
+                    for token in 0..seq_len {
+                        let src_start = token * dim + head * head_dim;
+                        let src_end = src_start + head_dim;
+                        let dst_start = token * head_dim;
+                        let dst_end = dst_start + head_dim;
+                        out_head[dst_start..dst_end].copy_from_slice(&input[src_start..src_end]);
+                    }
+                });
+        } else {
+            for head in 0..num_heads {
+                for token in 0..seq_len {
+                    let src_start = token * dim + head * head_dim;
+                    let src_end = src_start + head_dim;
+                    let dst_start = (head * seq_len + token) * head_dim;
+                    let dst_end = dst_start + head_dim;
+                    out[dst_start..dst_end].copy_from_slice(&input[src_start..src_end]);
+                }
+            }
+        }
+
+        Self::from_owned(out, vec![num_heads, seq_len, head_dim], device)
+    }
+
+    fn merge_attention_heads(self) -> Result<Self> {
+        let device = self.device.clone();
+        let _profile = op_scope_with("cpu.merge_attention_heads", || {
+            format!("shape={:?} contiguous={}", self.shape, self.is_dense_contiguous_view())
+        });
+        if self.shape.len() != 3 {
+            return Err(invalid_arg(format!(
+                "merge_attention_heads expects [num_heads, seq_len, head_dim], got {:?}",
+                self.shape
+            )));
+        }
+
+        let num_heads = self.shape[0];
+        let seq_len = self.shape[1];
+        let head_dim = self.shape[2];
+        let merged_dim = num_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| invalid_arg("merge_attention_heads dimension overflow"))?;
+
+        let input = self.into_contiguous_vec()?;
+        let mut out = vec![0.0; seq_len * merged_dim];
+        if should_parallelize(out.len()) && merged_dim > 0 {
+            out.par_chunks_mut(merged_dim)
+                .enumerate()
+                .for_each(|(token, out_row)| {
+                    for head in 0..num_heads {
+                        let src_start = (head * seq_len + token) * head_dim;
+                        let src_end = src_start + head_dim;
+                        let dst_start = head * head_dim;
+                        let dst_end = dst_start + head_dim;
+                        out_row[dst_start..dst_end].copy_from_slice(&input[src_start..src_end]);
+                    }
+                });
+        } else {
+            for token in 0..seq_len {
+                for head in 0..num_heads {
+                    let src_start = (head * seq_len + token) * head_dim;
+                    let src_end = src_start + head_dim;
+                    let dst_start = token * merged_dim + head * head_dim;
+                    let dst_end = dst_start + head_dim;
+                    out[dst_start..dst_end].copy_from_slice(&input[src_start..src_end]);
+                }
+            }
+        }
+
+        Self::from_owned(out, vec![seq_len, merged_dim], device)
     }
 
     fn add(self, rhs: &Self) -> Result<Self> {
@@ -380,6 +646,15 @@ impl Tensor for CpuTensor {
     }
 
     fn matmul(&self, rhs: &Self) -> Result<Self> {
+        let _profile = op_scope_with("cpu.matmul", || {
+            format!(
+                "lhs={:?} rhs={:?} lhs_contig={} rhs_contig={}",
+                self.shape,
+                rhs.shape,
+                self.is_dense_contiguous_view(),
+                rhs.is_dense_contiguous_view()
+            )
+        });
         let lhs_shape = self.shape.clone();
         let rhs_shape = rhs.shape.clone();
         let device = self.device.clone();
@@ -521,6 +796,16 @@ impl Tensor for CpuTensor {
     }
 
     fn linear(&self, weight: &Self, bias: Option<&Self>) -> Result<Self> {
+        let _profile = op_scope_with("cpu.linear", || {
+            format!(
+                "input={:?} weight={:?} bias={} input_contig={} weight_contig={}",
+                self.shape,
+                weight.shape,
+                bias.is_some(),
+                self.is_dense_contiguous_view(),
+                weight.is_dense_contiguous_view()
+            )
+        });
         if self.shape.is_empty() {
             return Err(invalid_arg(
                 "linear expects an input tensor with at least one dimension",
@@ -655,6 +940,15 @@ impl Tensor for CpuTensor {
     }
 
     fn rms_norm(self, weight: &Self, eps: f32) -> Result<Self> {
+        let _profile = op_scope_with("cpu.rms_norm", || {
+            format!(
+                "input={:?} weight={:?} input_contig={} weight_contig={}",
+                self.shape,
+                weight.shape,
+                self.is_dense_contiguous_view(),
+                weight.is_dense_contiguous_view()
+            )
+        });
         if self.shape.is_empty() {
             return Err(invalid_arg(
                 "rms_norm expects an input tensor with at least one dimension",
@@ -718,6 +1012,14 @@ impl Tensor for CpuTensor {
     }
 
     fn softmax(self, axis: isize) -> Result<Self> {
+        let _profile = op_scope_with("cpu.softmax", || {
+            format!(
+                "shape={:?} axis={} contiguous={}",
+                self.shape,
+                axis,
+                self.is_dense_contiguous_view()
+            )
+        });
         if self.shape.is_empty() {
             return Err(invalid_arg(
                 "softmax expects a tensor with at least one dimension",
@@ -805,6 +1107,17 @@ impl Tensor for CpuTensor {
         rope_dims: usize,
         theta: f32,
     ) -> Result<Self> {
+        let _profile = op_scope_with("cpu.rope", || {
+            format!(
+                "shape={:?} positions={} head_dim={} num_heads={} rope_dims={} contiguous={}",
+                self.shape,
+                positions.len(),
+                head_dim,
+                num_heads,
+                rope_dims,
+                self.is_dense_contiguous_view()
+            )
+        });
         self.validate_rope_shape(positions.len(), head_dim, num_heads, "rope")?;
         let rope_dims = normalize_rope_dims(head_dim, rope_dims, "rope", false)?;
 
@@ -854,6 +1167,17 @@ impl Tensor for CpuTensor {
         rope_dims: usize,
         theta: f32,
     ) -> Result<Self> {
+        let _profile = op_scope_with("cpu.region_rope", || {
+            format!(
+                "shape={:?} tokens={} head_dim={} num_heads={} rope_dims={} contiguous={}",
+                self.shape,
+                global_pos.len(),
+                head_dim,
+                num_heads,
+                rope_dims,
+                self.is_dense_contiguous_view()
+            )
+        });
         if global_pos.len() != region_ids.len() {
             return Err(invalid_arg(format!(
                 "region_rope expects matching global_pos and region_ids lengths, got {} and {}",
@@ -901,6 +1225,18 @@ impl Tensor for CpuTensor {
         stride: usize,
         padding: usize,
     ) -> Result<Self> {
+        let _profile = op_scope_with("cpu.conv1d_dw", || {
+            format!(
+                "input={:?} kernel={:?} bias={} stride={} padding={} input_contig={} kernel_contig={}",
+                self.shape,
+                kernel.shape,
+                bias.is_some(),
+                stride,
+                padding,
+                self.is_dense_contiguous_view(),
+                kernel.is_dense_contiguous_view()
+            )
+        });
         if stride == 0 {
             return Err(invalid_arg("conv1d_dw requires stride > 0"));
         }
@@ -1092,7 +1428,7 @@ fn should_parallelize_linear(rows: usize, in_dim: usize, out_dim: usize) -> bool
     }
 
     let work = rows.saturating_mul(in_dim).saturating_mul(out_dim);
-    work >= 2_000_000 && rows.saturating_mul(out_dim) >= 16_384
+    work >= 1_000_000 && rows.saturating_mul(out_dim) >= 8_192
 }
 
 fn choose_parallel_row_chunk_len(rows: usize, out_dim: usize) -> usize {
@@ -1194,6 +1530,47 @@ fn broadcast_offset(
         }
     }
     offset
+}
+
+fn trailing_feature_broadcast_dim(lhs: &[usize], rhs: &[usize], out: &[usize]) -> Option<usize> {
+    if out.is_empty() {
+        return None;
+    }
+
+    let feature_dim = *out.last()?;
+    if feature_dim == 0 {
+        return Some(0);
+    }
+
+    let lhs_feature = *lhs.last().unwrap_or(&1);
+    let rhs_feature = *rhs.last().unwrap_or(&1);
+    if lhs_feature != feature_dim || rhs_feature != feature_dim {
+        return None;
+    }
+
+    let lhs_matches = lhs.len() == 1 || lhs == out;
+    let rhs_matches = rhs.len() == 1 || rhs == out;
+    if lhs_matches && rhs_matches && (lhs.len() == 1 || rhs.len() == 1) {
+        Some(feature_dim)
+    } else {
+        None
+    }
+}
+
+fn suffix_broadcast_block_len(lhs: &[usize], rhs: &[usize], out: &[usize]) -> Option<usize> {
+    if lhs != out || rhs.len() >= out.len() || rhs.is_empty() {
+        return None;
+    }
+
+    let rank_diff = out.len() - rhs.len();
+    if out[..rank_diff].iter().any(|&dim| dim == 0) {
+        return None;
+    }
+    if out[rank_diff..] != rhs[..] {
+        return None;
+    }
+
+    Some(rhs.iter().copied().product())
 }
 
 fn for_each_index(shape: &[usize], mut f: impl FnMut(&[usize], usize)) {

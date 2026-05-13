@@ -26,6 +26,47 @@ pub trait Tensor: Sized + Clone {
     fn slice(self, axis: usize, start: usize, end: usize) -> Result<Self>;
     fn concat(parts: &[&Self], axis: usize) -> Result<Self>;
 
+    fn layout_for_attention_heads(self, num_heads: usize, head_dim: usize) -> Result<Self> {
+        let shape = self.shape().to_vec();
+        if shape.len() != 2 {
+            return Err(crate::Error::message(format!(
+                "layout_for_attention_heads expects [seq_len, dim], got {:?}",
+                shape
+            )));
+        }
+        let seq_len = shape[0];
+        let expected = num_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| crate::Error::message("attention projection dimension overflow"))?;
+        if shape[1] != expected {
+            return Err(crate::Error::message(format!(
+                "layout_for_attention_heads expected last dim {}, got {:?}",
+                expected, shape
+            )));
+        }
+
+        self.reshape(&[seq_len, num_heads, head_dim])?.transpose(0, 1)
+    }
+
+    fn merge_attention_heads(self) -> Result<Self> {
+        let shape = self.shape().to_vec();
+        if shape.len() != 3 {
+            return Err(crate::Error::message(format!(
+                "merge_attention_heads expects [num_heads, seq_len, head_dim], got {:?}",
+                shape
+            )));
+        }
+
+        let num_heads = shape[0];
+        let seq_len = shape[1];
+        let head_dim = shape[2];
+        let merged_dim = num_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| crate::Error::message("merge_attention_heads dimension overflow"))?;
+
+        self.transpose(0, 1)?.reshape(&[seq_len, merged_dim])
+    }
+
     fn add(self, rhs: &Self) -> Result<Self>;
     fn mul(self, rhs: &Self) -> Result<Self>;
     fn scale(self, s: f32) -> Result<Self>;
