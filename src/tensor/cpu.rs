@@ -311,9 +311,9 @@ impl Tensor for CpuTensor {
         let rank = parts[0].shape.len();
         validate_axis(axis, rank, "concat")?;
         let device = parts[0].device.clone();
-        let mut out_shape = parts[0].shape.clone();
+        let expected_shape = parts[0].shape.clone();
+        let mut out_shape = expected_shape.clone();
         out_shape[axis] = 0;
-        let mut part_buffers = Vec::with_capacity(parts.len());
 
         for part in parts {
             if part.shape.len() != rank {
@@ -326,12 +326,11 @@ impl Tensor for CpuTensor {
                 if dim != axis && part.shape[dim] != out_shape[dim] {
                     return Err(invalid_arg(format!(
                         "concat shape mismatch on axis {}: expected non-concat dims {:?}, got {:?}",
-                        axis, parts[0].shape, part.shape
+                        axis, expected_shape, part.shape
                     )));
                 }
             }
             out_shape[axis] += part.shape[axis];
-            part_buffers.push((part.to_vec()?, part.shape.clone()));
         }
 
         let out_len = checked_num_elements(&out_shape)?;
@@ -341,16 +340,24 @@ impl Tensor for CpuTensor {
         let out_axis_span = out_shape[axis] * inner;
         let mut axis_offset = 0usize;
 
-        for (data, shape) in part_buffers {
-            let part_block = shape[axis] * inner;
+        for part in parts {
+            let part_block = part.shape[axis] * inner;
+            let part_owned;
+            let part_data: &[f32] = match part.as_contiguous_slice() {
+                Some(slice) => slice,
+                None => {
+                    part_owned = part.to_vec()?;
+                    &part_owned
+                }
+            };
             for outer_index in 0..outer {
                 let src_start = outer_index * part_block;
                 let src_end = src_start + part_block;
                 let dst_start = outer_index * out_axis_span + axis_offset * inner;
                 let dst_end = dst_start + part_block;
-                out[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
+                out[dst_start..dst_end].copy_from_slice(&part_data[src_start..src_end]);
             }
-            axis_offset += shape[axis];
+            axis_offset += part.shape[axis];
         }
 
         Self::from_owned(out, out_shape, device)
