@@ -101,22 +101,6 @@ pub(crate) fn split_last_dim_two<T: Tensor>(tensor: &T) -> Result<(T, T)> {
     })
 }
 
-pub(crate) fn split_last_dim_three<T: Tensor>(tensor: &T) -> Result<(T, T, T)> {
-    split_last_dim(tensor, 3).and_then(|parts| {
-        let mut iter = parts.into_iter();
-        let first = iter
-            .next()
-            .ok_or_else(|| Error::message("split_last_dim_three produced no first chunk"))?;
-        let second = iter
-            .next()
-            .ok_or_else(|| Error::message("split_last_dim_three produced no second chunk"))?;
-        let third = iter
-            .next()
-            .ok_or_else(|| Error::message("split_last_dim_three produced no third chunk"))?;
-        Ok((first, second, third))
-    })
-}
-
 fn split_last_dim<T: Tensor>(tensor: &T, parts: usize) -> Result<Vec<T>> {
     if parts == 0 {
         return Err(Error::message("split_last_dim requires at least one part"));

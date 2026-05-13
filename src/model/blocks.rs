@@ -2,7 +2,7 @@ use crate::profiler::{scope, scope_with};
 use crate::{Error, Result, Tensor};
 
 use super::RMS_NORM_EPS;
-use super::ops::{cgmlp, glu_ffn, split_last_dim_three, split_last_dim_two};
+use super::ops::{cgmlp, glu_ffn};
 use super::weights::{
     AttentionWeights, EbfBlockWeights, JebfBlockWeights, JointAttentionWeights, PacWeights,
     PjacWeights, ResidualGluWeights,
@@ -37,15 +37,16 @@ pub fn attention<T: Tensor>(
     let kv = x
         .linear(&weights.kv.weight, Some(&weights.kv.bias))
         .map_err(|err| Error::message(format!("attention kv projection failed: {err}")))?;
-    let (k, v) = split_last_dim_two(&kv)?;
+    let (k, v) = kv
+        .split_last_dim_two_for_attention_heads(num_heads, head_dim)
+        .map_err(|err| Error::message(format!("attention kv split/layout failed: {err}")))?;
 
     let q = reshape_for_heads(q, num_heads, head_dim)?
         .rope(positions, head_dim, num_heads, head_dim, theta)
         .map_err(|err| Error::message(format!("attention q rope failed: {err}")))?;
-    let k = reshape_for_heads(k, num_heads, head_dim)?
+    let k = k
         .rope(positions, head_dim, num_heads, head_dim, theta)
         .map_err(|err| Error::message(format!("attention k rope failed: {err}")))?;
-    let v = reshape_for_heads(v, num_heads, head_dim)?;
 
     let attended = scaled_dot_product_attention(&q, &k, &v, None, head_dim)?;
     merge_heads(attended)?
@@ -116,32 +117,34 @@ pub fn joint_attention<T: Tensor>(
         .linear(&weights.x.qkv.weight, Some(&weights.x.qkv.bias))
         .map_err(|err| Error::message(format!("joint_attention x qkv failed: {err}")))?;
 
-    let (pool_q, pool_k, pool_v) = split_last_dim_three(&pool_qkv)?;
-    let (x_q, x_k, x_v) = split_last_dim_three(&x_qkv)?;
+    let (pool_q, pool_k, pool_v) = pool_qkv
+        .split_last_dim_three_for_attention_heads(num_heads, head_dim)
+        .map_err(|err| Error::message(format!("joint_attention pool qkv split/layout failed: {err}")))?;
+    let (x_q, x_k, x_v) = x_qkv
+        .split_last_dim_three_for_attention_heads(num_heads, head_dim)
+        .map_err(|err| Error::message(format!("joint_attention x qkv split/layout failed: {err}")))?;
 
     let pool_q = apply_optional_qk_norm(
-        reshape_for_heads(pool_q, num_heads, head_dim)?,
+        pool_q,
         weights.pool.qk_norm.as_ref().map(|norm| &norm.q),
         "joint_attention pool q_norm",
     )?;
     let pool_k = apply_optional_qk_norm(
-        reshape_for_heads(pool_k, num_heads, head_dim)?,
+        pool_k,
         weights.pool.qk_norm.as_ref().map(|norm| &norm.k),
         "joint_attention pool k_norm",
     )?;
-    let pool_v = reshape_for_heads(pool_v, num_heads, head_dim)?;
 
     let x_q = apply_optional_qk_norm(
-        reshape_for_heads(x_q, num_heads, head_dim)?,
+        x_q,
         weights.x.qk_norm.as_ref().map(|norm| &norm.q),
         "joint_attention x q_norm",
     )?;
     let x_k = apply_optional_qk_norm(
-        reshape_for_heads(x_k, num_heads, head_dim)?,
+        x_k,
         weights.x.qk_norm.as_ref().map(|norm| &norm.k),
         "joint_attention x k_norm",
     )?;
-    let x_v = reshape_for_heads(x_v, num_heads, head_dim)?;
 
     let _q_rope_scope = scope("joint_attention.q_rope", format!("pool_q={:?} x_q={:?}", pool_q.shape(), x_q.shape()));
     let q = T::concat(&[&pool_q, &x_q], 1)
@@ -549,18 +552,8 @@ fn scaled_dot_product_attention_chunked<T: Tensor>(
         .map_err(|err| Error::message(format!("attention key transpose failed: {err}")))?;
 
     if query_chunk_len >= query_len {
-        let mut scores = q
-            .matmul(&k_t)
-            .and_then(|scores| scores.scale(scale))
-            .map_err(|err| Error::message(format!("attention score matmul failed: {err}")))?;
-        if let Some(mask) = mask {
-            scores = scores
-                .add(mask)
-                .map_err(|err| Error::message(format!("attention mask add failed: {err}")))?;
-        }
-        return scores
-            .softmax(-1)
-            .and_then(|probs| probs.matmul(v))
+        return T::attention_score_softmax(q, &k_t, mask, scale)
+            .and_then(|probs| T::attention_value_matmul(&probs, v))
             .map_err(|err| Error::message(format!("attention value matmul failed: {err}")));
     }
 
@@ -578,18 +571,8 @@ fn scaled_dot_product_attention_chunked<T: Tensor>(
             None => None,
         };
 
-        let mut scores = q_chunk
-            .matmul(&k_t)
-            .and_then(|scores| scores.scale(scale))
-            .map_err(|err| Error::message(format!("attention score matmul failed: {err}")))?;
-        if let Some(mask_chunk) = mask_chunk.as_ref() {
-            scores = scores
-                .add(mask_chunk)
-                .map_err(|err| Error::message(format!("attention mask add failed: {err}")))?;
-        }
-        let chunk_output = scores
-            .softmax(-1)
-            .and_then(|probs| probs.matmul(v))
+        let chunk_output = T::attention_score_softmax(&q_chunk, &k_t, mask_chunk.as_ref(), scale)
+            .and_then(|probs| T::attention_value_matmul(&probs, v))
             .map_err(|err| Error::message(format!("attention value matmul failed: {err}")))?;
         outputs.push(chunk_output);
     }
