@@ -145,6 +145,24 @@ pub trait Tensor: Sized + Clone {
     fn mul(self, rhs: &Self) -> Result<Self>;
     fn scale(self, s: f32) -> Result<Self>;
     fn sigmoid(self) -> Result<Self>;
+    fn split_last_dim_two_gelu_mul(self) -> Result<Self> {
+        let shape = self.shape().to_vec();
+        let axis = shape
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| crate::Error::message("split_last_dim_two_gelu_mul requires rank >= 1"))?;
+        let dim = shape[axis];
+        if dim % 2 != 0 {
+            return Err(crate::Error::message(format!(
+                "split_last_dim_two_gelu_mul requires an even last dimension, got shape {:?}",
+                shape
+            )));
+        }
+        let half = dim / 2;
+        let left = self.clone().slice(axis, 0, half)?;
+        let right = self.slice(axis, half, dim)?;
+        left.gelu()?.mul(&right)
+    }
 
     fn matmul(&self, rhs: &Self) -> Result<Self>;
     fn linear(&self, weight: &Self, bias: Option<&Self>) -> Result<Self>;

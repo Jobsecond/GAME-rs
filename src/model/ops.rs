@@ -11,10 +11,8 @@ pub fn glu_ffn<T: Tensor>(x: &T, weights: &GluFfnWeights<T>) -> Result<T> {
     let hidden = x
         .linear(&weights.ln1.weight, Some(&weights.ln1.bias))
         .map_err(|err| Error::message(format!("glu_ffn ln1 failed: {err}")))?;
-    let (x1, x2) = split_last_dim_two(&hidden)?;
-    let gated = x1
-        .gelu()
-        .and_then(|lhs| lhs.mul(&x2))
+    let gated = hidden
+        .split_last_dim_two_gelu_mul()
         .map_err(|err| Error::message(format!("glu_ffn gate failed: {err}")))?;
     gated
         .linear(&weights.ln2.weight, Some(&weights.ln2.bias))

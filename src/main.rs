@@ -16,7 +16,7 @@ use game_crabml::{
     load_gguf, prepare_wav_for_inference, slice_waveform, split_long_chunks, write_midi_file,
     write_text_file,
 };
-use log::{Level, info, warn};
+use log::{Level, info};
 use serde_json::{Map, Value, json};
 
 #[derive(Debug, Parser)]

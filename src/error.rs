@@ -5,6 +5,7 @@ use std::path::PathBuf;
 pub enum Error {
     Io(std::io::Error),
     Json(serde_json::Error),
+    Candle(candle_core::Error),
     Format(String),
     MissingMetadata {
         key: String,
@@ -48,6 +49,7 @@ impl fmt::Display for Error {
         match self {
             Self::Io(err) => write!(f, "{err}"),
             Self::Json(err) => write!(f, "{err}"),
+            Self::Candle(err) => write!(f, "{err}"),
             Self::Format(message) => write!(f, "{message}"),
             Self::MissingMetadata { key } => write!(f, "missing GGUF metadata key `{key}`"),
             Self::InvalidMetadataType {
@@ -90,6 +92,7 @@ impl std::error::Error for Error {
         match self {
             Self::Io(err) => Some(err),
             Self::Json(err) => Some(err),
+            Self::Candle(err) => Some(err),
             _ => None,
         }
     }
@@ -104,5 +107,11 @@ impl From<std::io::Error> for Error {
 impl From<serde_json::Error> for Error {
     fn from(value: serde_json::Error) -> Self {
         Self::Json(value)
+    }
+}
+
+impl From<candle_core::Error> for Error {
+    fn from(value: candle_core::Error) -> Self {
+        Self::Candle(value)
     }
 }
