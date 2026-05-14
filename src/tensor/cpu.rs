@@ -2,7 +2,6 @@ use std::f32::consts::SQRT_2;
 use std::sync::OnceLock;
 
 use candle_core::{DType, Device, Storage, Tensor as CandleTensor};
-#[cfg(not(feature = "cpu-attention-gemm-matrixmultiply"))]
 use gemm::Parallelism;
 use rayon::prelude::*;
 
@@ -761,21 +760,26 @@ impl Tensor for CpuTensor {
                             let row_start = chunk_index * row_chunk_len;
                             let chunk_rows = out_chunk.len() / out_dim;
                             unsafe {
-                                matrixmultiply::sgemm(
+                                gemm::gemm(
                                     chunk_rows,
-                                    in_dim,
                                     out_dim,
-                                    1.0,
-                                    input.as_ptr().add(row_start * in_dim),
-                                    in_dim as isize,
-                                    1,
-                                    weight_data.as_ptr(),
-                                    1,
-                                    in_dim as isize,
-                                    0.0,
+                                    in_dim,
                                     out_chunk.as_mut_ptr(),
-                                    out_dim as isize,
                                     1,
+                                    out_dim as isize,
+                                    false,
+                                    input.as_ptr().add(row_start * in_dim),
+                                    1,
+                                    in_dim as isize,
+                                    weight_data.as_ptr(),
+                                    in_dim as isize,
+                                    1,
+                                    0.0,
+                                    1.0,
+                                    false,
+                                    false,
+                                    false,
+                                    Parallelism::None,
                                 );
                             }
 
@@ -789,36 +793,33 @@ impl Tensor for CpuTensor {
                         });
                 } else {
                     unsafe {
-                        matrixmultiply::sgemm(
+                        gemm::gemm(
                             rows,
-                            in_dim,
                             out_dim,
-                            1.0,
-                            input.as_ptr(),
-                            in_dim as isize,
-                            1,
-                            weight_data.as_ptr(),
-                            1,
-                            in_dim as isize,
-                            0.0,
+                            in_dim,
                             out.as_mut_ptr(),
-                            out_dim as isize,
                             1,
+                            out_dim as isize,
+                            false,
+                            input.as_ptr(),
+                            1,
+                            in_dim as isize,
+                            weight_data.as_ptr(),
+                            in_dim as isize,
+                            1,
+                            0.0,
+                            1.0,
+                            false,
+                            false,
+                            false,
+                            Parallelism::None,
                         );
                     }
 
                     if let Some(bias_values) = &bias_data {
-                        if should_parallelize(out.len()) && out_dim > 0 {
-                            out.par_chunks_mut(out_dim).for_each(|out_row| {
-                                for (out_idx, value) in out_row.iter_mut().enumerate() {
-                                    *value += bias_values[out_idx];
-                                }
-                            });
-                        } else {
-                            for row in 0..rows {
-                                for out_idx in 0..out_dim {
-                                    out[row * out_dim + out_idx] += bias_values[out_idx];
-                                }
+                        for row in 0..rows {
+                            for out_idx in 0..out_dim {
+                                out[row * out_dim + out_idx] += bias_values[out_idx];
                             }
                         }
                     }
@@ -1548,6 +1549,8 @@ impl Tensor for CpuTensor {
         let mut data = self.to_vec()?;
         let seq_len = shape[1];
 
+        let inv_freqs = precompute_inv_freqs(rope_dims, theta);
+
         let head_block = seq_len * head_dim;
         if should_parallelize(data.len()) && head_block > 0 {
             data.par_chunks_mut(head_block).for_each(|head_slice| {
@@ -1558,7 +1561,7 @@ impl Tensor for CpuTensor {
                         0,
                         rope_dims,
                         position as f32,
-                        theta,
+                        &inv_freqs,
                     );
                 }
             });
@@ -1571,7 +1574,7 @@ impl Tensor for CpuTensor {
                         0,
                         rope_dims,
                         position as f32,
-                        theta,
+                        &inv_freqs,
                     );
                 }
             }
@@ -1614,14 +1617,16 @@ impl Tensor for CpuTensor {
         let seq_len = shape[1];
         let mut data = self.to_vec()?;
 
+        let inv_freqs = precompute_inv_freqs(half, theta);
+
         let head_block = seq_len * head_dim;
         if should_parallelize(data.len()) && head_block > 0 {
             data.par_chunks_mut(head_block).for_each(|head_slice| {
                 for token in 0..seq_len {
                     let base = token * head_dim;
                     let values = &mut head_slice[base..base + head_dim];
-                    apply_rope_chunk(values, 0, half, global_pos[token] as f32, theta);
-                    apply_rope_chunk(values, half, half, region_ids[token] as f32, theta);
+                    apply_rope_chunk(values, 0, half, global_pos[token] as f32, &inv_freqs);
+                    apply_rope_chunk(values, half, half, region_ids[token] as f32, &inv_freqs);
                 }
             });
         } else {
@@ -1629,8 +1634,8 @@ impl Tensor for CpuTensor {
                 for token in 0..seq_len {
                     let base = (head * seq_len + token) * head_dim;
                     let values = &mut data[base..base + head_dim];
-                    apply_rope_chunk(values, 0, half, global_pos[token] as f32, theta);
-                    apply_rope_chunk(values, half, half, region_ids[token] as f32, theta);
+                    apply_rope_chunk(values, 0, half, global_pos[token] as f32, &inv_freqs);
+                    apply_rope_chunk(values, half, half, region_ids[token] as f32, &inv_freqs);
                 }
             }
         }
@@ -1708,48 +1713,69 @@ impl Tensor for CpuTensor {
             kernel.with_contiguous_data(|kernel_data| {
                 let mut out = vec![0.0; out_time * channels];
 
+                let valid_start = padding;
+                let valid_end = time + padding;
+                let mid_start = valid_start;
+                let mid_end = if valid_end >= kernel_size {
+                    let last_valid = (valid_end - kernel_size) / stride + 1;
+                    last_valid.min(out_time)
+                } else {
+                    0
+                };
+
+                let process_channel = |out_t: usize, channel: usize, input: &[f32], kernel_data: &[f32], bias_data: &Option<Vec<f32>>| -> f32 {
+                    let mut sum = bias_data.as_ref().map_or(0.0, |b| b[channel]);
+                    for kernel_index in 0..kernel_size {
+                        let input_index = out_t * stride + kernel_index;
+                        if input_index < padding {
+                            continue;
+                        }
+                        let input_t = input_index - padding;
+                        if input_t >= time {
+                            continue;
+                        }
+                        sum += input[input_t * channels + channel]
+                            * kernel_data[channel * kernel_size + kernel_index];
+                    }
+                    sum
+                };
+
                 if should_parallelize(out.len()) && channels > 0 {
                     out.par_chunks_mut(channels)
                         .enumerate()
                         .for_each(|(out_t, out_row)| {
-                            for (channel, value) in out_row.iter_mut().enumerate() {
-                                let mut sum = bias_data
-                                    .as_ref()
-                                    .map_or(0.0, |bias_values| bias_values[channel]);
-                                for kernel_index in 0..kernel_size {
-                                    let input_index = out_t * stride + kernel_index;
-                                    if input_index < padding {
-                                        continue;
-                                    }
-                                    let input_t = input_index - padding;
-                                    if input_t >= time {
-                                        continue;
-                                    }
-                                    sum += input[input_t * channels + channel]
-                                        * kernel_data[channel * kernel_size + kernel_index];
+                            if out_t < mid_start || out_t >= mid_end {
+                                for (channel, value) in out_row.iter_mut().enumerate() {
+                                    *value = process_channel(out_t, channel, input, kernel_data, &bias_data);
                                 }
-                                *value = sum;
+                            } else {
+                                for (channel, value) in out_row.iter_mut().enumerate() {
+                                    let mut sum = bias_data.as_ref().map_or(0.0, |b| b[channel]);
+                                    for kernel_index in 0..kernel_size {
+                                        let input_t = out_t * stride + kernel_index - padding;
+                                        sum += input[input_t * channels + channel]
+                                            * kernel_data[channel * kernel_size + kernel_index];
+                                    }
+                                    *value = sum;
+                                }
                             }
                         });
                 } else {
                     for out_t in 0..out_time {
-                        for channel in 0..channels {
-                            let mut sum = bias_data
-                                .as_ref()
-                                .map_or(0.0, |bias_values| bias_values[channel]);
-                            for kernel_index in 0..kernel_size {
-                                let input_index = out_t * stride + kernel_index;
-                                if input_index < padding {
-                                    continue;
-                                }
-                                let input_t = input_index - padding;
-                                if input_t >= time {
-                                    continue;
-                                }
-                                sum += input[input_t * channels + channel]
-                                    * kernel_data[channel * kernel_size + kernel_index];
+                        if out_t < mid_start || out_t >= mid_end {
+                            for channel in 0..channels {
+                                out[out_t * channels + channel] = process_channel(out_t, channel, input, kernel_data, &bias_data);
                             }
-                            out[out_t * channels + channel] = sum;
+                        } else {
+                            for channel in 0..channels {
+                                let mut sum = bias_data.as_ref().map_or(0.0, |b| b[channel]);
+                                for kernel_index in 0..kernel_size {
+                                    let input_t = out_t * stride + kernel_index - padding;
+                                    sum += input[input_t * channels + channel]
+                                        * kernel_data[channel * kernel_size + kernel_index];
+                                }
+                                out[out_t * channels + channel] = sum;
+                            }
                         }
                     }
                 }
@@ -2064,9 +2090,16 @@ fn normalize_rope_dims(
     Ok(dims)
 }
 
-fn apply_rope_chunk(values: &mut [f32], start: usize, dims: usize, position: f32, theta: f32) {
-    for local_offset in (0..dims).step_by(2) {
-        let angle = position / theta.powf(local_offset as f32 / dims as f32);
+fn precompute_inv_freqs(dims: usize, theta: f32) -> Vec<f32> {
+    (0..dims)
+        .step_by(2)
+        .map(|local_offset| 1.0 / theta.powf(local_offset as f32 / dims as f32))
+        .collect()
+}
+
+fn apply_rope_chunk(values: &mut [f32], start: usize, dims: usize, position: f32, inv_freqs: &[f32]) {
+    for (idx, local_offset) in (0..dims).step_by(2).enumerate() {
+        let angle = position * inv_freqs[idx];
         let (sin, cos) = angle.sin_cos();
         let i0 = start + local_offset;
         let i1 = i0 + 1;
