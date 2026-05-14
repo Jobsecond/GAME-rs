@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use crate::profiler::{scope, scope_with};
 use crate::{Error, Result, Tensor};
 
@@ -10,7 +12,8 @@ use super::weights::{
 
 // Chunk attention score rows so temporary score tensors stay bounded on both
 // CPU and GPU backends.
-const MAX_ATTENTION_SCORE_ELEMENTS: usize = 4_000_000;
+const DEFAULT_MAX_ATTENTION_SCORE_ELEMENTS: usize = 32_000_000;
+static MAX_ATTENTION_SCORE_ELEMENTS: OnceLock<usize> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct JointAttentionOutput<T> {
@@ -588,12 +591,23 @@ fn choose_attention_query_chunk_len(num_heads: usize, query_len: usize, key_len:
     }
 
     let score_elements = num_heads.saturating_mul(query_len).saturating_mul(key_len);
-    if score_elements <= MAX_ATTENTION_SCORE_ELEMENTS {
+    let max_score_elements = max_attention_score_elements();
+    if score_elements <= max_score_elements {
         return query_len;
     }
 
-    let rows = MAX_ATTENTION_SCORE_ELEMENTS / num_heads.saturating_mul(key_len).max(1);
+    let rows = max_score_elements / num_heads.saturating_mul(key_len).max(1);
     rows.max(1).min(query_len)
+}
+
+fn max_attention_score_elements() -> usize {
+    *MAX_ATTENTION_SCORE_ELEMENTS.get_or_init(|| {
+        std::env::var("CRABML_MAX_ATTENTION_SCORE_ELEMENTS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(DEFAULT_MAX_ATTENTION_SCORE_ELEMENTS)
+    })
 }
 
 fn validate_head_config(num_heads: usize, head_dim: usize) -> Result<()> {

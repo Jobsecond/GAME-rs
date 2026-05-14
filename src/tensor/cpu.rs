@@ -114,49 +114,52 @@ impl CpuTensor {
         });
         let (seq_len, part_dim) =
             self.validate_attention_layout_input(op_name, parts, num_heads, head_dim)?;
-        let input = self.to_vec()?;
         let full_dim = part_dim * parts;
-        let mut outputs = (0..parts)
-            .map(|_| vec![0.0; num_heads * seq_len * head_dim])
-            .collect::<Vec<_>>();
-        let head_block = seq_len * head_dim;
+        self.with_contiguous_data(|input| {
+            let mut outputs = (0..parts)
+                .map(|_| vec![0.0; num_heads * seq_len * head_dim])
+                .collect::<Vec<_>>();
+            let head_block = seq_len * head_dim;
 
-        if should_parallelize(input.len()) && head_block > 0 {
-            outputs
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(part, out_part)| {
+            if should_parallelize(input.len()) && head_block > 0 {
+                outputs
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(part, out_part)| {
+                        for head in 0..num_heads {
+                            let dst_head =
+                                &mut out_part[head * head_block..(head + 1) * head_block];
+                            let src_head_offset = part * part_dim + head * head_dim;
+                            for token in 0..seq_len {
+                                let src_start = token * full_dim + src_head_offset;
+                                let src_end = src_start + head_dim;
+                                let dst_start = token * head_dim;
+                                let dst_end = dst_start + head_dim;
+                                dst_head[dst_start..dst_end]
+                                    .copy_from_slice(&input[src_start..src_end]);
+                            }
+                        }
+                    });
+            } else {
+                for part in 0..parts {
                     for head in 0..num_heads {
-                        let dst_head = &mut out_part[head * head_block..(head + 1) * head_block];
-                        let src_head_offset = part * part_dim + head * head_dim;
                         for token in 0..seq_len {
-                            let src_start = token * full_dim + src_head_offset;
+                            let src_start = token * full_dim + part * part_dim + head * head_dim;
                             let src_end = src_start + head_dim;
-                            let dst_start = token * head_dim;
+                            let dst_start = (head * seq_len + token) * head_dim;
                             let dst_end = dst_start + head_dim;
-                            dst_head[dst_start..dst_end]
+                            outputs[part][dst_start..dst_end]
                                 .copy_from_slice(&input[src_start..src_end]);
                         }
                     }
-                });
-        } else {
-            for part in 0..parts {
-                for head in 0..num_heads {
-                    for token in 0..seq_len {
-                        let src_start = token * full_dim + part * part_dim + head * head_dim;
-                        let src_end = src_start + head_dim;
-                        let dst_start = (head * seq_len + token) * head_dim;
-                        let dst_end = dst_start + head_dim;
-                        outputs[part][dst_start..dst_end].copy_from_slice(&input[src_start..src_end]);
-                    }
                 }
             }
-        }
 
-        outputs
-            .into_iter()
-            .map(|data| Self::from_owned(data, &[num_heads, seq_len, head_dim]))
-            .collect()
+            outputs
+                .into_iter()
+                .map(|data| Self::from_owned(data, &[num_heads, seq_len, head_dim]))
+                .collect()
+        })
     }
 
     fn unary_op(self, op_name: &str, f: impl Fn(f32) -> f32 + Send + Sync) -> Result<Self> {
@@ -414,34 +417,36 @@ impl Tensor for CpuTensor {
             )));
         }
 
-        let input = self.to_vec()?;
-        let mut out = vec![0.0; input.len()];
-        let head_block = seq_len * head_dim;
-        if should_parallelize(out.len()) && head_block > 0 {
-            out.par_chunks_mut(head_block)
-                .enumerate()
-                .for_each(|(head, out_head)| {
+        self.with_contiguous_data(|input| {
+            let mut out = vec![0.0; input.len()];
+            let head_block = seq_len * head_dim;
+            if should_parallelize(out.len()) && head_block > 0 {
+                out.par_chunks_mut(head_block)
+                    .enumerate()
+                    .for_each(|(head, out_head)| {
+                        for token in 0..seq_len {
+                            let src_start = token * dim + head * head_dim;
+                            let src_end = src_start + head_dim;
+                            let dst_start = token * head_dim;
+                            let dst_end = dst_start + head_dim;
+                            out_head[dst_start..dst_end]
+                                .copy_from_slice(&input[src_start..src_end]);
+                        }
+                    });
+            } else {
+                for head in 0..num_heads {
                     for token in 0..seq_len {
                         let src_start = token * dim + head * head_dim;
                         let src_end = src_start + head_dim;
-                        let dst_start = token * head_dim;
+                        let dst_start = (head * seq_len + token) * head_dim;
                         let dst_end = dst_start + head_dim;
-                        out_head[dst_start..dst_end].copy_from_slice(&input[src_start..src_end]);
+                        out[dst_start..dst_end].copy_from_slice(&input[src_start..src_end]);
                     }
-                });
-        } else {
-            for head in 0..num_heads {
-                for token in 0..seq_len {
-                    let src_start = token * dim + head * head_dim;
-                    let src_end = src_start + head_dim;
-                    let dst_start = (head * seq_len + token) * head_dim;
-                    let dst_end = dst_start + head_dim;
-                    out[dst_start..dst_end].copy_from_slice(&input[src_start..src_end]);
                 }
             }
-        }
 
-        Self::from_owned(out, &[num_heads, seq_len, head_dim])
+            Self::from_owned(out, &[num_heads, seq_len, head_dim])
+        })
     }
 
     fn split_last_dim_two_for_attention_heads(
@@ -509,33 +514,35 @@ impl Tensor for CpuTensor {
             .checked_mul(head_dim)
             .ok_or_else(|| invalid_arg("merge_attention_heads dimension overflow"))?;
 
-        let input = self.to_vec()?;
-        let mut out = vec![0.0; seq_len * merged_dim];
-        if should_parallelize(out.len()) && merged_dim > 0 {
-            out.par_chunks_mut(merged_dim)
-                .enumerate()
-                .for_each(|(token, out_row)| {
+        self.with_contiguous_data(|input| {
+            let mut out = vec![0.0; seq_len * merged_dim];
+            if should_parallelize(out.len()) && merged_dim > 0 {
+                out.par_chunks_mut(merged_dim)
+                    .enumerate()
+                    .for_each(|(token, out_row)| {
+                        for head in 0..num_heads {
+                            let src_start = (head * seq_len + token) * head_dim;
+                            let src_end = src_start + head_dim;
+                            let dst_start = head * head_dim;
+                            let dst_end = dst_start + head_dim;
+                            out_row[dst_start..dst_end]
+                                .copy_from_slice(&input[src_start..src_end]);
+                        }
+                    });
+            } else {
+                for token in 0..seq_len {
                     for head in 0..num_heads {
                         let src_start = (head * seq_len + token) * head_dim;
                         let src_end = src_start + head_dim;
-                        let dst_start = head * head_dim;
+                        let dst_start = token * merged_dim + head * head_dim;
                         let dst_end = dst_start + head_dim;
-                        out_row[dst_start..dst_end].copy_from_slice(&input[src_start..src_end]);
+                        out[dst_start..dst_end].copy_from_slice(&input[src_start..src_end]);
                     }
-                });
-        } else {
-            for token in 0..seq_len {
-                for head in 0..num_heads {
-                    let src_start = (head * seq_len + token) * head_dim;
-                    let src_end = src_start + head_dim;
-                    let dst_start = token * merged_dim + head * head_dim;
-                    let dst_end = dst_start + head_dim;
-                    out[dst_start..dst_end].copy_from_slice(&input[src_start..src_end]);
                 }
             }
-        }
 
-        Self::from_owned(out, &[seq_len, merged_dim])
+            Self::from_owned(out, &[seq_len, merged_dim])
+        })
     }
 
     fn concat(parts: &[&Self], axis: usize) -> Result<Self> {
