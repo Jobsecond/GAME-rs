@@ -184,6 +184,18 @@ pub trait Tensor: Sized + Clone {
         probs.matmul(v)
     }
 
+    fn fused_attention(
+        q: &Self,
+        k: &Self,
+        v: &Self,
+        mask: Option<&Self>,
+        scale: f32,
+    ) -> Result<Self> {
+        let k_t = k.clone().transpose(1, 2)?;
+        let scores = Self::attention_score_softmax(q, &k_t, mask, scale)?;
+        Self::attention_value_matmul(&scores, v)
+    }
+
     fn rms_norm(self, weight: &Self, eps: f32) -> Result<Self>;
     fn gelu(self) -> Result<Self>;
     fn softmax(self, axis: isize) -> Result<Self>;

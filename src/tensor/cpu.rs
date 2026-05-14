@@ -1168,6 +1168,209 @@ impl Tensor for CpuTensor {
         Self::from_owned(out, &[heads, query_len, head_dim])
     }
 
+    fn fused_attention(
+        q: &Self,
+        k: &Self,
+        v: &Self,
+        mask: Option<&Self>,
+        scale: f32,
+    ) -> Result<Self> {
+        let _profile = op_scope_with("cpu.fused_attention", || {
+            format!(
+                "q={:?} k={:?} v={:?} mask={} scale={}",
+                q.shape(),
+                k.shape(),
+                v.shape(),
+                mask.is_some(),
+                scale
+            )
+        });
+
+        let (heads, q_len, head_dim) = (q.shape()[0], q.shape()[1], q.shape()[2]);
+        let key_len = k.shape()[1];
+
+        if q.shape()[2] != head_dim || k.shape()[2] != head_dim || v.shape()[2] != head_dim {
+            return Err(invalid_arg(format!(
+                "fused_attention head_dim mismatch: q={:?} k={:?} v={:?}",
+                q.shape(),
+                k.shape(),
+                v.shape()
+            )));
+        }
+        if q.shape()[0] != k.shape()[0] || q.shape()[0] != v.shape()[0] {
+            return Err(invalid_arg(format!(
+                "fused_attention head count mismatch: q={:?} k={:?} v={:?}",
+                q.shape(),
+                k.shape(),
+                v.shape()
+            )));
+        }
+        if k.shape()[1] != v.shape()[1] {
+            return Err(invalid_arg(format!(
+                "fused_attention key/value seq mismatch: k={:?} v={:?}",
+                k.shape(),
+                v.shape()
+            )));
+        }
+
+        let mask_shape = mask.map(|m| m.shape().to_vec());
+        let mask_2d = mask_shape.as_deref().map(|s| s.len() == 2).unwrap_or(false);
+
+        // Build k_t layout pointers like original attention_score_softmax does
+        let k_t = k.clone().transpose(1, 2)?;
+        let (k_storage, k_layout) = k_t.tensor.storage_and_layout();
+        let k_data = match &*k_storage {
+            Storage::Cpu(storage) => storage.as_slice::<f32>()?,
+            _ => return Err(invalid_arg("CpuTensor expected CPU storage for k_t")),
+        };
+        let k_ptr = k_data[k_layout.start_offset()..].as_ptr() as usize;
+        let k_batch_stride = k_layout.stride()[0];
+        let k_rs = k_layout.stride()[1] as isize;
+        let k_cs = k_layout.stride()[2] as isize;
+
+        // q layout
+        let (q_storage, q_layout) = q.tensor.storage_and_layout();
+        let q_data = match &*q_storage {
+            Storage::Cpu(storage) => storage.as_slice::<f32>()?,
+            _ => return Err(invalid_arg("CpuTensor expected CPU storage for q")),
+        };
+        let q_ptr = q_data[q_layout.start_offset()..].as_ptr() as usize;
+        let q_batch_stride = q_layout.stride()[0];
+        let q_rs = q_layout.stride()[1] as isize;
+        let q_cs = q_layout.stride()[2] as isize;
+
+        // v layout
+        let (v_storage, v_layout) = v.tensor.storage_and_layout();
+        let v_data = match &*v_storage {
+            Storage::Cpu(storage) => storage.as_slice::<f32>()?,
+            _ => return Err(invalid_arg("CpuTensor expected CPU storage for v")),
+        };
+        let v_ptr = v_data[v_layout.start_offset()..].as_ptr() as usize;
+        let v_batch_stride = v_layout.stride()[0];
+        let v_rs = v_layout.stride()[1] as isize;
+        let v_cs = v_layout.stride()[2] as isize;
+
+        // mask data as Vec
+        let mask_owned: Option<Vec<f32>> = mask.map(|m| m.to_vec()).transpose()?;
+
+        // Allocate scores as a single Vec (not a Tensor) like original pattern
+        let mut scores = vec![0.0; heads * q_len * key_len];
+        let score_head_stride = q_len * key_len;
+        let score_row_stride = key_len;
+
+        // Phase 1: GEMM scores = q @ k_t (with scale) – parallel across heads
+        let score_rs = key_len as isize;
+        let score_cs = 1isize;
+        if should_parallelize(heads * q_len * key_len) && key_len > 0 && head_dim > 0 {
+            scores.par_chunks_mut(score_head_stride)
+                .enumerate()
+                .for_each(|(head, out_head)| {
+                    let lhs_ptr = (q_ptr + head * q_batch_stride * std::mem::size_of::<f32>()) as *const f32;
+                    let rhs_ptr = (k_ptr + head * k_batch_stride * std::mem::size_of::<f32>()) as *const f32;
+                    unsafe {
+                        attention_gemm_f32(
+                            q_len, key_len, head_dim, scale,
+                            lhs_ptr, q_cs, q_rs,
+                            rhs_ptr, k_cs, k_rs,
+                            out_head.as_mut_ptr(), score_cs, score_rs,
+                        );
+                    }
+                });
+        } else {
+            for head in 0..heads {
+                let lhs_ptr = (q_ptr + head * q_batch_stride * std::mem::size_of::<f32>()) as *const f32;
+                let rhs_ptr = (k_ptr + head * k_batch_stride * std::mem::size_of::<f32>()) as *const f32;
+                let out_head = &mut scores[head * score_head_stride..(head + 1) * score_head_stride];
+                unsafe {
+                    attention_gemm_f32(
+                        q_len, key_len, head_dim, scale,
+                        lhs_ptr, q_cs, q_rs,
+                        rhs_ptr, k_cs, k_rs,
+                        out_head.as_mut_ptr(), score_cs, score_rs,
+                    );
+                }
+            }
+        }
+
+        // Phase 2: mask + softmax – parallel across ALL score rows
+        let total_score_rows = heads * q_len;
+        let mask_ref: Option<&[f32]> = mask_owned.as_deref();
+        if should_parallelize(total_score_rows * key_len) && key_len > 0 {
+            scores.par_chunks_mut(score_row_stride)
+                .enumerate()
+                .for_each(|(flat_row, row_scores)| {
+                    let head = flat_row / q_len;
+                    let row = flat_row % q_len;
+                    if let Some(mask_data) = mask_ref {
+                        let mask_base = if mask_2d {
+                            row * key_len
+                        } else {
+                            head * q_len * key_len + row * key_len
+                        };
+                        for j in 0..key_len {
+                            row_scores[j] += mask_data[mask_base + j];
+                        }
+                    }
+                    apply_softmax_inplace(row_scores);
+                });
+        } else {
+            for flat_row in 0..total_score_rows {
+                let head = flat_row / q_len;
+                let row = flat_row % q_len;
+                let row_start = flat_row * key_len;
+                let row_scores = &mut scores[row_start..row_start + key_len];
+                if let Some(mask_data) = mask_ref {
+                    let mask_base = if mask_2d {
+                        row * key_len
+                    } else {
+                        head * q_len * key_len + row * key_len
+                    };
+                    for j in 0..key_len {
+                        row_scores[j] += mask_data[mask_base + j];
+                    }
+                }
+                apply_softmax_inplace(row_scores);
+            }
+        }
+
+        // Phase 3: GEMM out = scores @ v – parallel across heads
+        let mut out = vec![0.0; heads * q_len * head_dim];
+        let out_head_stride = q_len * head_dim;
+        if should_parallelize(heads * q_len * head_dim) && key_len > 0 && head_dim > 0 {
+            out.par_chunks_mut(out_head_stride)
+                .enumerate()
+                .for_each(|(head, out_head)| {
+                    let score_base = head * score_head_stride;
+                    let rhs_ptr = (v_ptr + head * v_batch_stride * std::mem::size_of::<f32>()) as *const f32;
+                    unsafe {
+                        attention_gemm_f32(
+                            q_len, head_dim, key_len, 1.0,
+                            scores[score_base..].as_ptr(), score_cs, score_rs,
+                            rhs_ptr, v_cs, v_rs,
+                            out_head.as_mut_ptr(), 1, head_dim as isize,
+                        );
+                    }
+                });
+        } else {
+            for head in 0..heads {
+                let score_base = head * score_head_stride;
+                let rhs_ptr = (v_ptr + head * v_batch_stride * std::mem::size_of::<f32>()) as *const f32;
+                let out_head =
+                    &mut out[head * out_head_stride..(head + 1) * out_head_stride];
+                unsafe {
+                    attention_gemm_f32(
+                        q_len, head_dim, key_len, 1.0,
+                        scores[score_base..].as_ptr(), score_cs, score_rs,
+                        rhs_ptr, v_cs, v_rs,
+                        out_head.as_mut_ptr(), 1, head_dim as isize,
+                    );
+                }
+            }
+        }
+
+        Self::from_owned(out, &[heads, q_len, head_dim])
+    }
+
     fn rms_norm(self, weight: &Self, eps: f32) -> Result<Self> {
         let _profile = op_scope_with("cpu.rms_norm", || {
             format!(
@@ -2046,6 +2249,25 @@ fn choose_parallel_attention_row_chunk_len(
     let per_row_work = shared_dim.saturating_mul(out_dim).max(1);
     let min_chunk_rows = 1_000_000usize.div_ceil(per_row_work);
     by_tasks.max(min_chunk_rows).max(1).min(rows)
+}
+
+fn apply_softmax_inplace(row_scores: &mut [f32]) {
+    let mut max_val = f32::NEG_INFINITY;
+    for &s in row_scores.iter() {
+        if s > max_val {
+            max_val = s;
+        }
+    }
+    let mut sum = 0.0;
+    for s in row_scores.iter_mut() {
+        *s = (*s - max_val).exp();
+        sum += *s;
+    }
+    if sum > 0.0 {
+        for s in row_scores.iter_mut() {
+            *s /= sum;
+        }
+    }
 }
 
 fn apply_mask_and_softmax_row(

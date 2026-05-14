@@ -587,15 +587,10 @@ fn scaled_dot_product_attention_chunked<T: Tensor>(
     });
     let query_len = q.shape()[1];
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let k_t = k
-        .clone()
-        .transpose(1, 2)
-        .map_err(|err| Error::message(format!("attention key transpose failed: {err}")))?;
 
     if query_chunk_len >= query_len {
-        return T::attention_score_softmax(q, &k_t, mask, scale)
-            .and_then(|probs| T::attention_value_matmul(&probs, v))
-            .map_err(|err| Error::message(format!("attention value matmul failed: {err}")));
+        return T::fused_attention(q, k, v, mask, scale)
+            .map_err(|err| Error::message(format!("fused attention failed: {err}")));
     }
 
     let mut outputs = Vec::new();
@@ -612,9 +607,8 @@ fn scaled_dot_product_attention_chunked<T: Tensor>(
             None => None,
         };
 
-        let chunk_output = T::attention_score_softmax(&q_chunk, &k_t, mask_chunk.as_ref(), scale)
-            .and_then(|probs| T::attention_value_matmul(&probs, v))
-            .map_err(|err| Error::message(format!("attention value matmul failed: {err}")))?;
+        let chunk_output = T::fused_attention(&q_chunk, k, v, mask_chunk.as_ref(), scale)
+            .map_err(|err| Error::message(format!("fused attention failed: {err}")))?;
         outputs.push(chunk_output);
     }
 
