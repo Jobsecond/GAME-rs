@@ -792,6 +792,7 @@ dependencies = [
  "candle-nn",
  "clap",
  "env_logger",
+ "gemm",
  "hound",
  "log",
  "matrixmultiply",

@@ -2,12 +2,22 @@ use std::f32::consts::SQRT_2;
 use std::sync::OnceLock;
 
 use candle_core::{DType, Device, Storage, Tensor as CandleTensor};
+#[cfg(not(feature = "cpu-attention-gemm-matrixmultiply"))]
+use gemm::Parallelism;
 use rayon::prelude::*;
 
 use crate::profiler::op_scope_with;
 use crate::{Error, Result};
 
 use super::Tensor;
+
+#[cfg(all(
+    feature = "cpu-attention-gemm-gemm",
+    feature = "cpu-attention-gemm-matrixmultiply"
+))]
+compile_error!(
+    "cpu-attention-gemm-gemm and cpu-attention-gemm-matrixmultiply are mutually exclusive"
+);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CpuDevice;
@@ -184,7 +194,12 @@ impl CpuTensor {
         f: impl Fn(f32, f32) -> f32 + Send + Sync,
     ) -> Result<Self> {
         let _profile = op_scope_with("cpu.binary_op", || {
-            format!("op={} lhs={:?} rhs={:?}", op_name, self.shape(), rhs.shape())
+            format!(
+                "op={} lhs={:?} rhs={:?}",
+                op_name,
+                self.shape(),
+                rhs.shape()
+            )
         });
         let lhs_shape = self.shape().to_vec();
         let rhs_shape = rhs.shape().to_vec();
@@ -257,8 +272,7 @@ impl CpuTensor {
                             out.par_chunks_mut(last_dim)
                                 .enumerate()
                                 .for_each(|(row, out_row)| {
-                                    let lhs_row =
-                                        &lhs_data[row * last_dim..(row + 1) * last_dim];
+                                    let lhs_row = &lhs_data[row * last_dim..(row + 1) * last_dim];
                                     for col in 0..last_dim {
                                         out_row[col] = f(lhs_row[col], rhs_data[col]);
                                     }
@@ -277,8 +291,7 @@ impl CpuTensor {
                             out.par_chunks_mut(last_dim)
                                 .enumerate()
                                 .for_each(|(row, out_row)| {
-                                    let rhs_row =
-                                        &rhs_data[row * last_dim..(row + 1) * last_dim];
+                                    let rhs_row = &rhs_data[row * last_dim..(row + 1) * last_dim];
                                     for col in 0..last_dim {
                                         out_row[col] = f(lhs_data[col], rhs_row[col]);
                                     }
@@ -383,9 +396,11 @@ impl Tensor for CpuTensor {
                 end, start
             )));
         }
-        Ok(Self::from_tensor(
-            self.tensor.narrow(axis, start, end - start)?,
-        ))
+        Ok(Self::from_tensor(self.tensor.narrow(
+            axis,
+            start,
+            end - start,
+        )?))
     }
 
     fn layout_for_attention_heads(self, num_heads: usize, head_dim: usize) -> Result<Self> {
@@ -461,12 +476,12 @@ impl Tensor for CpuTensor {
             head_dim,
             "cpu.split_last_dim_two_for_attention_heads",
         )?;
-        let second = parts
-            .pop()
-            .ok_or_else(|| invalid_arg("split_last_dim_two_for_attention_heads missing second part"))?;
-        let first = parts
-            .pop()
-            .ok_or_else(|| invalid_arg("split_last_dim_two_for_attention_heads missing first part"))?;
+        let second = parts.pop().ok_or_else(|| {
+            invalid_arg("split_last_dim_two_for_attention_heads missing second part")
+        })?;
+        let first = parts.pop().ok_or_else(|| {
+            invalid_arg("split_last_dim_two_for_attention_heads missing first part")
+        })?;
         Ok((first, second))
     }
 
@@ -481,15 +496,15 @@ impl Tensor for CpuTensor {
             head_dim,
             "cpu.split_last_dim_three_for_attention_heads",
         )?;
-        let third = parts
-            .pop()
-            .ok_or_else(|| invalid_arg("split_last_dim_three_for_attention_heads missing third part"))?;
-        let second = parts
-            .pop()
-            .ok_or_else(|| invalid_arg("split_last_dim_three_for_attention_heads missing second part"))?;
-        let first = parts
-            .pop()
-            .ok_or_else(|| invalid_arg("split_last_dim_three_for_attention_heads missing first part"))?;
+        let third = parts.pop().ok_or_else(|| {
+            invalid_arg("split_last_dim_three_for_attention_heads missing third part")
+        })?;
+        let second = parts.pop().ok_or_else(|| {
+            invalid_arg("split_last_dim_three_for_attention_heads missing second part")
+        })?;
+        let first = parts.pop().ok_or_else(|| {
+            invalid_arg("split_last_dim_three_for_attention_heads missing first part")
+        })?;
         Ok((first, second, third))
     }
 
@@ -526,8 +541,7 @@ impl Tensor for CpuTensor {
                             let src_end = src_start + head_dim;
                             let dst_start = head * head_dim;
                             let dst_end = dst_start + head_dim;
-                            out_row[dst_start..dst_end]
-                                .copy_from_slice(&input[src_start..src_end]);
+                            out_row[dst_start..dst_end].copy_from_slice(&input[src_start..src_end]);
                         }
                     });
             } else {
@@ -552,7 +566,10 @@ impl Tensor for CpuTensor {
                 "parts={} axis={} first_shape={:?}",
                 parts.len(),
                 axis,
-                parts.first().map(|part| part.shape().to_vec()).unwrap_or_default()
+                parts
+                    .first()
+                    .map(|part| part.shape().to_vec())
+                    .unwrap_or_default()
             )
         });
         let first = parts
@@ -628,7 +645,11 @@ impl Tensor for CpuTensor {
 
     fn split_last_dim_two_gelu_mul(self) -> Result<Self> {
         let _profile = op_scope_with("cpu.split_last_dim_two_gelu_mul", || {
-            format!("shape={:?} contiguous={}", self.shape(), self.tensor.is_contiguous())
+            format!(
+                "shape={:?} contiguous={}",
+                self.shape(),
+                self.tensor.is_contiguous()
+            )
         });
         let shape = self.shape().to_vec();
         let axis = shape
@@ -668,8 +689,7 @@ impl Tensor for CpuTensor {
                     let out_row = &mut out[row * half..(row + 1) * half];
                     for col in 0..half {
                         let value = lhs[col];
-                        out_row[col] =
-                            0.5 * value * (1.0 + erf_approx(value / SQRT_2)) * rhs[col];
+                        out_row[col] = 0.5 * value * (1.0 + erf_approx(value / SQRT_2)) * rhs[col];
                     }
                 }
             }
@@ -900,11 +920,14 @@ impl Tensor for CpuTensor {
         } else {
             None
         };
-        let mask_outer_stride = mask_layout_owned.as_ref().map(|layout| match layout.dims().len() {
-            2 => layout.stride()[0],
-            3 => layout.stride()[1],
-            _ => 0,
-        });
+        let mask_outer_stride =
+            mask_layout_owned
+                .as_ref()
+                .map(|layout| match layout.dims().len() {
+                    2 => layout.stride()[0],
+                    3 => layout.stride()[1],
+                    _ => 0,
+                });
         let mask_head_stride = mask_layout_owned.as_ref().and_then(|layout| {
             if layout.dims().len() == 3 {
                 Some(layout.stride()[0])
@@ -924,47 +947,46 @@ impl Tensor for CpuTensor {
                     let rhs_ptr =
                         (k_ptr + head * k_batch_stride * std::mem::size_of::<f32>()) as *const f32;
                     unsafe {
-                        matrixmultiply::sgemm(
+                        attention_gemm_f32(
                             query_len,
-                            head_dim,
                             key_len,
+                            head_dim,
                             scale,
                             lhs_ptr,
-                            q_rs,
                             q_cs,
+                            q_rs,
                             rhs_ptr,
-                            k_rs,
                             k_cs,
-                            0.0,
+                            k_rs,
                             out_head.as_mut_ptr(),
-                            key_len as isize,
                             1,
+                            key_len as isize,
                         );
                     }
                 });
         } else {
             for head in 0..heads {
-                let out_head = &mut out[head * query_len * key_len..(head + 1) * query_len * key_len];
+                let out_head =
+                    &mut out[head * query_len * key_len..(head + 1) * query_len * key_len];
                 let lhs_ptr =
                     (q_ptr + head * q_batch_stride * std::mem::size_of::<f32>()) as *const f32;
                 let rhs_ptr =
                     (k_ptr + head * k_batch_stride * std::mem::size_of::<f32>()) as *const f32;
                 unsafe {
-                    matrixmultiply::sgemm(
+                    attention_gemm_f32(
                         query_len,
-                        head_dim,
                         key_len,
+                        head_dim,
                         scale,
                         lhs_ptr,
-                        q_rs,
                         q_cs,
+                        q_rs,
                         rhs_ptr,
-                        k_rs,
                         k_cs,
-                        0.0,
+                        k_rs,
                         out_head.as_mut_ptr(),
-                        key_len as isize,
                         1,
+                        key_len as isize,
                     );
                 }
             }
@@ -978,7 +1000,7 @@ impl Tensor for CpuTensor {
                     let row = flat_row % query_len;
                     apply_mask_and_softmax_row(
                         row_scores,
-                        mask_data.as_deref(),
+                        mask_data,
                         mask_shape.as_deref(),
                         mask_outer_stride,
                         mask_head_stride,
@@ -1034,7 +1056,11 @@ impl Tensor for CpuTensor {
         let (v_storage, v_layout) = v.tensor.storage_and_layout();
         let v_data = match &*v_storage {
             Storage::Cpu(storage) => storage.as_slice::<f32>()?,
-            _ => return Err(invalid_arg("CpuTensor expected CPU storage for value tensor")),
+            _ => {
+                return Err(invalid_arg(
+                    "CpuTensor expected CPU storage for value tensor",
+                ));
+            }
         };
         let v_ptr = v_data[v_layout.start_offset()..].as_ptr() as usize;
         let v_batch_stride = v_layout.stride()[0];
@@ -1043,8 +1069,7 @@ impl Tensor for CpuTensor {
 
         let mut out = vec![0.0; heads * query_len * head_dim];
         let head_block = query_len * head_dim;
-        let row_chunk_len =
-            choose_parallel_attention_row_chunk_len(query_len, key_len, head_dim);
+        let row_chunk_len = choose_parallel_attention_row_chunk_len(query_len, key_len, head_dim);
 
         if should_parallelize_attention_matmul(heads, query_len, key_len, head_dim)
             && row_chunk_len < query_len
@@ -1055,8 +1080,7 @@ impl Tensor for CpuTensor {
                 .for_each(|(head, out_head)| {
                     let lhs_base =
                         probs_ptr + head * probs_batch_stride * std::mem::size_of::<f32>();
-                    let rhs_base =
-                        v_ptr + head * v_batch_stride * std::mem::size_of::<f32>();
+                    let rhs_base = v_ptr + head * v_batch_stride * std::mem::size_of::<f32>();
                     out_head
                         .par_chunks_mut(row_chunk_len * head_dim)
                         .enumerate()
@@ -1068,21 +1092,20 @@ impl Tensor for CpuTensor {
                                 as *const f32;
                             let rhs_ptr = rhs_base as *const f32;
                             unsafe {
-                                matrixmultiply::sgemm(
+                                attention_gemm_f32(
                                     chunk_rows,
-                                    key_len,
                                     head_dim,
+                                    key_len,
                                     1.0,
                                     lhs_ptr,
-                                    probs_rs,
                                     probs_cs,
+                                    probs_rs,
                                     rhs_ptr,
-                                    v_rs,
                                     v_cs,
-                                    0.0,
+                                    v_rs,
                                     out_chunk.as_mut_ptr(),
-                                    head_dim as isize,
                                     1,
+                                    head_dim as isize,
                                 );
                             }
                         });
@@ -1094,53 +1117,49 @@ impl Tensor for CpuTensor {
                     let lhs_ptr = (probs_ptr
                         + head * probs_batch_stride * std::mem::size_of::<f32>())
                         as *const f32;
-                    let rhs_ptr = (v_ptr
-                        + head * v_batch_stride * std::mem::size_of::<f32>())
-                        as *const f32;
+                    let rhs_ptr =
+                        (v_ptr + head * v_batch_stride * std::mem::size_of::<f32>()) as *const f32;
                     unsafe {
-                        matrixmultiply::sgemm(
+                        attention_gemm_f32(
                             query_len,
-                            key_len,
                             head_dim,
+                            key_len,
                             1.0,
                             lhs_ptr,
-                            probs_rs,
                             probs_cs,
+                            probs_rs,
                             rhs_ptr,
-                            v_rs,
                             v_cs,
-                            0.0,
+                            v_rs,
                             out_head.as_mut_ptr(),
-                            head_dim as isize,
                             1,
+                            head_dim as isize,
                         );
                     }
                 });
         } else {
             for head in 0..heads {
-                let out_head = &mut out[head * query_len * head_dim..(head + 1) * query_len * head_dim];
-                let lhs_ptr = (probs_ptr
-                    + head * probs_batch_stride * std::mem::size_of::<f32>())
+                let out_head =
+                    &mut out[head * query_len * head_dim..(head + 1) * query_len * head_dim];
+                let lhs_ptr = (probs_ptr + head * probs_batch_stride * std::mem::size_of::<f32>())
                     as *const f32;
-                let rhs_ptr = (v_ptr
-                    + head * v_batch_stride * std::mem::size_of::<f32>())
-                    as *const f32;
+                let rhs_ptr =
+                    (v_ptr + head * v_batch_stride * std::mem::size_of::<f32>()) as *const f32;
                 unsafe {
-                    matrixmultiply::sgemm(
+                    attention_gemm_f32(
                         query_len,
-                        key_len,
                         head_dim,
+                        key_len,
                         1.0,
                         lhs_ptr,
-                        probs_rs,
                         probs_cs,
+                        probs_rs,
                         rhs_ptr,
-                        v_rs,
                         v_cs,
-                        0.0,
+                        v_rs,
                         out_head.as_mut_ptr(),
-                        head_dim as isize,
                         1,
+                        head_dim as isize,
                     );
                 }
             }
@@ -1211,7 +1230,9 @@ impl Tensor for CpuTensor {
     }
 
     fn gelu(self) -> Result<Self> {
-        self.unary_op("gelu", |value| 0.5 * value * (1.0 + erf_approx(value / SQRT_2)))
+        self.unary_op("gelu", |value| {
+            0.5 * value * (1.0 + erf_approx(value / SQRT_2))
+        })
     }
 
     fn softmax(self, axis: isize) -> Result<Self> {
@@ -1684,7 +1705,12 @@ fn broadcast_shape(lhs: &[usize], rhs: &[usize]) -> Result<Vec<usize>> {
     Ok(out)
 }
 
-fn broadcast_offset(coords: &[usize], shape: &[usize], strides: &[usize], out_rank: usize) -> usize {
+fn broadcast_offset(
+    coords: &[usize],
+    shape: &[usize],
+    strides: &[usize],
+    out_rank: usize,
+) -> usize {
     if shape.is_empty() {
         return 0;
     }
@@ -1858,6 +1884,85 @@ fn erf_approx(x: f32) -> f32 {
             * t)
             * (-x * x).exp();
     sign * y
+}
+
+#[cfg(feature = "cpu-attention-gemm-matrixmultiply")]
+#[inline]
+unsafe fn attention_gemm_f32(
+    rows: usize,
+    cols: usize,
+    inner: usize,
+    product_scale: f32,
+    lhs: *const f32,
+    lhs_cs: isize,
+    lhs_rs: isize,
+    rhs: *const f32,
+    rhs_cs: isize,
+    rhs_rs: isize,
+    dst: *mut f32,
+    dst_cs: isize,
+    dst_rs: isize,
+) {
+    unsafe {
+        matrixmultiply::sgemm(
+            rows,
+            inner,
+            cols,
+            product_scale,
+            lhs,
+            lhs_rs,
+            lhs_cs,
+            rhs,
+            rhs_rs,
+            rhs_cs,
+            0.0,
+            dst,
+            dst_rs,
+            dst_cs,
+        );
+    }
+}
+
+#[cfg(not(feature = "cpu-attention-gemm-matrixmultiply"))]
+#[inline]
+unsafe fn attention_gemm_f32(
+    rows: usize,
+    cols: usize,
+    inner: usize,
+    product_scale: f32,
+    lhs: *const f32,
+    lhs_cs: isize,
+    lhs_rs: isize,
+    rhs: *const f32,
+    rhs_cs: isize,
+    rhs_rs: isize,
+    dst: *mut f32,
+    dst_cs: isize,
+    dst_rs: isize,
+) {
+    unsafe {
+        gemm::gemm(
+            rows,
+            cols,
+            inner,
+            dst,
+            dst_cs,
+            dst_rs,
+            false,
+            lhs,
+            lhs_cs,
+            lhs_rs,
+            rhs,
+            rhs_cs,
+            rhs_rs,
+            0.0,
+            product_scale,
+            false,
+            false,
+            false,
+            Parallelism::None,
+        );
+    }
 }
 
 fn should_parallelize(len: usize) -> bool {

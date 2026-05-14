@@ -30,7 +30,12 @@ pub fn attention<T: Tensor>(
     theta: f32,
 ) -> Result<T> {
     let _scope = scope_with("attention", || {
-        format!("x={:?} heads={} head_dim={}", x.shape(), num_heads, head_dim)
+        format!(
+            "x={:?} heads={} head_dim={}",
+            x.shape(),
+            num_heads,
+            head_dim
+        )
     });
     validate_head_config(num_heads, head_dim)?;
 
@@ -100,7 +105,10 @@ pub fn joint_attention<T: Tensor>(
         )));
     }
 
-    let _pool_norm_scope = scope("joint_attention.pool_norm", format!("pool={:?}", pool.shape()));
+    let _pool_norm_scope = scope(
+        "joint_attention.pool_norm",
+        format!("pool={:?}", pool.shape()),
+    );
     let pool_norm = pool
         .clone()
         .rms_norm(&weights.pool.norm, RMS_NORM_EPS)
@@ -111,21 +119,33 @@ pub fn joint_attention<T: Tensor>(
         .rms_norm(&weights.x.norm, RMS_NORM_EPS)
         .map_err(|err| Error::message(format!("joint_attention x norm failed: {err}")))?;
 
-    let _pool_qkv_scope = scope("joint_attention.pool_qkv", format!("pool_norm={:?}", pool_norm.shape()));
+    let _pool_qkv_scope = scope(
+        "joint_attention.pool_qkv",
+        format!("pool_norm={:?}", pool_norm.shape()),
+    );
     let pool_qkv = pool_norm
         .linear(&weights.pool.qkv.weight, Some(&weights.pool.qkv.bias))
         .map_err(|err| Error::message(format!("joint_attention pool qkv failed: {err}")))?;
-    let _x_qkv_scope = scope("joint_attention.x_qkv", format!("x_norm={:?}", x_norm.shape()));
+    let _x_qkv_scope = scope(
+        "joint_attention.x_qkv",
+        format!("x_norm={:?}", x_norm.shape()),
+    );
     let x_qkv = x_norm
         .linear(&weights.x.qkv.weight, Some(&weights.x.qkv.bias))
         .map_err(|err| Error::message(format!("joint_attention x qkv failed: {err}")))?;
 
     let (pool_q, pool_k, pool_v) = pool_qkv
         .split_last_dim_three_for_attention_heads(num_heads, head_dim)
-        .map_err(|err| Error::message(format!("joint_attention pool qkv split/layout failed: {err}")))?;
+        .map_err(|err| {
+            Error::message(format!(
+                "joint_attention pool qkv split/layout failed: {err}"
+            ))
+        })?;
     let (x_q, x_k, x_v) = x_qkv
         .split_last_dim_three_for_attention_heads(num_heads, head_dim)
-        .map_err(|err| Error::message(format!("joint_attention x qkv split/layout failed: {err}")))?;
+        .map_err(|err| {
+            Error::message(format!("joint_attention x qkv split/layout failed: {err}"))
+        })?;
 
     let pool_q = apply_optional_qk_norm(
         pool_q,
@@ -149,7 +169,10 @@ pub fn joint_attention<T: Tensor>(
         "joint_attention x k_norm",
     )?;
 
-    let _q_rope_scope = scope("joint_attention.q_rope", format!("pool_q={:?} x_q={:?}", pool_q.shape(), x_q.shape()));
+    let _q_rope_scope = scope(
+        "joint_attention.q_rope",
+        format!("pool_q={:?} x_q={:?}", pool_q.shape(), x_q.shape()),
+    );
     let q = T::concat(&[&pool_q, &x_q], 1)
         .map_err(|err| Error::message(format!("joint_attention q concat failed: {err}")))?
         .region_rope(
@@ -161,7 +184,10 @@ pub fn joint_attention<T: Tensor>(
             theta,
         )
         .map_err(|err| Error::message(format!("joint_attention q mixed rope failed: {err}")))?;
-    let _k_rope_scope = scope("joint_attention.k_rope", format!("pool_k={:?} x_k={:?}", pool_k.shape(), x_k.shape()));
+    let _k_rope_scope = scope(
+        "joint_attention.k_rope",
+        format!("pool_k={:?} x_k={:?}", pool_k.shape(), x_k.shape()),
+    );
     let k = T::concat(&[&pool_k, &x_k], 1)
         .map_err(|err| Error::message(format!("joint_attention k concat failed: {err}")))?
         .region_rope(
@@ -173,11 +199,17 @@ pub fn joint_attention<T: Tensor>(
             theta,
         )
         .map_err(|err| Error::message(format!("joint_attention k mixed rope failed: {err}")))?;
-    let _v_concat_scope = scope("joint_attention.v_concat", format!("pool_v={:?} x_v={:?}", pool_v.shape(), x_v.shape()));
+    let _v_concat_scope = scope(
+        "joint_attention.v_concat",
+        format!("pool_v={:?} x_v={:?}", pool_v.shape(), x_v.shape()),
+    );
     let v = T::concat(&[&pool_v, &x_v], 1)
         .map_err(|err| Error::message(format!("joint_attention v concat failed: {err}")))?;
 
-    let _attn_scope = scope("joint_attention.attention", format!("q={:?} k={:?} v={:?}", q.shape(), k.shape(), v.shape()));
+    let _attn_scope = scope(
+        "joint_attention.attention",
+        format!("q={:?} k={:?} v={:?}", q.shape(), k.shape(), v.shape()),
+    );
     let merged = merge_heads(scaled_dot_product_attention(
         &q,
         &k,
@@ -186,14 +218,20 @@ pub fn joint_attention<T: Tensor>(
         head_dim,
     )?)?;
 
-    let _pool_out_scope = scope("joint_attention.pool_out", format!("merged={:?} pool_len={}", merged.shape(), pool_len));
+    let _pool_out_scope = scope(
+        "joint_attention.pool_out",
+        format!("merged={:?} pool_len={}", merged.shape(), pool_len),
+    );
     let pool_proj = merged
         .clone()
         .slice(0, 0, pool_len)
         .map_err(|err| Error::message(format!("joint_attention pool slice failed: {err}")))?
         .linear(&weights.pool.out.weight, Some(&weights.pool.out.bias))
         .map_err(|err| Error::message(format!("joint_attention pool out failed: {err}")))?;
-    let _x_out_scope = scope("joint_attention.x_out", format!("merged={:?} x_len={}", merged.shape(), x_len));
+    let _x_out_scope = scope(
+        "joint_attention.x_out",
+        format!("merged={:?} x_len={}", merged.shape(), x_len),
+    );
     let x_proj = merged
         .slice(0, pool_len, total_len)
         .map_err(|err| Error::message(format!("joint_attention x slice failed: {err}")))?

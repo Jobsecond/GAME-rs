@@ -105,10 +105,7 @@ pub(crate) fn scope(label: &'static str, details: impl Into<String>) -> ProfileS
     }
 }
 
-pub(crate) fn scope_with(
-    label: &'static str,
-    details: impl FnOnce() -> String,
-) -> ProfileScope {
+pub(crate) fn scope_with(label: &'static str, details: impl FnOnce() -> String) -> ProfileScope {
     if !cpu_profiling_enabled() || !is_session_active() {
         return ProfileScope {
             active: false,
@@ -128,10 +125,7 @@ pub(crate) fn scope_with(
     }
 }
 
-pub(crate) fn op_scope_with(
-    label: &'static str,
-    details: impl FnOnce() -> String,
-) -> ProfileScope {
+pub(crate) fn op_scope_with(label: &'static str, details: impl FnOnce() -> String) -> ProfileScope {
     if !cpu_profiling_enabled() || !is_session_active() {
         return ProfileScope {
             active: false,
@@ -214,7 +208,11 @@ fn log_profile_section(
     }
 
     let mut rows = entries.iter().collect::<Vec<_>>();
-    rows.sort_by(|(_, lhs), (_, rhs)| rhs.total.cmp(&lhs.total).then_with(|| rhs.calls.cmp(&lhs.calls)));
+    rows.sort_by(|(_, lhs), (_, rhs)| {
+        rhs.total
+            .cmp(&lhs.total)
+            .then_with(|| rhs.calls.cmp(&lhs.calls))
+    });
 
     let limit = profile_top_n();
     info!(

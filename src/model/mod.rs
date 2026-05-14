@@ -233,10 +233,7 @@ impl<T: Tensor> ModelInner<T> {
             &self.weights.encoder,
             &self.config,
         )?;
-        info!(
-            "  encoder: {:.3}s",
-            stage_start.elapsed().as_secs_f64(),
-        );
+        info!("  encoder: {:.3}s", stage_start.elapsed().as_secs_f64(),);
 
         // --- D3PM segmenter loop ---
         let stage_start = Instant::now();
@@ -298,10 +295,7 @@ impl<T: Tensor> ModelInner<T> {
                 "  region assignment: {:.3}s (0 regions, skipping estimator)",
                 stage_start.elapsed().as_secs_f64(),
             );
-            info!(
-                "  infer total: {:.3}s",
-                infer_start.elapsed().as_secs_f64(),
-            );
+            info!("  infer total: {:.3}s", infer_start.elapsed().as_secs_f64(),);
             return Ok(result);
         }
         info!(
@@ -319,10 +313,7 @@ impl<T: Tensor> ModelInner<T> {
             &self.config,
         )?
         .pool_logits;
-        info!(
-            "  estimator: {:.3}s",
-            stage_start.elapsed().as_secs_f64(),
-        );
+        info!("  estimator: {:.3}s", stage_start.elapsed().as_secs_f64(),);
 
         // --- Pitch decode ---
         let stage_start = Instant::now();
@@ -359,10 +350,7 @@ impl<T: Tensor> ModelInner<T> {
             stage_start.elapsed().as_secs_f64(),
         );
 
-        info!(
-            "  infer total: {:.3}s",
-            infer_start.elapsed().as_secs_f64(),
-        );
+        info!("  infer total: {:.3}s", infer_start.elapsed().as_secs_f64(),);
 
         Ok(result)
     }

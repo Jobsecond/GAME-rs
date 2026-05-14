@@ -45,7 +45,8 @@ pub trait Tensor: Sized + Clone {
             )));
         }
 
-        self.reshape(&[seq_len, num_heads, head_dim])?.transpose(0, 1)
+        self.reshape(&[seq_len, num_heads, head_dim])?
+            .transpose(0, 1)
     }
 
     fn split_last_dim_two_for_attention_heads(
@@ -147,10 +148,9 @@ pub trait Tensor: Sized + Clone {
     fn sigmoid(self) -> Result<Self>;
     fn split_last_dim_two_gelu_mul(self) -> Result<Self> {
         let shape = self.shape().to_vec();
-        let axis = shape
-            .len()
-            .checked_sub(1)
-            .ok_or_else(|| crate::Error::message("split_last_dim_two_gelu_mul requires rank >= 1"))?;
+        let axis = shape.len().checked_sub(1).ok_or_else(|| {
+            crate::Error::message("split_last_dim_two_gelu_mul requires rank >= 1")
+        })?;
         let dim = shape[axis];
         if dim % 2 != 0 {
             return Err(crate::Error::message(format!(

@@ -71,10 +71,7 @@ pub(crate) fn run_layout_ops_preserve_view_semantics<T: Tensor>(device: &T::Devi
 
     let kv = tensor::<T>(
         &[2, 4],
-        &[
-            1.0, 2.0, 10.0, 20.0,
-            3.0, 4.0, 30.0, 40.0,
-        ],
+        &[1.0, 2.0, 10.0, 20.0, 3.0, 4.0, 30.0, 40.0],
         device,
     );
     let (k, v) = kv.split_last_dim_two_for_attention_heads(1, 2).unwrap();
@@ -84,14 +81,11 @@ pub(crate) fn run_layout_ops_preserve_view_semantics<T: Tensor>(device: &T::Devi
     let qkv = tensor::<T>(
         &[2, 6],
         &[
-            1.0, 2.0, 10.0, 20.0, 100.0, 200.0,
-            3.0, 4.0, 30.0, 40.0, 300.0, 400.0,
+            1.0, 2.0, 10.0, 20.0, 100.0, 200.0, 3.0, 4.0, 30.0, 40.0, 300.0, 400.0,
         ],
         device,
     );
-    let (q, k, v) = qkv
-        .split_last_dim_three_for_attention_heads(1, 2)
-        .unwrap();
+    let (q, k, v) = qkv.split_last_dim_three_for_attention_heads(1, 2).unwrap();
     assert_tensor(&q, &[1, 2, 2], &[1.0, 2.0, 3.0, 4.0]);
     assert_tensor(&k, &[1, 2, 2], &[10.0, 20.0, 30.0, 40.0]);
     assert_tensor(&v, &[1, 2, 2], &[100.0, 200.0, 300.0, 400.0]);
