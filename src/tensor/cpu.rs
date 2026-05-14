@@ -1,4 +1,5 @@
 use std::f32::consts::SQRT_2;
+use std::sync::OnceLock;
 
 use candle_core::{DType, Device, Storage, Tensor as CandleTensor};
 use rayon::prelude::*;
@@ -1874,10 +1875,37 @@ fn should_parallelize_linear(rows: usize, in_dim: usize, out_dim: usize) -> bool
 
 fn choose_parallel_row_chunk_len(rows: usize, out_dim: usize) -> usize {
     let threads = rayon::current_num_threads().max(1);
-    let target_tasks = threads.saturating_mul(2);
+    let target_tasks = linear_target_tasks(threads);
     let by_tasks = rows.div_ceil(target_tasks);
-    let min_chunk_rows = 16_384usize.div_ceil(out_dim.max(1));
+    let min_chunk_rows = linear_min_outputs_per_chunk().div_ceil(out_dim.max(1));
     by_tasks.max(min_chunk_rows).max(1).min(rows)
+}
+
+fn linear_target_tasks(threads: usize) -> usize {
+    static OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
+    static DEFAULT: OnceLock<usize> = OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| {
+            std::env::var("CRABML_LINEAR_TARGET_TASKS")
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .filter(|&value| value > 0)
+        })
+        .unwrap_or(*DEFAULT.get_or_init(|| num_cpus::get_physical().max(1)))
+        .min(threads)
+        .max(1)
+}
+
+fn linear_min_outputs_per_chunk() -> usize {
+    static OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| {
+            std::env::var("CRABML_LINEAR_MIN_OUTPUTS_PER_CHUNK")
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .filter(|&value| value > 0)
+        })
+        .unwrap_or(16_384)
 }
 
 fn should_parallelize_attention_matmul(

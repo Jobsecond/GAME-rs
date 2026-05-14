@@ -796,6 +796,7 @@ dependencies = [
  "log",
  "matrixmultiply",
  "midly",
+ "num_cpus",
  "pollster",
  "rand 0.8.6",
  "rand_mt",
