@@ -16,7 +16,7 @@ use game_crabml::{
     load_gguf, prepare_wav_for_inference, slice_waveform, split_long_chunks, write_midi_file,
     write_text_file,
 };
-use log::{Level, info};
+use log::{Level, info, warn};
 use rayon::prelude::*;
 use serde_json::{Map, Value, json};
 
@@ -296,17 +296,13 @@ fn run_chunked_extract_with_progress(
         chunks
             .par_iter()
             .enumerate()
-            .map(|(index, chunk)| {
-                infer_chunk(model, chunk, params, index, random_chunk_seed_base)
-            })
+            .map(|(index, chunk)| infer_chunk(model, chunk, params, index, random_chunk_seed_base))
             .collect::<Vec<_>>()
     } else {
         chunks
             .iter()
             .enumerate()
-            .map(|(index, chunk)| {
-                infer_chunk(model, chunk, params, index, random_chunk_seed_base)
-            })
+            .map(|(index, chunk)| infer_chunk(model, chunk, params, index, random_chunk_seed_base))
             .collect::<Vec<_>>()
     };
 
@@ -315,7 +311,12 @@ fn run_chunked_extract_with_progress(
 
     let mut notes = Vec::new();
     for result in results {
-        progress.log_chunk_complete(result.index, chunk_count, result.notes.len(), result.elapsed);
+        progress.log_chunk_complete(
+            result.index,
+            chunk_count,
+            result.notes.len(),
+            result.elapsed,
+        );
         notes.extend(result.notes);
     }
 
@@ -1415,7 +1416,7 @@ mod tests {
     };
 
     use super::{
-        Cli, ChunkParallelism, Command, DEFAULT_MAX_CHUNK_SECONDS, ExtractFormat,
+        ChunkParallelism, Cli, Command, DEFAULT_MAX_CHUNK_SECONDS, ExtractFormat,
         infer_extract_format, parse_u32_auto, run_chunked_extract,
     };
 
