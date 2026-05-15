@@ -634,7 +634,7 @@ fn choose_attention_query_chunk_len(num_heads: usize, query_len: usize, key_len:
 
 fn max_attention_score_elements() -> usize {
     *MAX_ATTENTION_SCORE_ELEMENTS.get_or_init(|| {
-        std::env::var("CRABML_MAX_ATTENTION_SCORE_ELEMENTS")
+        std::env::var("GAME_MAX_ATTENTION_SCORE_ELEMENTS")
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
             .filter(|&value| value > 0)

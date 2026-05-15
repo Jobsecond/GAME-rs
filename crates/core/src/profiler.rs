@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use log::info;
+use crate::notify::{CoreEvent, NotificationLevel, emit};
 
 static CPU_PROFILING_ENABLED: OnceLock<bool> = OnceLock::new();
 static CPU_PROFILER_STATE: OnceLock<Mutex<CpuProfilerState>> = OnceLock::new();
@@ -49,7 +49,7 @@ enum ProfileKind {
 
 pub(crate) fn cpu_profiling_enabled() -> bool {
     *CPU_PROFILING_ENABLED.get_or_init(|| {
-        std::env::var("CRABML_CPU_PROFILE")
+        std::env::var("GAME_CPU_PROFILE")
             .ok()
             .map(|value| {
                 let value = value.trim();
@@ -198,12 +198,15 @@ fn log_profile_section(
     entries: &HashMap<ProfileKey, ProfileStats>,
 ) {
     if entries.is_empty() {
-        info!(
-            "cpu-profile {} `{}`: total={:.3}s entries=0",
-            kind,
-            label,
-            elapsed.as_secs_f64()
-        );
+        emit(CoreEvent::Message {
+            level: NotificationLevel::Info,
+            message: format!(
+                "cpu-profile {} `{}`: total={:.3}s entries=0",
+                kind,
+                label,
+                elapsed.as_secs_f64()
+            ),
+        });
         return;
     }
 
@@ -215,30 +218,36 @@ fn log_profile_section(
     });
 
     let limit = profile_top_n();
-    info!(
-        "cpu-profile {} `{}`: total={:.3}s entries={} top={}",
-        kind,
-        label,
-        elapsed.as_secs_f64(),
-        rows.len(),
-        rows.len().min(limit)
-    );
+    emit(CoreEvent::Message {
+        level: NotificationLevel::Info,
+        message: format!(
+            "cpu-profile {} `{}`: total={:.3}s entries={} top={}",
+            kind,
+            label,
+            elapsed.as_secs_f64(),
+            rows.len(),
+            rows.len().min(limit)
+        ),
+    });
     for (key, stats) in rows.into_iter().take(limit) {
         let avg = stats.total.as_secs_f64() / stats.calls as f64;
-        info!(
-            "  {} calls={} total={:.3}s avg={:.6}s max={:.6}s {}",
-            key.label,
-            stats.calls,
-            stats.total.as_secs_f64(),
-            avg,
-            stats.max.as_secs_f64(),
-            key.details
-        );
+        emit(CoreEvent::Message {
+            level: NotificationLevel::Info,
+            message: format!(
+                "  {} calls={} total={:.3}s avg={:.6}s max={:.6}s {}",
+                key.label,
+                stats.calls,
+                stats.total.as_secs_f64(),
+                avg,
+                stats.max.as_secs_f64(),
+                key.details
+            ),
+        });
     }
 }
 
 fn profile_top_n() -> usize {
-    std::env::var("CRABML_CPU_PROFILE_TOP")
+    std::env::var("GAME_CPU_PROFILE_TOP")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|&value| value > 0)

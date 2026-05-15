@@ -9,12 +9,17 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 #[cfg(feature = "gpu")]
-use game_crabml::GpuAdapterSelector;
-use game_crabml::{
-    BackboneConfig, Backend, Error, InferParams, LoadedGgufModel, LoadedTensor, MelExtractor,
-    MidiWriteOptions, Model, Result, SliceChunk, SlicerConfig, TextOutputFormat, TextWriteOptions,
-    load_gguf, prepare_wav_for_inference, slice_waveform, split_long_chunks, write_midi_file,
-    write_text_file,
+use game_core::GpuAdapterSelector;
+use game_audio::{
+    PreparedWaveform, SliceChunk, SlicerConfig, prepare_wav_for_inference, slice_waveform,
+    split_long_chunks,
+};
+use game_core::{
+    BackboneConfig, Backend, CoreEvent, Error, InferParams, LoadedGgufModel, LoadedTensor,
+    MelExtractor, Model, Note, NotificationLevel, Notifier, Result, load_gguf,
+};
+use game_output::{
+    MidiWriteOptions, TextOutputFormat, TextWriteOptions, write_midi_file, write_text_file,
 };
 use log::{Level, info, warn};
 use rayon::prelude::*;
@@ -141,6 +146,83 @@ enum ChunkParallelism {
 const DEFAULT_MAX_CHUNK_SECONDS: usize = 60;
 static LOGGER_START: OnceLock<Instant> = OnceLock::new();
 
+#[derive(Debug, Clone)]
+struct CliNotifier {
+    prefix: Option<String>,
+}
+
+impl CliNotifier {
+    fn root() -> Self {
+        Self { prefix: None }
+    }
+
+    fn chunk(index: usize, total: usize) -> Self {
+        Self {
+            prefix: Some(format!("chunk {}/{}: ", index + 1, total)),
+        }
+    }
+
+    fn render_message(&self, message: &str) -> String {
+        match &self.prefix {
+            Some(prefix) => format!("{prefix}{message}"),
+            None => message.to_owned(),
+        }
+    }
+}
+
+impl Notifier for CliNotifier {
+    fn notify(&self, event: CoreEvent) {
+        match event {
+            CoreEvent::Status { stage, message } => {
+                info!("{}", self.render_message(&format!("{stage}: {message}")));
+            }
+            CoreEvent::Progress {
+                stage,
+                current,
+                total,
+                detail,
+            } => {
+                let message = match detail {
+                    Some(detail) => format!("{stage}: {current}/{total} {detail}"),
+                    None => format!("{stage}: {current}/{total}"),
+                };
+                info!("{}", self.render_message(&message));
+            }
+            CoreEvent::Timing {
+                stage,
+                elapsed,
+                detail,
+            } => {
+                let message = match detail {
+                    Some(detail) => format!(
+                        "{stage}: elapsed={} {detail}",
+                        format_duration(elapsed)
+                    ),
+                    None => format!("{stage}: elapsed={}", format_duration(elapsed)),
+                };
+                info!("{}", self.render_message(&message));
+            }
+            CoreEvent::ModelLoaded { backend, elapsed } => {
+                info!(
+                    "{}",
+                    self.render_message(&format!(
+                        "model loaded: backend={backend} elapsed={}",
+                        format_duration(elapsed)
+                    ))
+                );
+            }
+            CoreEvent::Message { level, message } => match level {
+                NotificationLevel::Warn | NotificationLevel::Error => {
+                    warn!("{}", self.render_message(&message))
+                }
+                NotificationLevel::Trace
+                | NotificationLevel::Debug
+                | NotificationLevel::Info => info!("{}", self.render_message(&message)),
+            },
+        }
+    }
+}
+
 fn main() -> ExitCode {
     init_logging();
     match run() {
@@ -173,13 +255,14 @@ fn extract(args: ExtractArgs) -> Result<()> {
         ));
     }
 
+    let notifier = CliNotifier::root();
     let mut progress = ExtractProgress::new(&args);
     let format = resolve_extract_format(args.format, &args.output);
     progress.log_start(format);
 
     progress.log_step_start("loading model");
     let (model, load_elapsed) =
-        timed_result(|| load_model_for_extract(&args.model, args.device, &args.gpu))?;
+        timed_result(|| load_model_for_extract(&args.model, args.device, &args.gpu, &notifier))?;
     progress.record_model_loaded(&model, load_elapsed);
 
     progress.log_step_start("preparing audio");
@@ -245,14 +328,14 @@ fn extract(args: ExtractArgs) -> Result<()> {
 }
 
 struct ChunkedExtractResult {
-    notes: Vec<game_crabml::Note>,
+    notes: Vec<Note>,
     chunk_count: usize,
 }
 
 #[derive(Debug)]
 struct ChunkInferenceResult {
     index: usize,
-    notes: Vec<game_crabml::Note>,
+    notes: Vec<Note>,
     elapsed: Duration,
 }
 
@@ -296,13 +379,33 @@ fn run_chunked_extract_with_progress(
         chunks
             .par_iter()
             .enumerate()
-            .map(|(index, chunk)| infer_chunk(model, chunk, params, index, random_chunk_seed_base))
+            .map(|(index, chunk)| {
+                infer_chunk(
+                    model,
+                    chunk,
+                    params,
+                    index,
+                    chunk_count,
+                    random_chunk_seed_base,
+                    &CliNotifier::chunk(index, chunk_count),
+                )
+            })
             .collect::<Vec<_>>()
     } else {
         chunks
             .iter()
             .enumerate()
-            .map(|(index, chunk)| infer_chunk(model, chunk, params, index, random_chunk_seed_base))
+            .map(|(index, chunk)| {
+                infer_chunk(
+                    model,
+                    chunk,
+                    params,
+                    index,
+                    chunk_count,
+                    random_chunk_seed_base,
+                    &CliNotifier::chunk(index, chunk_count),
+                )
+            })
             .collect::<Vec<_>>()
     };
 
@@ -334,7 +437,7 @@ fn chunk_parallelism_enabled(
         ChunkParallelism::Off => false,
     };
     cli_enabled
-        && model.backend() == game_crabml::Backend::Cpu
+        && model.backend() == Backend::Cpu
         && chunk_count > 1
         && rayon::current_num_threads() > 1
         && std::env::var_os("GAME_DISABLE_CHUNK_PARALLELISM").is_none()
@@ -345,18 +448,20 @@ fn infer_chunk(
     chunk: &SliceChunk,
     params: &InferParams,
     index: usize,
+    _chunk_count: usize,
     random_chunk_seed_base: Option<u64>,
+    notifier: &dyn Notifier,
 ) -> Result<ChunkInferenceResult> {
     let start = Instant::now();
     let chunk_seed = random_chunk_seed_base
         .map(|base_seed| derive_chunk_seed(base_seed, index))
         .unwrap_or(params.seed);
     let result = if chunk_seed == params.seed {
-        model.infer(&chunk.waveform, params)?
+        model.infer_with_notifier(&chunk.waveform, params, notifier)?
     } else {
         let mut chunk_params = params.clone();
         chunk_params.seed = chunk_seed;
-        model.infer(&chunk.waveform, &chunk_params)?
+        model.infer_with_notifier(&chunk.waveform, &chunk_params, notifier)?
     };
     let mut notes = result.notes;
     let offset_seconds = chunk.offset_seconds as f32;
@@ -384,7 +489,7 @@ fn derive_chunk_seed(base_seed: u64, index: usize) -> u64 {
 fn write_extract_output(
     path: &Path,
     format: ExtractFormat,
-    notes: &[game_crabml::Note],
+    notes: &[Note],
 ) -> Result<()> {
     match format {
         ExtractFormat::Midi => write_midi_file(path, notes, &MidiWriteOptions::default()),
@@ -423,33 +528,38 @@ fn load_model_for_extract(
     model_path: &Path,
     device: Option<ExtractDevice>,
     gpu: &GpuSelectorArgs,
+    notifier: &dyn Notifier,
 ) -> Result<Model> {
     match device {
-        Some(ExtractDevice::Cpu) => Model::load(model_path, Backend::Cpu),
-        Some(ExtractDevice::Gpu) => load_gpu_model(model_path, gpu),
-        None if gpu.has_any() => load_gpu_model(model_path, gpu),
-        None => load_auto_model(model_path),
+        Some(ExtractDevice::Cpu) => Model::load_with_notifier(model_path, Backend::Cpu, notifier),
+        Some(ExtractDevice::Gpu) => load_gpu_model(model_path, gpu, notifier),
+        None if gpu.has_any() => load_gpu_model(model_path, gpu, notifier),
+        None => load_auto_model(model_path, notifier),
     }
 }
 
 #[cfg(feature = "gpu")]
-fn load_gpu_model(model_path: &Path, gpu: &GpuSelectorArgs) -> Result<Model> {
+fn load_gpu_model(model_path: &Path, gpu: &GpuSelectorArgs, notifier: &dyn Notifier) -> Result<Model> {
     let selector = gpu.to_selector();
-    Model::load_with_gpu_selector(model_path, selector.as_ref())
+    Model::load_with_gpu_selector_and_notifier(model_path, selector.as_ref(), notifier)
 }
 
 #[cfg(not(feature = "gpu"))]
-fn load_gpu_model(_model_path: &Path, _gpu: &GpuSelectorArgs) -> Result<Model> {
+fn load_gpu_model(
+    _model_path: &Path,
+    _gpu: &GpuSelectorArgs,
+    _notifier: &dyn Notifier,
+) -> Result<Model> {
     Err(Error::message(
         "GPU extraction requested but the `gpu` cargo feature is disabled",
     ))
 }
 
 #[cfg(feature = "gpu")]
-fn load_auto_model(model_path: &Path) -> Result<Model> {
-    match Model::load_with_gpu_selector(model_path, None) {
+fn load_auto_model(model_path: &Path, notifier: &dyn Notifier) -> Result<Model> {
+    match Model::load_with_gpu_selector_and_notifier(model_path, None, notifier) {
         Ok(model) => Ok(model),
-        Err(gpu_err) => match Model::load(model_path, Backend::Cpu) {
+        Err(gpu_err) => match Model::load_with_notifier(model_path, Backend::Cpu, notifier) {
             Ok(model) => {
                 warn!("GPU backend unavailable ({gpu_err}); falling back to CPU");
                 Ok(model)
@@ -462,8 +572,8 @@ fn load_auto_model(model_path: &Path) -> Result<Model> {
 }
 
 #[cfg(not(feature = "gpu"))]
-fn load_auto_model(model_path: &Path) -> Result<Model> {
-    Model::load(model_path, Backend::Cpu)
+fn load_auto_model(model_path: &Path, notifier: &dyn Notifier) -> Result<Model> {
+    Model::load_with_notifier(model_path, Backend::Cpu, notifier)
 }
 
 fn ensure_output_parent_dir(path: &Path) -> Result<()> {
@@ -620,15 +730,10 @@ impl<'a> ExtractProgress<'a> {
         info!("{step_name}...");
     }
 
-    fn record_model_loaded(&mut self, model: &Model, elapsed: Duration) {
+    fn record_model_loaded(&mut self, _model: &Model, elapsed: Duration) {
         self.model_load_elapsed = elapsed;
-        info!(
-            "model loaded: backend={} elapsed={}",
-            backend_name(model.backend()),
-            format_duration(elapsed)
-        );
         #[cfg(feature = "gpu")]
-        if let Some(adapter) = model.gpu_adapter_info() {
+        if let Some(adapter) = _model.gpu_adapter_info() {
             info!(
                 "gpu adapter: {} (backend={}, type={}, vendor=0x{:04x}, device=0x{:04x})",
                 adapter.name,
@@ -642,7 +747,7 @@ impl<'a> ExtractProgress<'a> {
 
     fn record_audio_prepared(
         &mut self,
-        waveform: &game_crabml::PreparedWaveform,
+        waveform: &PreparedWaveform,
         elapsed: Duration,
     ) {
         self.audio_prepare_elapsed = elapsed;
@@ -686,7 +791,7 @@ impl<'a> ExtractProgress<'a> {
         &mut self,
         chunks: &[SliceChunk],
         split_elapsed: Duration,
-        waveform: &game_crabml::PreparedWaveform,
+        waveform: &PreparedWaveform,
     ) {
         self.split_elapsed = split_elapsed;
         let max_samples = waveform
@@ -735,7 +840,7 @@ impl<'a> ExtractProgress<'a> {
 
     fn print_summary(
         &self,
-        waveform: &game_crabml::PreparedWaveform,
+        waveform: &PreparedWaveform,
         model: &Model,
         total_frames: usize,
         result: &ChunkedExtractResult,
@@ -1410,10 +1515,10 @@ mod tests {
     use std::path::Path;
 
     use clap::Parser;
-    use game_crabml::{
-        Backend, Error, InferParams, Model, Note, SlicerConfig, prepare_wav_for_inference,
-        slice_waveform, split_long_chunks,
+    use game_audio::{
+        SlicerConfig, prepare_wav_for_inference, slice_waveform, split_long_chunks,
     };
+    use game_core::{Backend, Error, InferParams, Model, Note};
 
     use super::{
         ChunkParallelism, Cli, Command, DEFAULT_MAX_CHUNK_SECONDS, ExtractFormat,
@@ -1447,7 +1552,7 @@ mod tests {
     #[test]
     fn extract_cli_uses_default_max_chunk_seconds() {
         let cli = Cli::try_parse_from([
-            "game-crabml",
+            "game-cli",
             "extract",
             "-m",
             "model.gguf",
@@ -1466,7 +1571,7 @@ mod tests {
     #[test]
     fn extract_cli_accepts_custom_max_chunk_seconds() {
         let cli = Cli::try_parse_from([
-            "game-crabml",
+            "game-cli",
             "extract",
             "-m",
             "model.gguf",
@@ -1487,7 +1592,7 @@ mod tests {
     #[test]
     fn extract_cli_rejects_zero_max_chunk_seconds() {
         let err = Cli::try_parse_from([
-            "game-crabml",
+            "game-cli",
             "extract",
             "-m",
             "model.gguf",
@@ -1508,7 +1613,7 @@ mod tests {
     #[test]
     fn extract_cli_uses_default_chunk_parallelism() {
         let cli = Cli::try_parse_from([
-            "game-crabml",
+            "game-cli",
             "extract",
             "-m",
             "model.gguf",
@@ -1527,7 +1632,7 @@ mod tests {
     #[test]
     fn extract_cli_accepts_chunk_parallelism_flag() {
         let cli = Cli::try_parse_from([
-            "game-crabml",
+            "game-cli",
             "extract",
             "-m",
             "model.gguf",

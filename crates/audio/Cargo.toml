@@ -1,0 +1,8 @@
+[package]
+name = "game-audio"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+game-core = { path = "../core" }
+hound = "3"

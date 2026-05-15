@@ -245,7 +245,7 @@ pub(super) fn linear_target_tasks(threads: usize) -> usize {
     static DEFAULT: OnceLock<usize> = OnceLock::new();
     OVERRIDE
         .get_or_init(|| {
-            std::env::var("CRABML_LINEAR_TARGET_TASKS")
+            std::env::var("GAME_LINEAR_TARGET_TASKS")
                 .ok()
                 .and_then(|value| value.trim().parse::<usize>().ok())
                 .filter(|&value| value > 0)
@@ -259,7 +259,7 @@ pub(super) fn linear_min_outputs_per_chunk() -> usize {
     static OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
     OVERRIDE
         .get_or_init(|| {
-            std::env::var("CRABML_LINEAR_MIN_OUTPUTS_PER_CHUNK")
+            std::env::var("GAME_LINEAR_MIN_OUTPUTS_PER_CHUNK")
                 .ok()
                 .and_then(|value| value.trim().parse::<usize>().ok())
                 .filter(|&value| value > 0)

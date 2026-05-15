@@ -8,9 +8,9 @@ pub mod weights;
 use std::path::Path;
 use std::time::Instant;
 
-use log::info;
 use rand::random;
 
+use crate::notify::{CoreEvent, emit, with_notifier};
 use crate::profiler::cpu_profile_session;
 use crate::tensor::{CpuDevice, CpuTensor};
 #[cfg(feature = "gpu")]
@@ -60,8 +60,28 @@ pub(crate) const RMS_NORM_EPS: f32 = 1e-6;
 
 impl Model {
     pub fn load(path: impl AsRef<Path>, backend: Backend) -> Result<Self> {
-        let loaded = load_gguf(path)?;
-        Self::from_loaded_model(loaded, backend)
+        Self::load_with_notifier(path, backend, &crate::NullNotifier)
+    }
+
+    pub fn load_with_notifier(
+        path: impl AsRef<Path>,
+        backend: Backend,
+        notifier: &dyn crate::Notifier,
+    ) -> Result<Self> {
+        with_notifier(notifier, || {
+            emit(CoreEvent::Status {
+                stage: "model_load",
+                message: "loading model".to_owned(),
+            });
+            let started_at = Instant::now();
+            let loaded = load_gguf(path)?;
+            let model = Self::from_loaded_model(loaded, backend)?;
+            emit(CoreEvent::ModelLoaded {
+                backend: backend_name(model.backend()),
+                elapsed: started_at.elapsed(),
+            });
+            Ok(model)
+        })
     }
 
     #[cfg(feature = "gpu")]
@@ -69,8 +89,29 @@ impl Model {
         path: impl AsRef<Path>,
         selector: Option<&GpuAdapterSelector>,
     ) -> Result<Self> {
-        let loaded = load_gguf(path)?;
-        Self::from_loaded_model_with_gpu_selector(loaded, selector)
+        Self::load_with_gpu_selector_and_notifier(path, selector, &crate::NullNotifier)
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn load_with_gpu_selector_and_notifier(
+        path: impl AsRef<Path>,
+        selector: Option<&GpuAdapterSelector>,
+        notifier: &dyn crate::Notifier,
+    ) -> Result<Self> {
+        with_notifier(notifier, || {
+            emit(CoreEvent::Status {
+                stage: "model_load",
+                message: "loading model".to_owned(),
+            });
+            let started_at = Instant::now();
+            let loaded = load_gguf(path)?;
+            let model = Self::from_loaded_model_with_gpu_selector(loaded, selector)?;
+            emit(CoreEvent::ModelLoaded {
+                backend: backend_name(model.backend()),
+                elapsed: started_at.elapsed(),
+            });
+            Ok(model)
+        })
     }
 
     pub fn backend(&self) -> Backend {
@@ -87,13 +128,22 @@ impl Model {
     }
 
     pub fn infer(&self, waveform: &[f32], params: &InferParams) -> Result<InferResult> {
+        self.infer_with_notifier(waveform, params, &crate::NullNotifier)
+    }
+
+    pub fn infer_with_notifier(
+        &self,
+        waveform: &[f32],
+        params: &InferParams,
+        notifier: &dyn crate::Notifier,
+    ) -> Result<InferResult> {
         let seed = if params.seed == 0 {
             random::<u64>()
         } else {
             params.seed
         };
         let mut rng = Mt19937Rng::new(seed);
-        self.infer_with_rng(waveform, params, &mut rng)
+        with_notifier(notifier, || self.infer_with_rng(waveform, params, &mut rng))
     }
 
     fn from_loaded_model(model: LoadedGgufModel, backend: Backend) -> Result<Self> {
@@ -222,11 +272,11 @@ impl<T: Tensor> ModelInner<T> {
             &self.device,
         )
         .map_err(|err| Error::message(format!("failed to upload mel spectrogram: {err}")))?;
-        info!(
-            "  mel extraction: {:.3}s ({} frames)",
-            stage_start.elapsed().as_secs_f64(),
-            seq_len,
-        );
+        emit(CoreEvent::Timing {
+            stage: "mel_extraction",
+            elapsed: stage_start.elapsed(),
+            detail: Some(format!("{seq_len} frames")),
+        });
 
         // --- Encoder ---
         let stage_start = Instant::now();
@@ -236,7 +286,11 @@ impl<T: Tensor> ModelInner<T> {
             &self.weights.encoder,
             &self.config,
         )?;
-        info!("  encoder: {:.3}s", stage_start.elapsed().as_secs_f64(),);
+        emit(CoreEvent::Timing {
+            stage: "encoder",
+            elapsed: stage_start.elapsed(),
+            detail: None,
+        });
 
         // --- D3PM segmenter loop ---
         let stage_start = Instant::now();
@@ -270,6 +324,12 @@ impl<T: Tensor> ModelInner<T> {
             .collect::<Result<Vec<_>>>()?;
 
         for (step_index, t) in schedule.iter().copied().enumerate() {
+            emit(CoreEvent::Progress {
+                stage: "d3pm_step",
+                current: step_index + 1,
+                total: n_d3pm_steps,
+                detail: Some(format!("t={t:.3}")),
+            });
             let removal_probability = d3pm_time_schedule(t);
             boundaries = remove_mutable_boundaries(&boundaries, &known, removal_probability, rng)?;
 
@@ -293,11 +353,11 @@ impl<T: Tensor> ModelInner<T> {
                 params.boundary_radius,
             )?;
         }
-        info!(
-            "  d3pm loop ({} steps): {:.3}s",
-            n_d3pm_steps,
-            stage_start.elapsed().as_secs_f64(),
-        );
+        emit(CoreEvent::Timing {
+            stage: "d3pm_loop",
+            elapsed: stage_start.elapsed(),
+            detail: Some(format!("{n_d3pm_steps} steps")),
+        });
 
         // --- Region assignment ---
         let stage_start = Instant::now();
@@ -308,18 +368,23 @@ impl<T: Tensor> ModelInner<T> {
             num_frames: usize_to_i32("inference frame count", seq_len)?,
         };
         if n_regions == 0 {
-            info!(
-                "  region assignment: {:.3}s (0 regions, skipping estimator)",
-                stage_start.elapsed().as_secs_f64(),
-            );
-            info!("  infer total: {:.3}s", infer_start.elapsed().as_secs_f64(),);
+            emit(CoreEvent::Timing {
+                stage: "region_assignment",
+                elapsed: stage_start.elapsed(),
+                detail: Some("0 regions, skipping estimator".to_owned()),
+            });
+            emit(CoreEvent::Timing {
+                stage: "infer_total",
+                elapsed: infer_start.elapsed(),
+                detail: None,
+            });
             return Ok(result);
         }
-        info!(
-            "  region assignment: {:.3}s ({} regions)",
-            stage_start.elapsed().as_secs_f64(),
-            n_regions,
-        );
+        emit(CoreEvent::Timing {
+            stage: "region_assignment",
+            elapsed: stage_start.elapsed(),
+            detail: Some(format!("{n_regions} regions")),
+        });
 
         // --- Estimator ---
         let stage_start = Instant::now();
@@ -330,7 +395,11 @@ impl<T: Tensor> ModelInner<T> {
             &self.config,
         )?
         .pool_logits;
-        info!("  estimator: {:.3}s", stage_start.elapsed().as_secs_f64(),);
+        emit(CoreEvent::Timing {
+            stage: "estimator",
+            elapsed: stage_start.elapsed(),
+            detail: None,
+        });
 
         // --- Pitch decode ---
         let stage_start = Instant::now();
@@ -362,14 +431,26 @@ impl<T: Tensor> ModelInner<T> {
             });
             offset_seconds += duration_seconds;
         }
-        info!(
-            "  pitch decode: {:.3}s",
-            stage_start.elapsed().as_secs_f64(),
-        );
+        emit(CoreEvent::Timing {
+            stage: "pitch_decode",
+            elapsed: stage_start.elapsed(),
+            detail: None,
+        });
 
-        info!("  infer total: {:.3}s", infer_start.elapsed().as_secs_f64(),);
+        emit(CoreEvent::Timing {
+            stage: "infer_total",
+            elapsed: infer_start.elapsed(),
+            detail: None,
+        });
 
         Ok(result)
+    }
+}
+
+fn backend_name(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Cpu => "cpu",
+        Backend::Gpu => "gpu",
     }
 }
 
