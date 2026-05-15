@@ -260,3 +260,53 @@ pub(crate) fn run_gpu_against_cpu_reference<T: Tensor>(device: &T::Device) -> Re
     assert_tensor(&gpu_out, cpu_out.shape(), &cpu_out.to_vec()?);
     Ok(())
 }
+
+pub(crate) fn run_fused_attention_matches_reference<T: Tensor>(device: &T::Device) {
+    let q = tensor::<T>(
+        &[2, 3, 2],
+        &[
+            1.0, 0.0, 0.5, 0.5, -0.2, 0.8, //
+            0.3, 0.7, 0.6, 0.4, 0.9, -0.1,
+        ],
+        device,
+    );
+    let k = tensor::<T>(
+        &[2, 4, 2],
+        &[
+            0.9, 0.1, 0.1, 0.9, 0.8, 0.2, 0.3, 0.7, //
+            0.2, 0.8, 0.7, 0.3, 0.4, 0.6, 0.6, 0.4,
+        ],
+        device,
+    );
+    let v = tensor::<T>(
+        &[2, 4, 2],
+        &[
+            0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, //
+            0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1,
+        ],
+        device,
+    );
+    let mask = tensor::<T>(
+        &[2, 3, 4],
+        &[
+            0.0, 0.0, -10_000.0, -10_000.0, //
+            0.0, 0.0, 0.0, -10_000.0, //
+            0.0, -10_000.0, 0.0, 0.0, //
+            0.0, -10_000.0, 0.0, 0.0, //
+            -10_000.0, 0.0, 0.0, 0.0, //
+            0.0, 0.0, 0.0, 0.0,
+        ],
+        device,
+    );
+
+    let scale = 1.0 / (q.shape()[2] as f32).sqrt();
+    let fused = T::fused_attention(&q, &k, &v, Some(&mask), scale).unwrap();
+    let k_t = k.clone().transpose(1, 2).unwrap();
+    let scores = T::attention_score_softmax(&q, &k_t, Some(&mask), scale).unwrap();
+    let reference = T::attention_value_matmul(&scores, &v).unwrap();
+
+    assert_eq!(fused.shape(), reference.shape());
+    let fused_data = export(&fused);
+    let reference_data = export(&reference);
+    assert_close(&fused_data, &reference_data);
+}

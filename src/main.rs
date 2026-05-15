@@ -17,6 +17,7 @@ use game_crabml::{
     write_text_file,
 };
 use log::{Level, info};
+use rayon::prelude::*;
 use serde_json::{Map, Value, json};
 
 #[derive(Debug, Parser)]
@@ -82,6 +83,9 @@ struct ExtractArgs {
     #[arg(long, default_value_t = 0)]
     seed: u64,
 
+    #[arg(long = "chunk-parallelism", value_enum, default_value_t = ChunkParallelism::Auto)]
+    chunk_parallelism: ChunkParallelism,
+
     #[arg(
         long = "max-chunk-seconds",
         default_value_t = DEFAULT_MAX_CHUNK_SECONDS,
@@ -125,6 +129,13 @@ enum ExtractFormat {
 enum ExtractDevice {
     Cpu,
     Gpu,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ChunkParallelism {
+    Auto,
+    On,
+    Off,
 }
 
 const DEFAULT_MAX_CHUNK_SECONDS: usize = 60;
@@ -213,7 +224,13 @@ fn extract(args: ExtractArgs) -> Result<()> {
     };
     progress.log_inference_start(chunks.len());
     let (result, inference_elapsed) = timed_result(|| {
-        run_chunked_extract_with_progress(&model, &chunks, &params, &mut progress)
+        run_chunked_extract_with_progress(
+            &model,
+            &chunks,
+            &params,
+            args.chunk_parallelism,
+            &mut progress,
+        )
     })?;
     progress.record_inference_complete(&result, inference_elapsed);
 
@@ -232,45 +249,135 @@ struct ChunkedExtractResult {
     chunk_count: usize,
 }
 
+#[derive(Debug)]
+struct ChunkInferenceResult {
+    index: usize,
+    notes: Vec<game_crabml::Note>,
+    elapsed: Duration,
+}
+
 #[cfg(test)]
 fn run_chunked_extract(
     model: &Model,
     chunks: &[SliceChunk],
     params: &InferParams,
 ) -> Result<ChunkedExtractResult> {
-    run_chunked_extract_with_progress(model, chunks, params, &mut NoopExtractProgress)
+    run_chunked_extract_with_progress(
+        model,
+        chunks,
+        params,
+        ChunkParallelism::Auto,
+        &mut NoopExtractProgress,
+    )
 }
 
 fn run_chunked_extract_with_progress(
     model: &Model,
     chunks: &[SliceChunk],
     params: &InferParams,
+    chunk_parallelism: ChunkParallelism,
     progress: &mut impl ExtractProgressLogger,
 ) -> Result<ChunkedExtractResult> {
-    let mut notes = Vec::new();
+    let chunk_count = chunks.len();
+    let parallel_chunks = chunk_parallelism_enabled(model, chunk_count, chunk_parallelism);
+    let random_chunk_seed_base = (parallel_chunks && params.seed == 0).then(rand::random::<u64>);
     for (index, chunk) in chunks.iter().enumerate() {
-        let chunk_start = Instant::now();
         let chunk_duration_seconds =
             chunk.waveform.len() as f64 / model.config().inference.audio_sample_rate as f64;
         progress.log_chunk_start(
             index,
-            chunks.len(),
+            chunk_count,
             chunk.offset_seconds,
             chunk_duration_seconds,
         );
-        let result = model.infer(&chunk.waveform, params)?;
-        let chunk_notes = result.notes.len();
-        for mut note in result.notes {
-            note.offset_seconds += chunk.offset_seconds as f32;
-            notes.push(note);
-        }
-        progress.log_chunk_complete(index, chunks.len(), chunk_notes, chunk_start.elapsed());
     }
 
-    Ok(ChunkedExtractResult {
+    let results = if parallel_chunks {
+        chunks
+            .par_iter()
+            .enumerate()
+            .map(|(index, chunk)| {
+                infer_chunk(model, chunk, params, index, random_chunk_seed_base)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        chunks
+            .iter()
+            .enumerate()
+            .map(|(index, chunk)| {
+                infer_chunk(model, chunk, params, index, random_chunk_seed_base)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut results = results.into_iter().collect::<Result<Vec<_>>>()?;
+    results.sort_unstable_by_key(|result| result.index);
+
+    let mut notes = Vec::new();
+    for result in results {
+        progress.log_chunk_complete(result.index, chunk_count, result.notes.len(), result.elapsed);
+        notes.extend(result.notes);
+    }
+
+    Ok(ChunkedExtractResult { notes, chunk_count })
+}
+
+fn chunk_parallelism_enabled(
+    model: &Model,
+    chunk_count: usize,
+    chunk_parallelism: ChunkParallelism,
+) -> bool {
+    let cli_enabled = match chunk_parallelism {
+        ChunkParallelism::Auto => true,
+        ChunkParallelism::On => true,
+        ChunkParallelism::Off => false,
+    };
+    cli_enabled
+        && model.backend() == game_crabml::Backend::Cpu
+        && chunk_count > 1
+        && rayon::current_num_threads() > 1
+        && std::env::var_os("GAME_DISABLE_CHUNK_PARALLELISM").is_none()
+}
+
+fn infer_chunk(
+    model: &Model,
+    chunk: &SliceChunk,
+    params: &InferParams,
+    index: usize,
+    random_chunk_seed_base: Option<u64>,
+) -> Result<ChunkInferenceResult> {
+    let start = Instant::now();
+    let chunk_seed = random_chunk_seed_base
+        .map(|base_seed| derive_chunk_seed(base_seed, index))
+        .unwrap_or(params.seed);
+    let result = if chunk_seed == params.seed {
+        model.infer(&chunk.waveform, params)?
+    } else {
+        let mut chunk_params = params.clone();
+        chunk_params.seed = chunk_seed;
+        model.infer(&chunk.waveform, &chunk_params)?
+    };
+    let mut notes = result.notes;
+    let offset_seconds = chunk.offset_seconds as f32;
+    for note in &mut notes {
+        note.offset_seconds += offset_seconds;
+    }
+
+    Ok(ChunkInferenceResult {
+        index,
         notes,
-        chunk_count: chunks.len(),
+        elapsed: start.elapsed(),
     })
+}
+
+fn derive_chunk_seed(base_seed: u64, index: usize) -> u64 {
+    let mut value = base_seed.wrapping_add((index as u64).wrapping_add(1) * 0x9E37_79B9_7F4A_7C15);
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^= value >> 31;
+    value.max(1)
 }
 
 fn write_extract_output(
@@ -1308,8 +1415,8 @@ mod tests {
     };
 
     use super::{
-        Cli, Command, DEFAULT_MAX_CHUNK_SECONDS, ExtractFormat, infer_extract_format,
-        parse_u32_auto, run_chunked_extract,
+        Cli, ChunkParallelism, Command, DEFAULT_MAX_CHUNK_SECONDS, ExtractFormat,
+        infer_extract_format, parse_u32_auto, run_chunked_extract,
     };
 
     #[test]
@@ -1395,6 +1502,46 @@ mod tests {
             err.to_string().contains("--max-chunk-seconds"),
             "unexpected clap error: {err}"
         );
+    }
+
+    #[test]
+    fn extract_cli_uses_default_chunk_parallelism() {
+        let cli = Cli::try_parse_from([
+            "game-crabml",
+            "extract",
+            "-m",
+            "model.gguf",
+            "-o",
+            "notes.txt",
+            "input.wav",
+        ])
+        .unwrap();
+
+        let Command::Extract(args) = cli.command else {
+            panic!("expected extract command");
+        };
+        assert_eq!(args.chunk_parallelism, ChunkParallelism::Auto);
+    }
+
+    #[test]
+    fn extract_cli_accepts_chunk_parallelism_flag() {
+        let cli = Cli::try_parse_from([
+            "game-crabml",
+            "extract",
+            "-m",
+            "model.gguf",
+            "-o",
+            "notes.txt",
+            "--chunk-parallelism",
+            "off",
+            "input.wav",
+        ])
+        .unwrap();
+
+        let Command::Extract(args) = cli.command else {
+            panic!("expected extract command");
+        };
+        assert_eq!(args.chunk_parallelism, ChunkParallelism::Off);
     }
 
     #[test]

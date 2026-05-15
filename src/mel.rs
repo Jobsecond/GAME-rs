@@ -1,5 +1,5 @@
 use std::f32::consts::PI;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use realfft::{RealFftPlanner, RealToComplex};
 
@@ -71,12 +71,12 @@ pub struct MelExtractor {
     window: Vec<f32>,
     mel_fb: Vec<f32>,
     fft: Arc<dyn RealToComplex<f32>>,
+    fft_lock: Arc<Mutex<()>>,
 }
 
 impl MelExtractor {
     pub fn new(cfg: MelConfig) -> Result<Self> {
         validate_config(&cfg)?;
-
         let mut planner = RealFftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(cfg.n_fft);
 
@@ -84,6 +84,7 @@ impl MelExtractor {
             window: make_hann_window(cfg.win_length),
             mel_fb: make_mel_filterbank(cfg.n_fft, cfg.n_mels, cfg.sample_rate, cfg.fmin, cfg.fmax),
             fft,
+            fft_lock: Arc::new(Mutex::new(())),
             cfg,
         })
     }
@@ -112,6 +113,10 @@ impl MelExtractor {
         let (pad_l, pad_r) = pad_sizes(self.cfg.win_length, self.cfg.hop_length);
         let padded = reflect_pad(waveform, pad_l, pad_r)?;
         let n_bins = self.cfg.n_fft / 2 + 1;
+        let _fft_guard = self
+            .fft_lock
+            .lock()
+            .map_err(|_| Error::message("mel FFT lock poisoned"))?;
 
         let mut frame = self.fft.make_input_vec();
         let mut spec = self.fft.make_output_vec();

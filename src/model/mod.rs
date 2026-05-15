@@ -24,7 +24,10 @@ use crate::{
 pub use encoder::{EncoderOutputs, run_encoder};
 pub use estimator::{EstimatorOutputs, run_estimator};
 pub use ops::build_joint_attn_mask;
-pub use segmenter::{SegmenterOutputs, run_segmenter_step};
+pub use segmenter::{
+    PreparedSegmenterContext, SegmenterOutputs, prepare_segmenter_context,
+    project_segmenter_time_embedding, run_segmenter_step, run_segmenter_step_with_context,
+};
 pub use weights::{GameModelWeights, bind_model_weights};
 
 #[cfg(test)]
@@ -248,23 +251,37 @@ impl<T: Tensor> ModelInner<T> {
         let mask = vec![1u8; seq_len];
         let mut boundaries = known.clone();
         let mut noise_mod = vec![0i32; seq_len];
+        let segmenter_context = prepare_segmenter_context(
+            &encoder.x_seg,
+            Some(params.language),
+            &self.weights.segmenter,
+            &self.config,
+        )?;
+        let projected_time_embeddings = schedule
+            .iter()
+            .copied()
+            .map(|t| {
+                project_segmenter_time_embedding::<T>(
+                    (self.config.mode == "d3pm").then_some(t),
+                    &self.device,
+                    &self.weights.segmenter,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        for t in schedule {
+        for (step_index, t) in schedule.iter().copied().enumerate() {
             let removal_probability = d3pm_time_schedule(t);
             boundaries = remove_mutable_boundaries(&boundaries, &known, removal_probability, rng)?;
 
-            let regions = boundaries_to_regions(&boundaries, Some(&mask))?;
-            for (dst, region) in noise_mod.iter_mut().zip(regions.iter().copied()) {
-                *dst = region % region_cycle_len;
-            }
+            fill_noise_mod_from_boundaries(&boundaries, region_cycle_len, &mut noise_mod)?;
 
-            let segmenter = run_segmenter_step(
-                &encoder.x_seg,
+            let segmenter = run_segmenter_step_with_context(
+                &segmenter_context,
                 &noise_mod,
-                (self.config.mode == "d3pm").then_some(t),
-                Some(params.language),
+                projected_time_embeddings[step_index].as_ref(),
                 &self.weights.segmenter,
                 &self.config,
+                false,
             )?;
             let logits = export_tensor(&segmenter.logits)?;
             let probs = sigmoid_all(&logits);
@@ -472,4 +489,34 @@ fn checked_num_elements(shape: &[usize]) -> Result<usize> {
         acc.checked_mul(dim)
             .ok_or_else(|| Error::message(format!("shape {:?} overflows usize", shape)))
     })
+}
+
+fn fill_noise_mod_from_boundaries(
+    boundaries: &[u8],
+    region_cycle_len: i32,
+    out: &mut [i32],
+) -> Result<()> {
+    if boundaries.len() != out.len() {
+        return Err(Error::message(format!(
+            "noise_mod output length {} does not match boundaries length {}",
+            out.len(),
+            boundaries.len()
+        )));
+    }
+    if region_cycle_len <= 0 {
+        return Err(Error::message(format!(
+            "region cycle length must be > 0, got {region_cycle_len}"
+        )));
+    }
+
+    let mut running = 1_i32;
+    for (index, dst) in out.iter_mut().enumerate() {
+        if boundaries[index] != 0 {
+            running = running
+                .checked_add(1)
+                .ok_or_else(|| Error::message("region id overflowed i32"))?;
+        }
+        *dst = running % region_cycle_len;
+    }
+    Ok(())
 }

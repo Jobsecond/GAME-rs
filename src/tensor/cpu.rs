@@ -1213,7 +1213,6 @@ impl Tensor for CpuTensor {
                 v.shape()
             )));
         }
-
         let mask_shape = mask.map(|m| m.shape().to_vec());
         let mask_2d = mask_shape.as_deref().map(|s| s.len() == 2).unwrap_or(false);
 
@@ -1263,31 +1262,55 @@ impl Tensor for CpuTensor {
         let score_rs = key_len as isize;
         let score_cs = 1isize;
         if should_parallelize(heads * q_len * key_len) && key_len > 0 && head_dim > 0 {
-            scores.par_chunks_mut(score_head_stride)
+            scores
+                .par_chunks_mut(score_head_stride)
                 .enumerate()
                 .for_each(|(head, out_head)| {
-                    let lhs_ptr = (q_ptr + head * q_batch_stride * std::mem::size_of::<f32>()) as *const f32;
-                    let rhs_ptr = (k_ptr + head * k_batch_stride * std::mem::size_of::<f32>()) as *const f32;
+                    let lhs_ptr =
+                        (q_ptr + head * q_batch_stride * std::mem::size_of::<f32>()) as *const f32;
+                    let rhs_ptr =
+                        (k_ptr + head * k_batch_stride * std::mem::size_of::<f32>()) as *const f32;
                     unsafe {
                         attention_gemm_f32(
-                            q_len, key_len, head_dim, scale,
-                            lhs_ptr, q_cs, q_rs,
-                            rhs_ptr, k_cs, k_rs,
-                            out_head.as_mut_ptr(), score_cs, score_rs,
+                            q_len,
+                            key_len,
+                            head_dim,
+                            scale,
+                            lhs_ptr,
+                            q_cs,
+                            q_rs,
+                            rhs_ptr,
+                            k_cs,
+                            k_rs,
+                            out_head.as_mut_ptr(),
+                            score_cs,
+                            score_rs,
                         );
                     }
                 });
         } else {
             for head in 0..heads {
-                let lhs_ptr = (q_ptr + head * q_batch_stride * std::mem::size_of::<f32>()) as *const f32;
-                let rhs_ptr = (k_ptr + head * k_batch_stride * std::mem::size_of::<f32>()) as *const f32;
-                let out_head = &mut scores[head * score_head_stride..(head + 1) * score_head_stride];
+                let lhs_ptr =
+                    (q_ptr + head * q_batch_stride * std::mem::size_of::<f32>()) as *const f32;
+                let rhs_ptr =
+                    (k_ptr + head * k_batch_stride * std::mem::size_of::<f32>()) as *const f32;
+                let out_head =
+                    &mut scores[head * score_head_stride..(head + 1) * score_head_stride];
                 unsafe {
                     attention_gemm_f32(
-                        q_len, key_len, head_dim, scale,
-                        lhs_ptr, q_cs, q_rs,
-                        rhs_ptr, k_cs, k_rs,
-                        out_head.as_mut_ptr(), score_cs, score_rs,
+                        q_len,
+                        key_len,
+                        head_dim,
+                        scale,
+                        lhs_ptr,
+                        q_cs,
+                        q_rs,
+                        rhs_ptr,
+                        k_cs,
+                        k_rs,
+                        out_head.as_mut_ptr(),
+                        score_cs,
+                        score_rs,
                     );
                 }
             }
@@ -1297,7 +1320,8 @@ impl Tensor for CpuTensor {
         let total_score_rows = heads * q_len;
         let mask_ref: Option<&[f32]> = mask_owned.as_deref();
         if should_parallelize(total_score_rows * key_len) && key_len > 0 {
-            scores.par_chunks_mut(score_row_stride)
+            scores
+                .par_chunks_mut(score_row_stride)
                 .enumerate()
                 .for_each(|(flat_row, row_scores)| {
                     let head = flat_row / q_len;
@@ -1342,28 +1366,47 @@ impl Tensor for CpuTensor {
                 .enumerate()
                 .for_each(|(head, out_head)| {
                     let score_base = head * score_head_stride;
-                    let rhs_ptr = (v_ptr + head * v_batch_stride * std::mem::size_of::<f32>()) as *const f32;
+                    let rhs_ptr =
+                        (v_ptr + head * v_batch_stride * std::mem::size_of::<f32>()) as *const f32;
                     unsafe {
                         attention_gemm_f32(
-                            q_len, head_dim, key_len, 1.0,
-                            scores[score_base..].as_ptr(), score_cs, score_rs,
-                            rhs_ptr, v_cs, v_rs,
-                            out_head.as_mut_ptr(), 1, head_dim as isize,
+                            q_len,
+                            head_dim,
+                            key_len,
+                            1.0,
+                            scores[score_base..].as_ptr(),
+                            score_cs,
+                            score_rs,
+                            rhs_ptr,
+                            v_cs,
+                            v_rs,
+                            out_head.as_mut_ptr(),
+                            1,
+                            head_dim as isize,
                         );
                     }
                 });
         } else {
             for head in 0..heads {
                 let score_base = head * score_head_stride;
-                let rhs_ptr = (v_ptr + head * v_batch_stride * std::mem::size_of::<f32>()) as *const f32;
-                let out_head =
-                    &mut out[head * out_head_stride..(head + 1) * out_head_stride];
+                let rhs_ptr =
+                    (v_ptr + head * v_batch_stride * std::mem::size_of::<f32>()) as *const f32;
+                let out_head = &mut out[head * out_head_stride..(head + 1) * out_head_stride];
                 unsafe {
                     attention_gemm_f32(
-                        q_len, head_dim, key_len, 1.0,
-                        scores[score_base..].as_ptr(), score_cs, score_rs,
-                        rhs_ptr, v_cs, v_rs,
-                        out_head.as_mut_ptr(), 1, head_dim as isize,
+                        q_len,
+                        head_dim,
+                        key_len,
+                        1.0,
+                        scores[score_base..].as_ptr(),
+                        score_cs,
+                        score_rs,
+                        rhs_ptr,
+                        v_cs,
+                        v_rs,
+                        out_head.as_mut_ptr(),
+                        1,
+                        head_dim as isize,
                     );
                 }
             }
@@ -1723,7 +1766,12 @@ impl Tensor for CpuTensor {
                     0
                 };
 
-                let process_channel = |out_t: usize, channel: usize, input: &[f32], kernel_data: &[f32], bias_data: &Option<Vec<f32>>| -> f32 {
+                let process_channel = |out_t: usize,
+                                       channel: usize,
+                                       input: &[f32],
+                                       kernel_data: &[f32],
+                                       bias_data: &Option<Vec<f32>>|
+                 -> f32 {
                     let mut sum = bias_data.as_ref().map_or(0.0, |b| b[channel]);
                     for kernel_index in 0..kernel_size {
                         let input_index = out_t * stride + kernel_index;
@@ -1746,7 +1794,13 @@ impl Tensor for CpuTensor {
                         .for_each(|(out_t, out_row)| {
                             if out_t < mid_start || out_t >= mid_end {
                                 for (channel, value) in out_row.iter_mut().enumerate() {
-                                    *value = process_channel(out_t, channel, input, kernel_data, &bias_data);
+                                    *value = process_channel(
+                                        out_t,
+                                        channel,
+                                        input,
+                                        kernel_data,
+                                        &bias_data,
+                                    );
                                 }
                             } else {
                                 for (channel, value) in out_row.iter_mut().enumerate() {
@@ -1764,7 +1818,8 @@ impl Tensor for CpuTensor {
                     for out_t in 0..out_time {
                         if out_t < mid_start || out_t >= mid_end {
                             for channel in 0..channels {
-                                out[out_t * channels + channel] = process_channel(out_t, channel, input, kernel_data, &bias_data);
+                                out[out_t * channels + channel] =
+                                    process_channel(out_t, channel, input, kernel_data, &bias_data);
                             }
                         } else {
                             for channel in 0..channels {
@@ -2097,7 +2152,13 @@ fn precompute_inv_freqs(dims: usize, theta: f32) -> Vec<f32> {
         .collect()
 }
 
-fn apply_rope_chunk(values: &mut [f32], start: usize, dims: usize, position: f32, inv_freqs: &[f32]) {
+fn apply_rope_chunk(
+    values: &mut [f32],
+    start: usize,
+    dims: usize,
+    position: f32,
+    inv_freqs: &[f32],
+) {
     for (idx, local_offset) in (0..dims).step_by(2).enumerate() {
         let angle = position * inv_freqs[idx];
         let (sin, cos) = angle.sin_cos();
@@ -2303,6 +2364,29 @@ fn apply_softmax_inplace(row_scores: &mut [f32]) {
     }
 }
 
+fn attention_mask_row_slice<'a>(
+    mask_data: Option<&'a [f32]>,
+    mask_shape: Option<&[usize]>,
+    mask_outer_stride: Option<usize>,
+    mask_head_stride: Option<usize>,
+    head: usize,
+    row: usize,
+    col_start: usize,
+    len: usize,
+) -> Option<&'a [f32]> {
+    let mask = mask_data?;
+    let mask_base = match mask_shape {
+        Some([_, _]) => row * mask_outer_stride.unwrap_or(col_start + len),
+        Some([_, _, _]) => {
+            head * mask_head_stride.unwrap_or(0)
+                + row * mask_outer_stride.unwrap_or(col_start + len)
+        }
+        _ => return None,
+    };
+    let start = mask_base + col_start;
+    Some(&mask[start..start + len])
+}
+
 fn apply_mask_and_softmax_row(
     row_scores: &mut [f32],
     mask_data: Option<&[f32]>,
@@ -2317,15 +2401,16 @@ fn apply_mask_and_softmax_row(
     }
 
     let key_len = row_scores.len();
-    if let Some(mask) = mask_data {
-        let mask_base = match mask_shape {
-            Some([_, _]) => row * mask_outer_stride.unwrap_or(key_len),
-            Some([_, _, _]) => {
-                head * mask_head_stride.unwrap_or(0) + row * mask_outer_stride.unwrap_or(key_len)
-            }
-            _ => 0,
-        };
-        let mask_row = &mask[mask_base..mask_base + key_len];
+    if let Some(mask_row) = attention_mask_row_slice(
+        mask_data,
+        mask_shape,
+        mask_outer_stride,
+        mask_head_stride,
+        head,
+        row,
+        0,
+        key_len,
+    ) {
         for col in 0..key_len {
             row_scores[col] += mask_row[col];
         }
@@ -2397,6 +2482,11 @@ mod tests {
     #[test]
     fn embedding_and_repeat_return_expected_rows() {
         tests::run_embedding_and_repeat_return_expected_rows::<CpuTensor>(&CpuDevice);
+    }
+
+    #[test]
+    fn fused_attention_matches_reference() {
+        tests::run_fused_attention_matches_reference::<CpuTensor>(&CpuDevice);
     }
 
     #[test]
