@@ -797,14 +797,10 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "env_logger",
- "game-audio",
  "game-core",
- "game-output",
+ "game-service",
  "log",
- "rand 0.8.6",
- "rayon",
  "serde_json",
- "wgpu",
 ]
 
 [[package]]
@@ -833,6 +829,17 @@ version = "0.1.0"
 dependencies = [
  "game-core",
  "midly",
+]
+
+[[package]]
+name = "game-service"
+version = "0.1.0"
+dependencies = [
+ "game-audio",
+ "game-core",
+ "game-output",
+ "rand 0.8.6",
+ "rayon",
 ]
 
 [[package]]

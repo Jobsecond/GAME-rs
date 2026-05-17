@@ -1,28 +1,24 @@
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
-use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-#[cfg(feature = "gpu")]
-use game_core::GpuAdapterSelector;
-use game_audio::{
-    PreparedWaveform, SliceChunk, SlicerConfig, prepare_wav_for_inference, slice_waveform,
-    split_long_chunks,
-};
 use game_core::{
     BackboneConfig, Backend, CoreEvent, Error, InferParams, LoadedGgufModel, LoadedTensor,
-    MelExtractor, Model, Note, NotificationLevel, Notifier, Result, load_gguf,
+    NotificationLevel, Notifier, Result, load_gguf,
 };
-use game_output::{
-    MidiWriteOptions, TextOutputFormat, TextWriteOptions, write_midi_file, write_text_file,
+use game_service::{
+    DEFAULT_MAX_CHUNK_SECONDS, ChunkParallelism as ServiceChunkParallelism,
+    ExtractDevice as ServiceExtractDevice, ExtractFormat as ServiceExtractFormat,
+    ExtractOutputRequest, ExtractRequest as ServiceExtractRequest,
+    ExtractResult as ServiceExtractResult, GpuSelector as ServiceGpuSelector,
+    extract_with_notifier as run_extract_with_notifier,
 };
 use log::{Level, info, warn};
-use rayon::prelude::*;
 use serde_json::{Map, Value, json};
 
 #[derive(Debug, Parser)]
@@ -143,8 +139,36 @@ enum ChunkParallelism {
     Off,
 }
 
-const DEFAULT_MAX_CHUNK_SECONDS: usize = 60;
 static LOGGER_START: OnceLock<Instant> = OnceLock::new();
+
+impl From<ExtractFormat> for ServiceExtractFormat {
+    fn from(value: ExtractFormat) -> Self {
+        match value {
+            ExtractFormat::Midi => ServiceExtractFormat::Midi,
+            ExtractFormat::Txt => ServiceExtractFormat::Txt,
+            ExtractFormat::Csv => ServiceExtractFormat::Csv,
+        }
+    }
+}
+
+impl From<ExtractDevice> for ServiceExtractDevice {
+    fn from(value: ExtractDevice) -> Self {
+        match value {
+            ExtractDevice::Cpu => ServiceExtractDevice::Cpu,
+            ExtractDevice::Gpu => ServiceExtractDevice::Gpu,
+        }
+    }
+}
+
+impl From<ChunkParallelism> for ServiceChunkParallelism {
+    fn from(value: ChunkParallelism) -> Self {
+        match value {
+            ChunkParallelism::Auto => ServiceChunkParallelism::Auto,
+            ChunkParallelism::On => ServiceChunkParallelism::On,
+            ChunkParallelism::Off => ServiceChunkParallelism::Off,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct CliNotifier {
@@ -154,12 +178,6 @@ struct CliNotifier {
 impl CliNotifier {
     fn root() -> Self {
         Self { prefix: None }
-    }
-
-    fn chunk(index: usize, total: usize) -> Self {
-        Self {
-            prefix: Some(format!("chunk {}/{}: ", index + 1, total)),
-        }
     }
 
     fn render_message(&self, message: &str) -> String {
@@ -249,369 +267,120 @@ fn run() -> Result<()> {
 }
 
 fn extract(args: ExtractArgs) -> Result<()> {
-    if matches!(args.device, Some(ExtractDevice::Cpu)) && args.gpu.has_any() {
-        return Err(Error::message(
-            "GPU selector flags cannot be used with `--device cpu`",
-        ));
-    }
-
+    let request = build_extract_request(&args);
+    let format = request
+        .output
+        .as_ref()
+        .map(ExtractOutputRequest::resolved_format)
+        .unwrap_or(ServiceExtractFormat::Midi);
+    info!(
+        "starting extract: input={} model={} output={} format={} requested_device={}",
+        args.input.display(),
+        args.model.display(),
+        args.output.display(),
+        extract_format_name(format),
+        args.device.map(extract_device_name).unwrap_or("auto")
+    );
     let notifier = CliNotifier::root();
-    let mut progress = ExtractProgress::new(&args);
-    let format = resolve_extract_format(args.format, &args.output);
-    progress.log_start(format);
-
-    progress.log_step_start("loading model");
-    let (model, load_elapsed) =
-        timed_result(|| load_model_for_extract(&args.model, args.device, &args.gpu, &notifier))?;
-    progress.record_model_loaded(&model, load_elapsed);
-
-    progress.log_step_start("preparing audio");
-    let (waveform, audio_elapsed) = timed_result(|| {
-        prepare_wav_for_inference(&args.input, model.config().inference.audio_sample_rate)
-    })?;
-    progress.record_audio_prepared(&waveform, audio_elapsed);
-
-    let slicer_config = SlicerConfig {
-        sample_rate: waveform.sample_rate,
-        ..SlicerConfig::default()
-    };
-    progress.log_step_start("slicing audio on silence");
-    let (sliced_chunks, slice_elapsed) =
-        timed_result(|| slice_waveform(&waveform.samples, &slicer_config))?;
-    progress.record_slice_complete(&sliced_chunks, slice_elapsed);
-    progress.log_step_start("splitting long chunks");
-    let (chunks, split_elapsed) = timed_result(|| {
-        split_long_chunks(
-            &sliced_chunks,
-            waveform.sample_rate,
-            waveform.sample_rate.saturating_mul(args.max_chunk_seconds),
-        )
-    })?;
-    progress.record_split_complete(&chunks, split_elapsed, &waveform);
-
-    progress.log_step_start("initializing mel extractor");
-    let (mel_extractor, mel_setup_elapsed) =
-        timed_result(|| MelExtractor::from_inference_config(&model.config().inference))?;
-    let total_frames = mel_extractor.num_frames(waveform.samples.len());
-    progress.record_mel_setup(total_frames, mel_setup_elapsed);
-
-    let params = InferParams {
-        language: args.language,
-        d3pm_t0: args.d3pm_t0,
-        d3pm_nsteps: args.d3pm_nsteps,
-        boundary_threshold: args.boundary_threshold,
-        boundary_radius: args.boundary_radius,
-        note_threshold: args.note_threshold,
-        seed: args.seed,
-        ..InferParams::default()
-    };
-    progress.log_inference_start(chunks.len());
-    let (result, inference_elapsed) = timed_result(|| {
-        run_chunked_extract_with_progress(
-            &model,
-            &chunks,
-            &params,
-            args.chunk_parallelism,
-            &mut progress,
-        )
-    })?;
-    progress.record_inference_complete(&result, inference_elapsed);
-
-    progress.log_step_start("writing output");
-    let (_, write_elapsed) = timed_result(|| {
-        ensure_output_parent_dir(&args.output)?;
-        write_extract_output(&args.output, format, &result.notes)
-    })?;
-    progress.record_output_written(&args.output, write_elapsed);
-    progress.print_summary(&waveform, &model, total_frames, &result);
+    let result = run_extract_with_notifier(&request, &notifier)?;
+    print_extract_summary(&args, &result);
     Ok(())
 }
 
-struct ChunkedExtractResult {
-    notes: Vec<Note>,
-    chunk_count: usize,
-}
-
-#[derive(Debug)]
-struct ChunkInferenceResult {
-    index: usize,
-    notes: Vec<Note>,
-    elapsed: Duration,
-}
-
-#[cfg(test)]
-fn run_chunked_extract(
-    model: &Model,
-    chunks: &[SliceChunk],
-    params: &InferParams,
-) -> Result<ChunkedExtractResult> {
-    run_chunked_extract_with_progress(
-        model,
-        chunks,
-        params,
-        ChunkParallelism::Auto,
-        &mut NoopExtractProgress,
-    )
-}
-
-fn run_chunked_extract_with_progress(
-    model: &Model,
-    chunks: &[SliceChunk],
-    params: &InferParams,
-    chunk_parallelism: ChunkParallelism,
-    progress: &mut impl ExtractProgressLogger,
-) -> Result<ChunkedExtractResult> {
-    let chunk_count = chunks.len();
-    let parallel_chunks = chunk_parallelism_enabled(model, chunk_count, chunk_parallelism);
-    let random_chunk_seed_base = (parallel_chunks && params.seed == 0).then(rand::random::<u64>);
-    for (index, chunk) in chunks.iter().enumerate() {
-        let chunk_duration_seconds =
-            chunk.waveform.len() as f64 / model.config().inference.audio_sample_rate as f64;
-        progress.log_chunk_start(
-            index,
-            chunk_count,
-            chunk.offset_seconds,
-            chunk_duration_seconds,
-        );
-    }
-
-    let results = if parallel_chunks {
-        chunks
-            .par_iter()
-            .enumerate()
-            .map(|(index, chunk)| {
-                infer_chunk(
-                    model,
-                    chunk,
-                    params,
-                    index,
-                    chunk_count,
-                    random_chunk_seed_base,
-                    &CliNotifier::chunk(index, chunk_count),
-                )
-            })
-            .collect::<Vec<_>>()
-    } else {
-        chunks
-            .iter()
-            .enumerate()
-            .map(|(index, chunk)| {
-                infer_chunk(
-                    model,
-                    chunk,
-                    params,
-                    index,
-                    chunk_count,
-                    random_chunk_seed_base,
-                    &CliNotifier::chunk(index, chunk_count),
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-
-    let mut results = results.into_iter().collect::<Result<Vec<_>>>()?;
-    results.sort_unstable_by_key(|result| result.index);
-
-    let mut notes = Vec::new();
-    for result in results {
-        progress.log_chunk_complete(
-            result.index,
-            chunk_count,
-            result.notes.len(),
-            result.elapsed,
-        );
-        notes.extend(result.notes);
-    }
-
-    Ok(ChunkedExtractResult { notes, chunk_count })
-}
-
-fn chunk_parallelism_enabled(
-    model: &Model,
-    chunk_count: usize,
-    chunk_parallelism: ChunkParallelism,
-) -> bool {
-    let cli_enabled = match chunk_parallelism {
-        ChunkParallelism::Auto => true,
-        ChunkParallelism::On => true,
-        ChunkParallelism::Off => false,
-    };
-    cli_enabled
-        && model.backend() == Backend::Cpu
-        && chunk_count > 1
-        && rayon::current_num_threads() > 1
-        && std::env::var_os("GAME_DISABLE_CHUNK_PARALLELISM").is_none()
-}
-
-fn infer_chunk(
-    model: &Model,
-    chunk: &SliceChunk,
-    params: &InferParams,
-    index: usize,
-    _chunk_count: usize,
-    random_chunk_seed_base: Option<u64>,
-    notifier: &dyn Notifier,
-) -> Result<ChunkInferenceResult> {
-    let start = Instant::now();
-    let chunk_seed = random_chunk_seed_base
-        .map(|base_seed| derive_chunk_seed(base_seed, index))
-        .unwrap_or(params.seed);
-    let result = if chunk_seed == params.seed {
-        model.infer_with_notifier(&chunk.waveform, params, notifier)?
-    } else {
-        let mut chunk_params = params.clone();
-        chunk_params.seed = chunk_seed;
-        model.infer_with_notifier(&chunk.waveform, &chunk_params, notifier)?
-    };
-    let mut notes = result.notes;
-    let offset_seconds = chunk.offset_seconds as f32;
-    for note in &mut notes {
-        note.offset_seconds += offset_seconds;
-    }
-
-    Ok(ChunkInferenceResult {
-        index,
-        notes,
-        elapsed: start.elapsed(),
-    })
-}
-
-fn derive_chunk_seed(base_seed: u64, index: usize) -> u64 {
-    let mut value = base_seed.wrapping_add((index as u64).wrapping_add(1) * 0x9E37_79B9_7F4A_7C15);
-    value ^= value >> 30;
-    value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    value ^= value >> 27;
-    value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
-    value ^= value >> 31;
-    value.max(1)
-}
-
-fn write_extract_output(
-    path: &Path,
-    format: ExtractFormat,
-    notes: &[Note],
-) -> Result<()> {
-    match format {
-        ExtractFormat::Midi => write_midi_file(path, notes, &MidiWriteOptions::default()),
-        ExtractFormat::Txt => write_text_file(
-            path,
-            notes,
-            TextOutputFormat::Txt,
-            &TextWriteOptions::default(),
-        ),
-        ExtractFormat::Csv => write_text_file(
-            path,
-            notes,
-            TextOutputFormat::Csv,
-            &TextWriteOptions::default(),
-        ),
-    }
-}
-
-fn resolve_extract_format(format: Option<ExtractFormat>, output: &Path) -> ExtractFormat {
-    format
-        .or_else(|| infer_extract_format(output))
-        .unwrap_or(ExtractFormat::Midi)
-}
-
-fn infer_extract_format(output: &Path) -> Option<ExtractFormat> {
-    let extension = output.extension()?.to_str()?.to_ascii_lowercase();
-    match extension.as_str() {
-        "mid" | "midi" => Some(ExtractFormat::Midi),
-        "txt" => Some(ExtractFormat::Txt),
-        "csv" => Some(ExtractFormat::Csv),
-        _ => None,
-    }
-}
-
-fn load_model_for_extract(
-    model_path: &Path,
-    device: Option<ExtractDevice>,
-    gpu: &GpuSelectorArgs,
-    notifier: &dyn Notifier,
-) -> Result<Model> {
-    match device {
-        Some(ExtractDevice::Cpu) => Model::load_with_notifier(model_path, Backend::Cpu, notifier),
-        Some(ExtractDevice::Gpu) => load_gpu_model(model_path, gpu, notifier),
-        None if gpu.has_any() => load_gpu_model(model_path, gpu, notifier),
-        None => load_auto_model(model_path, notifier),
-    }
-}
-
-#[cfg(feature = "gpu")]
-fn load_gpu_model(model_path: &Path, gpu: &GpuSelectorArgs, notifier: &dyn Notifier) -> Result<Model> {
-    let selector = gpu.to_selector();
-    Model::load_with_gpu_selector_and_notifier(model_path, selector.as_ref(), notifier)
-}
-
-#[cfg(not(feature = "gpu"))]
-fn load_gpu_model(
-    _model_path: &Path,
-    _gpu: &GpuSelectorArgs,
-    _notifier: &dyn Notifier,
-) -> Result<Model> {
-    Err(Error::message(
-        "GPU extraction requested but the `gpu` cargo feature is disabled",
-    ))
-}
-
-#[cfg(feature = "gpu")]
-fn load_auto_model(model_path: &Path, notifier: &dyn Notifier) -> Result<Model> {
-    match Model::load_with_gpu_selector_and_notifier(model_path, None, notifier) {
-        Ok(model) => Ok(model),
-        Err(gpu_err) => match Model::load_with_notifier(model_path, Backend::Cpu, notifier) {
-            Ok(model) => {
-                warn!("GPU backend unavailable ({gpu_err}); falling back to CPU");
-                Ok(model)
-            }
-            Err(cpu_err) => Err(Error::message(format!(
-                "failed to load model on GPU ({gpu_err}) and CPU fallback also failed ({cpu_err})"
-            ))),
+fn build_extract_request(args: &ExtractArgs) -> ServiceExtractRequest {
+    ServiceExtractRequest {
+        model_path: args.model.clone(),
+        input_path: args.input.clone(),
+        output: Some(ExtractOutputRequest {
+            path: args.output.clone(),
+            format: args.format.map(Into::into),
+            midi_options: Default::default(),
+            text_options: Default::default(),
+        }),
+        device: args.device.map_or(ServiceExtractDevice::Auto, Into::into),
+        gpu: args.gpu.to_service_selector(),
+        infer_params: InferParams {
+            language: args.language,
+            d3pm_t0: args.d3pm_t0,
+            d3pm_nsteps: args.d3pm_nsteps,
+            boundary_threshold: args.boundary_threshold,
+            boundary_radius: args.boundary_radius,
+            note_threshold: args.note_threshold,
+            seed: args.seed,
+            ..InferParams::default()
         },
+        chunk_parallelism: args.chunk_parallelism.into(),
+        max_chunk_seconds: args.max_chunk_seconds,
     }
 }
 
-#[cfg(not(feature = "gpu"))]
-fn load_auto_model(model_path: &Path, notifier: &dyn Notifier) -> Result<Model> {
-    Model::load_with_notifier(model_path, Backend::Cpu, notifier)
-}
-
-fn ensure_output_parent_dir(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+fn print_extract_summary(args: &ExtractArgs, result: &ServiceExtractResult) {
+    if result.audio.was_resampled() || result.audio.was_downmixed() {
+        eprintln!(
+            "audio: {} Hz/{} ch -> {} Hz mono",
+            result.audio.source_sample_rate,
+            result.audio.source_channels,
+            result.audio.sample_rate
+        );
+    } else {
+        eprintln!("audio: {} Hz mono", result.audio.sample_rate);
     }
-    Ok(())
+    eprintln!("backend: {}", backend_name(result.backend));
+    if let Some(adapter) = &result.gpu_adapter {
+        eprintln!(
+            "gpu: {} (backend={}, type={}, vendor=0x{:04x}, device=0x{:04x})",
+            adapter.name,
+            adapter.backend,
+            adapter.device_type,
+            adapter.vendor_id,
+            adapter.device_id
+        );
+    }
+    eprintln!("max_chunk_seconds: {}", args.max_chunk_seconds);
+    eprintln!("chunks: {}", result.chunk_count);
+    eprintln!("frames: {}", result.total_frames);
+    eprintln!("notes: {}", result.notes.len());
+    if let Some(output) = &result.output {
+        eprintln!("wrote {}", output.path.display());
+    }
+    eprintln!("elapsed_total: {}", format_duration(result.timings.total));
+    eprintln!(
+        "elapsed_model_load: {}",
+        format_duration(result.timings.model_load)
+    );
+    eprintln!(
+        "elapsed_audio_prepare: {}",
+        format_duration(result.timings.audio_prepare)
+    );
+    eprintln!(
+        "elapsed_slice: {}",
+        format_duration(result.timings.silence_slice)
+    );
+    eprintln!(
+        "elapsed_long_chunk_split: {}",
+        format_duration(result.timings.long_chunk_split)
+    );
+    eprintln!(
+        "elapsed_mel_setup: {}",
+        format_duration(result.timings.mel_setup)
+    );
+    eprintln!(
+        "elapsed_inference: {}",
+        format_duration(result.timings.inference)
+    );
+    eprintln!(
+        "elapsed_output_write: {}",
+        format_duration(result.timings.output_write)
+    );
+    if result.chunks_before_long_split != result.chunk_count {
+        eprintln!("chunks_before_long_split: {}", result.chunks_before_long_split);
+    }
 }
 
 fn backend_name(backend: Backend) -> &'static str {
     match backend {
         Backend::Cpu => "cpu",
         Backend::Gpu => "gpu",
-    }
-}
-
-#[cfg(feature = "gpu")]
-fn wgpu_backend_name(backend: wgpu::Backend) -> &'static str {
-    match backend {
-        wgpu::Backend::Empty => "empty",
-        wgpu::Backend::Vulkan => "vulkan",
-        wgpu::Backend::Metal => "metal",
-        wgpu::Backend::Dx12 => "dx12",
-        wgpu::Backend::Gl => "gl",
-        wgpu::Backend::BrowserWebGpu => "webgpu",
-    }
-}
-
-#[cfg(feature = "gpu")]
-fn wgpu_device_type_name(device_type: wgpu::DeviceType) -> &'static str {
-    match device_type {
-        wgpu::DeviceType::Other => "other",
-        wgpu::DeviceType::IntegratedGpu => "integrated",
-        wgpu::DeviceType::DiscreteGpu => "discrete",
-        wgpu::DeviceType::VirtualGpu => "virtual",
-        wgpu::DeviceType::Cpu => "cpu",
     }
 }
 
@@ -638,307 +407,6 @@ fn init_logging() {
     let _ = builder.try_init();
 }
 
-fn timed_result<T>(f: impl FnOnce() -> Result<T>) -> Result<(T, Duration)> {
-    let start = Instant::now();
-    let value = f()?;
-    Ok((value, start.elapsed()))
-}
-
-trait ExtractProgressLogger {
-    fn log_chunk_start(
-        &mut self,
-        chunk_index: usize,
-        chunk_count: usize,
-        offset_seconds: f64,
-        duration_seconds: f64,
-    );
-
-    fn log_chunk_complete(
-        &mut self,
-        chunk_index: usize,
-        chunk_count: usize,
-        chunk_notes: usize,
-        elapsed: Duration,
-    );
-}
-
-#[cfg(test)]
-struct NoopExtractProgress;
-
-#[cfg(test)]
-impl ExtractProgressLogger for NoopExtractProgress {
-    fn log_chunk_start(
-        &mut self,
-        _chunk_index: usize,
-        _chunk_count: usize,
-        _offset_seconds: f64,
-        _duration_seconds: f64,
-    ) {
-    }
-
-    fn log_chunk_complete(
-        &mut self,
-        _chunk_index: usize,
-        _chunk_count: usize,
-        _chunk_notes: usize,
-        _elapsed: Duration,
-    ) {
-    }
-}
-
-struct ExtractProgress<'a> {
-    args: &'a ExtractArgs,
-    started_at: Instant,
-    model_load_elapsed: Duration,
-    audio_prepare_elapsed: Duration,
-    slice_elapsed: Duration,
-    split_elapsed: Duration,
-    mel_setup_elapsed: Duration,
-    inference_elapsed: Duration,
-    write_elapsed: Duration,
-    original_chunk_count: usize,
-}
-
-impl<'a> ExtractProgress<'a> {
-    fn new(args: &'a ExtractArgs) -> Self {
-        Self {
-            args,
-            started_at: Instant::now(),
-            model_load_elapsed: Duration::ZERO,
-            audio_prepare_elapsed: Duration::ZERO,
-            slice_elapsed: Duration::ZERO,
-            split_elapsed: Duration::ZERO,
-            mel_setup_elapsed: Duration::ZERO,
-            inference_elapsed: Duration::ZERO,
-            write_elapsed: Duration::ZERO,
-            original_chunk_count: 0,
-        }
-    }
-
-    fn log_start(&self, format: ExtractFormat) {
-        info!(
-            "starting extract: input={} model={} output={} format={} requested_device={}",
-            self.args.input.display(),
-            self.args.model.display(),
-            self.args.output.display(),
-            extract_format_name(format),
-            self.args.device.map(extract_device_name).unwrap_or("auto")
-        );
-    }
-
-    fn log_step_start(&self, step_name: &str) {
-        info!("{step_name}...");
-    }
-
-    fn record_model_loaded(&mut self, _model: &Model, elapsed: Duration) {
-        self.model_load_elapsed = elapsed;
-        #[cfg(feature = "gpu")]
-        if let Some(adapter) = _model.gpu_adapter_info() {
-            info!(
-                "gpu adapter: {} (backend={}, type={}, vendor=0x{:04x}, device=0x{:04x})",
-                adapter.name,
-                wgpu_backend_name(adapter.backend),
-                wgpu_device_type_name(adapter.device_type),
-                adapter.vendor,
-                adapter.device
-            );
-        }
-    }
-
-    fn record_audio_prepared(
-        &mut self,
-        waveform: &PreparedWaveform,
-        elapsed: Duration,
-    ) {
-        self.audio_prepare_elapsed = elapsed;
-        let input_seconds = if waveform.source_sample_rate == 0 {
-            0.0
-        } else {
-            waveform.samples.len() as f64 / waveform.sample_rate as f64
-        };
-        if waveform.was_resampled() || waveform.was_downmixed() {
-            info!(
-                "audio prepared: {} Hz/{} ch -> {} Hz mono, samples={}, duration={:.2}s, elapsed={}",
-                waveform.source_sample_rate,
-                waveform.source_channels,
-                waveform.sample_rate,
-                waveform.samples.len(),
-                input_seconds,
-                format_duration(elapsed)
-            );
-        } else {
-            info!(
-                "audio prepared: {} Hz mono, samples={}, duration={:.2}s, elapsed={}",
-                waveform.sample_rate,
-                waveform.samples.len(),
-                input_seconds,
-                format_duration(elapsed)
-            );
-        }
-    }
-
-    fn record_slice_complete(&mut self, sliced_chunks: &[SliceChunk], slice_elapsed: Duration) {
-        self.slice_elapsed = slice_elapsed;
-        self.original_chunk_count = sliced_chunks.len();
-        info!(
-            "silence slicing complete: chunks={} elapsed={}",
-            sliced_chunks.len(),
-            format_duration(slice_elapsed)
-        );
-    }
-
-    fn record_split_complete(
-        &mut self,
-        chunks: &[SliceChunk],
-        split_elapsed: Duration,
-        waveform: &PreparedWaveform,
-    ) {
-        self.split_elapsed = split_elapsed;
-        let max_samples = waveform
-            .sample_rate
-            .saturating_mul(self.args.max_chunk_seconds);
-        info!(
-            "long-chunk split complete: chunks={} max_chunk_seconds={} max_chunk_samples={} elapsed={}",
-            chunks.len(),
-            self.args.max_chunk_seconds,
-            max_samples,
-            format_duration(split_elapsed)
-        );
-    }
-
-    fn record_mel_setup(&mut self, total_frames: usize, elapsed: Duration) {
-        self.mel_setup_elapsed = elapsed;
-        info!(
-            "mel extractor ready: frames={} elapsed={}",
-            total_frames,
-            format_duration(elapsed)
-        );
-    }
-
-    fn log_inference_start(&self, chunk_count: usize) {
-        info!("running inference across {chunk_count} chunk(s)");
-    }
-
-    fn record_inference_complete(&mut self, result: &ChunkedExtractResult, elapsed: Duration) {
-        self.inference_elapsed = elapsed;
-        info!(
-            "inference complete: chunks={} notes={} elapsed={}",
-            result.chunk_count,
-            result.notes.len(),
-            format_duration(elapsed)
-        );
-    }
-
-    fn record_output_written(&mut self, output: &Path, elapsed: Duration) {
-        self.write_elapsed = elapsed;
-        info!(
-            "output written: path={} elapsed={}",
-            output.display(),
-            format_duration(elapsed)
-        );
-    }
-
-    fn print_summary(
-        &self,
-        waveform: &PreparedWaveform,
-        model: &Model,
-        total_frames: usize,
-        result: &ChunkedExtractResult,
-    ) {
-        if waveform.was_resampled() || waveform.was_downmixed() {
-            eprintln!(
-                "audio: {} Hz/{} ch -> {} Hz mono",
-                waveform.source_sample_rate, waveform.source_channels, waveform.sample_rate
-            );
-        } else {
-            eprintln!("audio: {} Hz mono", waveform.sample_rate);
-        }
-        eprintln!("backend: {}", backend_name(model.backend()));
-        #[cfg(feature = "gpu")]
-        if let Some(adapter) = model.gpu_adapter_info() {
-            eprintln!(
-                "gpu: {} (backend={}, type={}, vendor=0x{:04x}, device=0x{:04x})",
-                adapter.name,
-                wgpu_backend_name(adapter.backend),
-                wgpu_device_type_name(adapter.device_type),
-                adapter.vendor,
-                adapter.device
-            );
-        }
-        eprintln!("max_chunk_seconds: {}", self.args.max_chunk_seconds);
-        eprintln!("chunks: {}", result.chunk_count);
-        eprintln!("frames: {}", total_frames);
-        eprintln!("notes: {}", result.notes.len());
-        eprintln!("wrote {}", self.args.output.display());
-        eprintln!(
-            "elapsed_total: {}",
-            format_duration(self.started_at.elapsed())
-        );
-        eprintln!(
-            "elapsed_model_load: {}",
-            format_duration(self.model_load_elapsed)
-        );
-        eprintln!(
-            "elapsed_audio_prepare: {}",
-            format_duration(self.audio_prepare_elapsed)
-        );
-        eprintln!("elapsed_slice: {}", format_duration(self.slice_elapsed));
-        eprintln!(
-            "elapsed_long_chunk_split: {}",
-            format_duration(self.split_elapsed)
-        );
-        eprintln!(
-            "elapsed_mel_setup: {}",
-            format_duration(self.mel_setup_elapsed)
-        );
-        eprintln!(
-            "elapsed_inference: {}",
-            format_duration(self.inference_elapsed)
-        );
-        eprintln!(
-            "elapsed_output_write: {}",
-            format_duration(self.write_elapsed)
-        );
-        if self.original_chunk_count != 0 && self.original_chunk_count != result.chunk_count {
-            eprintln!("chunks_before_long_split: {}", self.original_chunk_count);
-        }
-    }
-}
-
-impl ExtractProgressLogger for ExtractProgress<'_> {
-    fn log_chunk_start(
-        &mut self,
-        chunk_index: usize,
-        chunk_count: usize,
-        offset_seconds: f64,
-        duration_seconds: f64,
-    ) {
-        info!(
-            "chunk {}/{}: infer start offset={:.2}s duration={:.2}s",
-            chunk_index + 1,
-            chunk_count,
-            offset_seconds,
-            duration_seconds
-        );
-    }
-
-    fn log_chunk_complete(
-        &mut self,
-        chunk_index: usize,
-        chunk_count: usize,
-        chunk_notes: usize,
-        elapsed: Duration,
-    ) {
-        info!(
-            "chunk {}/{}: infer done notes={} elapsed={}",
-            chunk_index + 1,
-            chunk_count,
-            chunk_notes,
-            format_duration(elapsed)
-        );
-    }
-}
-
 fn format_duration(duration: Duration) -> String {
     format!("{:.3}s", duration.as_secs_f64())
 }
@@ -960,11 +428,11 @@ fn extract_device_name(device: ExtractDevice) -> &'static str {
     }
 }
 
-fn extract_format_name(format: ExtractFormat) -> &'static str {
+fn extract_format_name(format: ServiceExtractFormat) -> &'static str {
     match format {
-        ExtractFormat::Midi => "midi",
-        ExtractFormat::Txt => "txt",
-        ExtractFormat::Csv => "csv",
+        ServiceExtractFormat::Midi => "midi",
+        ServiceExtractFormat::Txt => "txt",
+        ServiceExtractFormat::Csv => "csv",
     }
 }
 
@@ -1493,19 +961,12 @@ fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
 }
 
 impl GpuSelectorArgs {
-    fn has_any(&self) -> bool {
-        self.gpu_name.is_some() || self.gpu_vendor_id.is_some() || self.gpu_device_id.is_some()
-    }
-
-    #[cfg(feature = "gpu")]
-    fn to_selector(&self) -> Option<GpuAdapterSelector> {
-        self.has_any().then(|| GpuAdapterSelector {
+    fn to_service_selector(&self) -> ServiceGpuSelector {
+        ServiceGpuSelector {
             name_substring: self.gpu_name.clone(),
             vendor_id: self.gpu_vendor_id,
             device_id: self.gpu_device_id,
-            backend: None,
-            device_type: None,
-        })
+        }
     }
 }
 
@@ -1515,14 +976,15 @@ mod tests {
     use std::path::Path;
 
     use clap::Parser;
-    use game_audio::{
-        SlicerConfig, prepare_wav_for_inference, slice_waveform, split_long_chunks,
+    use game_core::Note;
+    use game_service::{
+        ExtractDevice as ServiceExtractDevice, ExtractFormat as ServiceExtractFormat,
+        ExtractRequest,
+        extract as run_extract_pipeline, infer_extract_format as service_infer_extract_format,
     };
-    use game_core::{Backend, Error, InferParams, Model, Note};
 
     use super::{
-        ChunkParallelism, Cli, Command, DEFAULT_MAX_CHUNK_SECONDS, ExtractFormat,
-        infer_extract_format, parse_u32_auto, run_chunked_extract,
+        ChunkParallelism, Cli, Command, DEFAULT_MAX_CHUNK_SECONDS, parse_u32_auto,
     };
 
     #[test]
@@ -1535,18 +997,18 @@ mod tests {
     #[test]
     fn infer_extract_format_from_output_extension() {
         assert_eq!(
-            infer_extract_format(Path::new("notes.mid")),
-            Some(ExtractFormat::Midi)
+            service_infer_extract_format(Path::new("notes.mid")),
+            Some(ServiceExtractFormat::Midi)
         );
         assert_eq!(
-            infer_extract_format(Path::new("notes.txt")),
-            Some(ExtractFormat::Txt)
+            service_infer_extract_format(Path::new("notes.txt")),
+            Some(ServiceExtractFormat::Txt)
         );
         assert_eq!(
-            infer_extract_format(Path::new("notes.csv")),
-            Some(ExtractFormat::Csv)
+            service_infer_extract_format(Path::new("notes.csv")),
+            Some(ServiceExtractFormat::Csv)
         );
-        assert_eq!(infer_extract_format(Path::new("notes.unknown")), None);
+        assert_eq!(service_infer_extract_format(Path::new("notes.unknown")), None);
     }
 
     #[test]
@@ -1675,35 +1137,22 @@ mod tests {
             return;
         }
 
-        let model = Model::load(&model_path, Backend::Cpu).unwrap();
-        let waveform =
-            prepare_wav_for_inference(&audio_path, model.config().inference.audio_sample_rate)
-                .unwrap();
-        let chunks = slice_waveform(
-            &waveform.samples,
-            &SlicerConfig {
-                sample_rate: waveform.sample_rate,
-                ..SlicerConfig::default()
+        let actual = run_extract_pipeline(&ExtractRequest {
+            model_path,
+            input_path: audio_path,
+            output: None,
+            device: ServiceExtractDevice::Cpu,
+            infer_params: game_core::InferParams {
+                seed: 1,
+                ..game_core::InferParams::default()
             },
-        )
+            max_chunk_seconds: DEFAULT_MAX_CHUNK_SECONDS,
+            ..ExtractRequest::default()
+        })
         .unwrap();
-        let chunks = split_long_chunks(
-            &chunks,
-            waveform.sample_rate,
-            waveform.sample_rate * DEFAULT_MAX_CHUNK_SECONDS,
-        )
-        .unwrap();
-        let params = InferParams {
-            seed: 1,
-            ..InferParams::default()
-        };
-        let actual = run_chunked_extract(&model, &chunks, &params).unwrap();
         let expected = parse_expected_notes(&expected_path).unwrap();
-        let metrics = compare_notes_by_frame(
-            &expected,
-            &actual.notes,
-            model.config().inference.timestep(),
-        );
+        let metrics =
+            compare_notes_by_frame(&expected, &actual.notes, actual.timestep_seconds);
 
         eprintln!(
             "vocal2 CPU regression: expected_notes={} actual_notes={} expected_frames={} actual_frames={} voicedness_match={:.4} pitch_mae={:.4} pitch_le_0_5={:.4}",
@@ -1770,14 +1219,14 @@ mod tests {
         let cpu = run_real_model_extract_with_shared_chunking(
             root,
             &audio_path,
-            Backend::Cpu,
+            ServiceExtractDevice::Cpu,
             max_chunk_seconds,
         )
         .unwrap();
         let gpu = run_real_model_extract_with_shared_chunking(
             root,
             &audio_path,
-            Backend::Gpu,
+            ServiceExtractDevice::Gpu,
             max_chunk_seconds,
         )
         .unwrap();
@@ -1875,41 +1324,36 @@ mod tests {
         Ok(notes)
     }
 
+    #[cfg(feature = "gpu")]
     struct RealModelExtractResult {
         notes: Vec<Note>,
         timestep: f32,
     }
 
+    #[cfg(feature = "gpu")]
     fn run_real_model_extract_with_shared_chunking(
         root: &Path,
         audio_path: &Path,
-        backend: Backend,
+        device: ServiceExtractDevice,
         max_chunk_seconds: usize,
-    ) -> Result<RealModelExtractResult, Error> {
+    ) -> game_core::Result<RealModelExtractResult> {
         let model_path = root.join("assets").join("models").join("large.gguf");
-        let model = Model::load(&model_path, backend)?;
-        let waveform =
-            prepare_wav_for_inference(audio_path, model.config().inference.audio_sample_rate)?;
-        let chunks = slice_waveform(
-            &waveform.samples,
-            &SlicerConfig {
-                sample_rate: waveform.sample_rate,
-                ..SlicerConfig::default()
+        let result = run_extract_pipeline(&ExtractRequest {
+            model_path,
+            input_path: audio_path.to_path_buf(),
+            output: None,
+            device,
+            infer_params: game_core::InferParams {
+                seed: 1,
+                ..game_core::InferParams::default()
             },
-        )?;
-        let chunks = split_long_chunks(
-            &chunks,
-            waveform.sample_rate,
-            waveform.sample_rate.saturating_mul(max_chunk_seconds),
-        )?;
-        let params = InferParams {
-            seed: 1,
-            ..InferParams::default()
-        };
-        let result = run_chunked_extract(&model, &chunks, &params)?;
+            chunk_parallelism: game_service::ChunkParallelism::Auto,
+            max_chunk_seconds,
+            ..ExtractRequest::default()
+        })?;
         Ok(RealModelExtractResult {
             notes: result.notes,
-            timestep: model.config().inference.timestep(),
+            timestep: result.timestep_seconds,
         })
     }
 
