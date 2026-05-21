@@ -152,7 +152,7 @@ impl Drop for CpuProfileSession {
         }
 
         let elapsed = self.started_at.elapsed();
-        let mut state = profiler_state().lock().unwrap();
+        let mut state = profiler_state().lock().unwrap_or_else(|p| p.into_inner());
         log_profile_section("scope", &state.label, elapsed, &state.scopes);
         log_profile_section("op", &state.label, elapsed, &state.ops);
         state.active = false;
@@ -166,7 +166,7 @@ impl Drop for ProfileScope {
         }
 
         let elapsed = self.started_at.elapsed();
-        let mut state = profiler_state().lock().unwrap();
+        let mut state = profiler_state().lock().unwrap_or_else(|p| p.into_inner());
         let map = match self.kind {
             ProfileKind::Scope => &mut state.scopes,
             ProfileKind::Op => &mut state.ops,

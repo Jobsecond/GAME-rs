@@ -511,10 +511,14 @@ fn default_d3pm_schedule(t0: f32, n_steps: i32) -> Result<Vec<f32>> {
     }
 
     let n_steps = positive_usize("InferParams.d3pm_nsteps", n_steps)?;
-    let step = (1.0 - t0) / n_steps as f32;
     let mut ts = Vec::with_capacity(n_steps);
-    for index in 0..n_steps {
-        ts.push(t0 + step * index as f32);
+    if n_steps == 1 {
+        ts.push(t0);
+    } else {
+        let step = (1.0 - t0) / (n_steps - 1) as f32;
+        for index in 0..n_steps {
+            ts.push(t0 + step * index as f32);
+        }
     }
     Ok(ts)
 }

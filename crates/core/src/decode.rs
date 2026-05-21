@@ -65,6 +65,7 @@ pub fn decode_soft_boundaries(
     for index in 0..probs.len() {
         let lo = index.saturating_sub(radius);
         let hi = min(probs.len() - 1, index.saturating_add(radius));
+        let is_barrier = barriers.is_some_and(|barriers| barriers[index] != 0);
         let mut best = values[lo];
         let mut arg = lo;
         for k in (lo + 1)..=hi {
@@ -73,11 +74,9 @@ pub fn decode_soft_boundaries(
                 arg = k;
             }
         }
-        if arg != index {
+        if arg != index && !is_barrier {
             continue;
         }
-
-        let is_barrier = barriers.is_some_and(|barriers| barriers[index] != 0);
         let meets_threshold = probs[index] >= threshold;
         if is_barrier || meets_threshold {
             out[index] = 1;

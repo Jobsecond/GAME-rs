@@ -99,9 +99,14 @@ impl MelExtractor {
 
     pub fn num_frames(&self, n_samples: usize) -> usize {
         let (pad_l, pad_r) = pad_sizes(self.cfg.win_length, self.cfg.hop_length);
-        let padded = n_samples as i64 + pad_l as i64 + pad_r as i64;
-        let frames = (padded - self.cfg.win_length as i64) / self.cfg.hop_length as i64 + 1;
-        frames.max(0) as usize
+        let padded = (n_samples as u64)
+            .saturating_add(pad_l as u64)
+            .saturating_add(pad_r as u64);
+        if padded < self.cfg.win_length as u64 {
+            return 0;
+        }
+        let frames = (padded - self.cfg.win_length as u64) / self.cfg.hop_length as u64 + 1;
+        frames as usize
     }
 
     pub fn forward(&self, waveform: &[f32]) -> Result<Vec<f32>> {

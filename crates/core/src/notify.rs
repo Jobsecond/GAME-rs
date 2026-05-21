@@ -57,11 +57,16 @@ pub(crate) fn with_notifier<T>(notifier: &dyn Notifier, f: impl FnOnce() -> T) -
     let ptr = notifier as *const dyn Notifier;
     let erased = unsafe { mem::transmute::<*const dyn Notifier, (usize, usize)>(ptr) };
     CURRENT_NOTIFIER.with(|current| current.borrow_mut().push(erased));
-    let result = f();
-    CURRENT_NOTIFIER.with(|current| {
-        current.borrow_mut().pop();
-    });
-    result
+    struct PopGuard;
+    impl Drop for PopGuard {
+        fn drop(&mut self) {
+            CURRENT_NOTIFIER.with(|current| {
+                current.borrow_mut().pop();
+            });
+        }
+    }
+    let _guard = PopGuard;
+    f()
 }
 
 pub(crate) fn emit(event: CoreEvent) {

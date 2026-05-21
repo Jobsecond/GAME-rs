@@ -115,7 +115,9 @@ impl TryFrom<u32> for GGMLType {
             16 => Ok(Self::I8),
             17 => Ok(Self::I16),
             18 => Ok(Self::I32),
-            19 => Ok(Self::Count),
+            19 => Err(Error::Format(
+                "GGML type 19 (Count) is a sentinel, not a valid tensor type".to_owned(),
+            )),
             _ => Err(Error::Format(format!(
                 "unsupported GGML tensor type {value}"
             ))),
@@ -324,7 +326,7 @@ impl GGUFFile {
             on_disk_tensor_infos.push(decode_on_disk_tensor_info(&mut reader, header.version)?);
         }
 
-        let tensor_data_start = align_up(reader.position(), header.alignment() as usize);
+        let tensor_data_start = align_up(reader.position(), header.alignment() as usize)?;
         if tensor_data_start > bytes.len() {
             return Err(Error::Format(format!(
                 "GGUF tensor data starts past end of file: start={}, file_size={}",
@@ -499,12 +501,22 @@ impl<'a> GGUFReader<'a> {
                 Ok(GGUFMetadataValue::String(self.read_string(version)?))
             }
             GGUFMetadataValueType::Array => {
-                Ok(GGUFMetadataValue::Array(self.read_array_value(version)?))
+                Ok(GGUFMetadataValue::Array(self.read_array_value(version, 0)?))
             }
         }
     }
 
-    fn read_array_value(&mut self, version: GGUFVersion) -> Result<GGUFMetadataArray> {
+    fn read_array_value(
+        &mut self,
+        version: GGUFVersion,
+        depth: usize,
+    ) -> Result<GGUFMetadataArray> {
+        const MAX_NESTING_DEPTH: usize = 16;
+        if depth >= MAX_NESTING_DEPTH {
+            return Err(Error::Format(format!(
+                "GGUF nested array depth exceeds maximum of {MAX_NESTING_DEPTH}"
+            )));
+        }
         let typ = GGUFMetadataValueType::try_from(self.read_u32()?)?;
         let len = self.read_len(version)?;
         match typ {
@@ -520,16 +532,16 @@ impl<'a> GGUFReader<'a> {
             GGUFMetadataValueType::F64 => Ok(GGUFMetadataArray::F64Array(self.read_vec_f64(len)?)),
             GGUFMetadataValueType::Bool => Ok(GGUFMetadataArray::BoolArray(self.read_vec_u8(len)?)),
             GGUFMetadataValueType::String => {
-                let mut values = Vec::with_capacity(len);
+                let mut values = Vec::with_capacity(len.min(1024));
                 for _ in 0..len {
                     values.push(self.read_string(version)?);
                 }
                 Ok(GGUFMetadataArray::StringArray(values))
             }
             GGUFMetadataValueType::Array => {
-                let mut values = Vec::with_capacity(len);
+                let mut values = Vec::with_capacity(len.min(1024));
                 for _ in 0..len {
-                    values.push(self.read_array_value(version)?);
+                    values.push(self.read_array_value(version, depth + 1)?);
                 }
                 Ok(GGUFMetadataArray::NestedArray(values))
             }
@@ -631,7 +643,7 @@ fn decode_header(reader: &mut GGUFReader<'_>) -> Result<GGUFHeader> {
     let tensor_count = reader.read_len(version)?;
     let metadata_kv_count = reader.read_len(version)?;
 
-    let mut metadata_kv = HashMap::with_capacity(metadata_kv_count);
+    let mut metadata_kv = HashMap::with_capacity(metadata_kv_count.min(65536));
     for _ in 0..metadata_kv_count {
         let key = reader.read_string(version)?;
         let value = reader.read_value(version)?;
@@ -657,6 +669,11 @@ fn decode_on_disk_tensor_info(
 ) -> Result<GGUFOnDiskTensorInfo> {
     let name = reader.read_string(version)?;
     let n_dimensions = reader.read_u32()? as usize;
+    if n_dimensions > 32 {
+        return Err(Error::Format(format!(
+            "GGUF tensor `{name}` claims {n_dimensions} dimensions, maximum supported is 32"
+        )));
+    }
     let dimensions = reader.read_len_array(version, n_dimensions)?;
     let typ = GGMLType::try_from(reader.read_u32()?)?;
     let offset = reader.read_u64()?;
@@ -711,16 +728,18 @@ fn convert_tensor_infos(
     Ok(result)
 }
 
-fn align_up(value: usize, alignment: usize) -> usize {
+fn align_up(value: usize, alignment: usize) -> Result<usize> {
     if alignment == 0 {
-        return value;
+        return Ok(value);
     }
 
     let remainder = value % alignment;
     if remainder == 0 {
-        value
+        Ok(value)
     } else {
-        value + (alignment - remainder)
+        value
+            .checked_add(alignment - remainder)
+            .ok_or_else(|| Error::Format("GGUF alignment overflow".to_owned()))
     }
 }
 

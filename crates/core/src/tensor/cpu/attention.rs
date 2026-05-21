@@ -99,17 +99,28 @@ impl CpuTensor {
         } else {
             None
         };
+        let mask_is_contiguous_copy = mask_owned.is_some();
         let mask_outer_stride =
             mask_layout_owned
                 .as_ref()
-                .map(|layout| match layout.dims().len() {
-                    2 => layout.stride()[0],
-                    3 => layout.stride()[1],
-                    _ => 0,
+                .map(|layout| {
+                    if mask_is_contiguous_copy {
+                        key_len
+                    } else {
+                        match layout.dims().len() {
+                            2 => layout.stride()[0],
+                            3 => layout.stride()[1],
+                            _ => 0,
+                        }
+                    }
                 });
         let mask_head_stride = mask_layout_owned.as_ref().and_then(|layout| {
             if layout.dims().len() == 3 {
-                Some(layout.stride()[0])
+                if mask_is_contiguous_copy {
+                    Some(query_len * key_len)
+                } else {
+                    Some(layout.stride()[0])
+                }
             } else {
                 None
             }
@@ -365,10 +376,18 @@ impl CpuTensor {
             )
         });
 
+        if q.shape().len() != 3 || k.shape().len() != 3 || v.shape().len() != 3 {
+            return Err(invalid_arg(format!(
+                "fused_attention expects rank-3 q/k/v, got {:?}, {:?}, {:?}",
+                q.shape(),
+                k.shape(),
+                v.shape()
+            )));
+        }
         let (heads, q_len, head_dim) = (q.shape()[0], q.shape()[1], q.shape()[2]);
         let key_len = k.shape()[1];
 
-        if q.shape()[2] != head_dim || k.shape()[2] != head_dim || v.shape()[2] != head_dim {
+        if k.shape()[2] != head_dim || v.shape()[2] != head_dim {
             return Err(invalid_arg(format!(
                 "fused_attention head_dim mismatch: q={:?} k={:?} v={:?}",
                 q.shape(),
@@ -640,16 +659,18 @@ pub(super) fn attention_mask_row_slice<'a>(
     len: usize,
 ) -> Option<&'a [f32]> {
     let mask = mask_data?;
+    let outer_stride = mask_outer_stride?;
     let mask_base = match mask_shape {
-        Some([_, _]) => row * mask_outer_stride.unwrap_or(col_start + len),
-        Some([_, _, _]) => {
-            head * mask_head_stride.unwrap_or(0)
-                + row * mask_outer_stride.unwrap_or(col_start + len)
-        }
+        Some([_, _]) => row * outer_stride,
+        Some([_, _, _]) => head * mask_head_stride.unwrap_or(0) + row * outer_stride,
         _ => return None,
     };
     let start = mask_base + col_start;
-    Some(&mask[start..start + len])
+    let end = start + len;
+    if end > mask.len() {
+        return None;
+    }
+    Some(&mask[start..end])
 }
 
 pub(super) fn apply_mask_and_softmax_row(
@@ -694,7 +715,9 @@ pub(super) fn apply_mask_and_softmax_row(
         sum += *value;
     }
 
-    for value in row_scores.iter_mut() {
-        *value /= sum;
+    if sum > 0.0 {
+        for value in row_scores.iter_mut() {
+            *value /= sum;
+        }
     }
 }

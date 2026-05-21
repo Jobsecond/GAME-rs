@@ -162,7 +162,7 @@ pub fn resample_linear(
     let mut out = Vec::with_capacity(dst_len);
     for index in 0..dst_len {
         let position = index as f64 * step;
-        let left = position.floor() as usize;
+        let left = (position.floor() as usize).min(samples.len() - 1);
         let right = (left + 1).min(samples.len() - 1);
         let frac = (position - left as f64) as f32;
         let value = samples[left] + (samples[right] - samples[left]) * frac;

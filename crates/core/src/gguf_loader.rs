@@ -18,7 +18,7 @@ pub struct LoadedTensor {
 
 impl LoadedTensor {
     pub fn num_elements(&self) -> usize {
-        num_elements(&self.shape)
+        num_elements(&self.shape).expect("LoadedTensor shape must not overflow")
     }
 
     pub fn byte_len(&self) -> usize {
@@ -221,7 +221,12 @@ fn load_tensors(file: &GGUFFile) -> Result<BTreeMap<String, LoadedTensor>> {
                 data,
             },
         );
-        debug_assert!(replaced.is_none());
+        if replaced.is_some() {
+            return Err(Error::message(format!(
+                "duplicate tensor name `{}` in GGUF file",
+                tensor.name()
+            )));
+        }
     }
 
     Ok(tensors)
@@ -235,7 +240,7 @@ fn decode_tensor_data(
 ) -> Result<Vec<f32>> {
     match typ {
         GGMLType::F32 => {
-            let len = num_elements(shape);
+            let len = num_elements(shape)?;
             let expected_bytes = len
                 .checked_mul(std::mem::size_of::<f32>())
                 .ok_or_else(|| Error::message(format!("tensor `{name}` byte size overflow")))?;
@@ -316,7 +321,11 @@ fn optional_i64(metadata: &GGUFMetadata, key: &str) -> Result<Option<i64>> {
             })?;
             Ok(Some(converted))
         }
-        Some(GGUFMetadataValue::Bool(value)) => Ok(Some(i64::from(*value != 0))),
+        Some(GGUFMetadataValue::Bool(_)) => Err(Error::InvalidMetadataType {
+            key: key.to_owned(),
+            expected: "integer",
+            found: "bool",
+        }),
         Some(other) => Err(Error::InvalidMetadataType {
             key: key.to_owned(),
             expected: "integer",
@@ -335,7 +344,17 @@ fn required_f32(metadata: &GGUFMetadata, key: &str) -> Result<f32> {
 fn optional_f32(metadata: &GGUFMetadata, key: &str) -> Result<Option<f32>> {
     match metadata.as_hashmap().get(key) {
         Some(GGUFMetadataValue::F32(value)) => Ok(Some(*value)),
-        Some(GGUFMetadataValue::F64(value)) => Ok(Some(*value as f32)),
+        Some(GGUFMetadataValue::F64(value)) => {
+            let converted = *value as f32;
+            if !converted.is_finite() && value.is_finite() {
+                return Err(Error::InvalidMetadataValue {
+                    key: key.to_owned(),
+                    value: value.to_string(),
+                    reason: "f64 value overflows f32 range",
+                });
+            }
+            Ok(Some(converted))
+        }
         Some(GGUFMetadataValue::I32(value)) => Ok(Some(*value as f32)),
         Some(GGUFMetadataValue::I64(value)) => Ok(Some(*value as f32)),
         Some(other) => Err(Error::InvalidMetadataType {
@@ -355,8 +374,11 @@ fn to_i32_value(value: i64, key: &str) -> Result<i32> {
     })
 }
 
-fn num_elements(shape: &[usize]) -> usize {
-    shape.iter().copied().product()
+fn num_elements(shape: &[usize]) -> Result<usize> {
+    shape.iter().try_fold(1usize, |acc, &dim| {
+        acc.checked_mul(dim)
+            .ok_or_else(|| Error::message(format!("tensor shape {:?} overflows usize", shape)))
+    })
 }
 
 fn metadata_type_name(value: &GGUFMetadataValue) -> &'static str {

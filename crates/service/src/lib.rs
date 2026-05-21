@@ -462,6 +462,13 @@ fn run_chunked_extract_with_notifier(
 ) -> Result<ChunkedExtractResult> {
     let chunk_count = chunks.len();
     let parallel_chunks = chunk_parallelism_enabled(model, chunk_count, chunk_parallelism);
+    if chunk_parallelism == ChunkParallelism::On && !parallel_chunks && model.backend() != Backend::Cpu {
+        emit_message(
+            notifier,
+            NotificationLevel::Warn,
+            "chunk parallelism forced on but GPU backend does not support it; falling back to serial",
+        );
+    }
     let random_chunk_seed_base = (parallel_chunks && params.seed == 0).then(random::<u64>);
     for (index, chunk) in chunks.iter().enumerate() {
         let chunk_duration_seconds =

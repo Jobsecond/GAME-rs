@@ -27,8 +27,14 @@ pub fn prepare_segmenter_context<T: Tensor>(
     weights: &SegmenterWeights<T>,
     cfg: &GameModelConfig,
 ) -> Result<PreparedSegmenterContext<T>> {
-    validate_segmenter_input(x_seg, &vec![0; x_seg.shape()[0]], cfg)?;
+    if x_seg.shape().len() != 2 {
+        return Err(Error::message(format!(
+            "segmenter expects x_seg shaped [num_frames, embedding_dim], got {:?}",
+            x_seg.shape()
+        )));
+    }
     let seq_len = x_seg.shape()[0];
+    validate_segmenter_input(x_seg, &vec![0; seq_len], cfg)?;
     let positions = sequence_positions(seq_len)?;
     let base = x_seg
         .linear(&weights.input_proj.weight, Some(&weights.input_proj.bias))
