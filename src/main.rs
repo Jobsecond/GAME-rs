@@ -1,12 +1,13 @@
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use console::Style;
 use game_core::{
     BackboneConfig, Backend, CoreEvent, Error, InferParams, LoadedGgufModel, LoadedTensor,
     NotificationLevel, Notifier, Result, load_gguf,
@@ -18,7 +19,8 @@ use game_service::{
     ExtractResult as ServiceExtractResult, GpuSelector as ServiceGpuSelector,
     extract_with_notifier as run_extract_with_notifier,
 };
-use log::{Level, info, warn};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use log::Level;
 use serde_json::{Map, Value, json};
 
 #[derive(Debug, Parser)]
@@ -170,75 +172,457 @@ impl From<ChunkParallelism> for ServiceChunkParallelism {
     }
 }
 
-#[derive(Debug, Clone)]
-struct CliNotifier {
-    prefix: Option<String>,
+const STAGE_LINE_WIDTH: usize = 50;
+
+struct RichState {
+    chunk_bars: HashMap<usize, ProgressBar>,
+    chunk_overall_bar: Option<ProgressBar>,
+    total_chunks: Option<usize>,
+    completed_chunks: usize,
+    silence_chunk_count: Option<usize>,
 }
 
-impl CliNotifier {
-    fn root() -> Self {
-        Self { prefix: None }
-    }
+struct RichNotifier {
+    multi: MultiProgress,
+    state: Mutex<RichState>,
+    use_color: bool,
+    use_progress: bool,
+    style_label: Style,
+    style_timing: Style,
+    style_warn: Style,
+    style_error: Style,
+    style_dim: Style,
+    style_title: Style,
+}
 
-    fn render_message(&self, message: &str) -> String {
-        match &self.prefix {
-            Some(prefix) => format!("{prefix}{message}"),
-            None => message.to_owned(),
+impl RichNotifier {
+    fn new() -> Self {
+        let term = console::Term::stderr();
+        let is_tty = term.is_term();
+        let use_color = is_tty && std::env::var_os("NO_COLOR").is_none();
+        let use_progress = is_tty;
+
+        let multi = if use_progress {
+            MultiProgress::with_draw_target(ProgressDrawTarget::stderr())
+        } else {
+            MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+        };
+
+        let (style_label, style_timing, style_warn, style_error, style_dim, style_title) =
+            if use_color {
+                (
+                    Style::new().cyan(),
+                    Style::new().green(),
+                    Style::new().yellow(),
+                    Style::new().red(),
+                    Style::new().dim(),
+                    Style::new().cyan().bold(),
+                )
+            } else {
+                let plain = Style::new();
+                (
+                    plain.clone(),
+                    plain.clone(),
+                    plain.clone(),
+                    plain.clone(),
+                    plain.clone(),
+                    plain,
+                )
+            };
+
+        Self {
+            multi,
+            state: Mutex::new(RichState {
+                chunk_bars: HashMap::new(),
+                chunk_overall_bar: None,
+                total_chunks: None,
+                completed_chunks: 0,
+                silence_chunk_count: None,
+            }),
+            use_color,
+            use_progress,
+            style_label,
+            style_timing,
+            style_warn,
+            style_error,
+            style_dim,
+            style_title,
         }
     }
+
+    fn println(&self, line: &str) {
+        if self.use_progress {
+            let _ = self.multi.println(line);
+        } else {
+            eprintln!("{line}");
+        }
+    }
+
+    fn format_stage_line(&self, label: &str, bracket: &str, elapsed: Duration) -> String {
+        let time_str = format_duration(elapsed);
+        let plain_left = if bracket.is_empty() {
+            format!("  {label}")
+        } else {
+            format!("  {label} [{bracket}]")
+        };
+        let padding = STAGE_LINE_WIDTH.saturating_sub(plain_left.len() + time_str.len());
+
+        let colored_left = if bracket.is_empty() {
+            format!("  {}", self.style_label.apply_to(label))
+        } else {
+            format!(
+                "  {} [{}]",
+                self.style_label.apply_to(label),
+                bracket
+            )
+        };
+        format!(
+            "{colored_left}{:pad$}{}",
+            "",
+            self.style_timing.apply_to(&time_str),
+            pad = padding
+        )
+    }
+
+    fn handle_d3pm_progress(&self, current: usize, total: usize, detail: Option<&str>) {
+        if total <= 1 || !self.use_progress {
+            return;
+        }
+
+        let mut state = self.state.lock().unwrap();
+        let chunk_idx = detail.and_then(parse_chunk_index).unwrap_or(0);
+        let total_chunks = state.total_chunks.unwrap_or(1);
+
+        if !state.chunk_bars.contains_key(&chunk_idx) {
+            let bar = if let Some(overall) = &state.chunk_overall_bar {
+                self.multi
+                    .insert_before(overall, ProgressBar::new(total as u64))
+            } else {
+                self.multi.add(ProgressBar::new(total as u64))
+            };
+            let prefix = if total_chunks > 1 {
+                format!("D3PM {}/{total_chunks}", chunk_idx + 1)
+            } else {
+                "D3PM".to_owned()
+            };
+            bar.set_style(
+                ProgressStyle::with_template(
+                    "  {prefix}  [{bar:28}] {pos}/{len} steps  {msg}  {elapsed}",
+                )
+                .unwrap()
+                .progress_chars("##-"),
+            );
+            bar.set_prefix(prefix);
+            state.chunk_bars.insert(chunk_idx, bar);
+        }
+
+        let bar = &state.chunk_bars[&chunk_idx];
+        bar.set_position(current as u64);
+        let t_val = detail.and_then(parse_t_value).unwrap_or("");
+        bar.set_message(t_val.to_owned());
+
+        if current >= total {
+            bar.finish_and_clear();
+        }
+    }
+
+    fn advance_chunk_bar(state: &mut RichState) {
+        state.completed_chunks += 1;
+        if let Some(bar) = &state.chunk_overall_bar {
+            bar.set_position(state.completed_chunks as u64);
+        }
+    }
+
+    fn finish(&self) {
+        let mut state = self.state.lock().unwrap();
+        for (_, bar) in state.chunk_bars.drain() {
+            bar.finish_and_clear();
+        }
+        if let Some(bar) = state.chunk_overall_bar.take() {
+            bar.finish_and_clear();
+        }
+    }
+
+    fn print_banner(&self) {
+        let title = "GAME - Generative Adaptive MIDI Extractor";
+        if self.use_color {
+            self.println(&format!("{}", self.style_title.apply_to(title)));
+        } else {
+            self.println(title);
+        }
+        self.println(&"\u{2500}".repeat(title.len()));
+        self.println("");
+    }
+
+    fn print_summary(&self, _args: &ExtractArgs, result: &ServiceExtractResult) {
+        let sep = "\u{2500}".repeat(STAGE_LINE_WIDTH);
+        self.println(&sep);
+        self.println(&format!(
+            "  {}",
+            self.style_label.apply_to("Result")
+        ));
+        self.println(&sep);
+
+        let audio_val = if result.audio.was_resampled() || result.audio.was_downmixed() {
+            format!(
+                "{} Hz/{} ch -> {} Hz mono",
+                result.audio.source_sample_rate, result.audio.source_channels, result.audio.sample_rate
+            )
+        } else {
+            format!("{} Hz mono", result.audio.sample_rate)
+        };
+        self.print_summary_kv("Audio", &audio_val);
+        self.print_summary_kv("Backend", backend_name(result.backend));
+        if let Some(adapter) = &result.gpu_adapter {
+            self.print_summary_kv("GPU", &adapter.name);
+        }
+        self.print_summary_kv("Chunks", &result.chunk_count.to_string());
+        self.print_summary_kv("Frames", &format_count(result.total_frames as u64));
+        self.print_summary_kv("Notes", &result.notes.len().to_string());
+        if let Some(output) = &result.output {
+            self.print_summary_kv("Output", &output.path.display().to_string());
+        }
+
+        self.println("");
+        self.println(&format!(
+            "  {}",
+            self.style_label.apply_to("Timings")
+        ));
+        self.print_timing_row("model load", result.timings.model_load);
+        self.print_timing_row("audio prepare", result.timings.audio_prepare);
+        self.print_timing_row("silence slice", result.timings.silence_slice);
+        if result.chunks_before_long_split != result.chunk_count {
+            self.print_timing_row("long chunk split", result.timings.long_chunk_split);
+        }
+        self.print_timing_row("mel setup", result.timings.mel_setup);
+        self.print_timing_row("inference", result.timings.inference);
+        self.print_timing_row("output write", result.timings.output_write);
+        self.println(&format!(
+            "  {}",
+            self.style_dim.apply_to(&"\u{2500}".repeat(40))
+        ));
+        self.print_timing_row("total", result.timings.total);
+    }
+
+    fn print_summary_kv(&self, label: &str, value: &str) {
+        self.println(&format!(
+            "  {:<12}{}",
+            self.style_label.apply_to(label),
+            value
+        ));
+    }
+
+    fn print_timing_row(&self, label: &str, duration: Duration) {
+        let value = format_duration(duration);
+        let total_dots_width = 38usize.saturating_sub(label.len() + value.len());
+        let dot_pairs = total_dots_width / 2;
+        let extra = total_dots_width % 2;
+        let dots = format!(
+            "{}{}",
+            " .".repeat(dot_pairs),
+            if extra == 1 { " " } else { "" }
+        );
+        self.println(&format!(
+            "  {label} {dots} {}",
+            self.style_timing.apply_to(&value)
+        ));
+    }
 }
 
-impl Notifier for CliNotifier {
+impl Notifier for RichNotifier {
     fn notify(&self, event: CoreEvent) {
         match event {
-            CoreEvent::Status { stage, message } => {
-                info!("{}", self.render_message(&format!("{stage}: {message}")));
+            CoreEvent::ModelLoaded { backend, elapsed } => {
+                self.println(&self.format_stage_line("model loaded", backend, elapsed));
             }
+
+            CoreEvent::Status { stage, message } => match stage {
+                "extract_infer" => {
+                    if let Some(count) = parse_chunk_count_from_message(&message) {
+                        let mut state = self.state.lock().unwrap();
+                        state.total_chunks = Some(count);
+                        if count > 1 && self.use_progress {
+                            let bar = self.multi.add(ProgressBar::new(count as u64));
+                            bar.set_style(
+                                ProgressStyle::with_template(
+                                    "  chunks [{bar:20}] {pos}/{len}  {elapsed}",
+                                )
+                                .unwrap()
+                                .progress_chars("##-"),
+                            );
+                            bar.enable_steady_tick(Duration::from_millis(250));
+                            state.chunk_overall_bar = Some(bar);
+                        }
+                    }
+                    self.println("");
+                }
+                _ => {}
+            },
+
             CoreEvent::Progress {
                 stage,
                 current,
                 total,
                 detail,
             } => {
-                let message = match detail {
-                    Some(detail) => format!("{stage}: {current}/{total} {detail}"),
-                    None => format!("{stage}: {current}/{total}"),
-                };
-                info!("{}", self.render_message(&message));
+                if stage == "d3pm_step" {
+                    self.handle_d3pm_progress(current, total, detail.as_deref());
+                }
             }
+
             CoreEvent::Timing {
                 stage,
                 elapsed,
                 detail,
-            } => {
-                let message = match detail {
-                    Some(detail) => format!(
-                        "{stage}: elapsed={} {detail}",
-                        format_duration(elapsed)
-                    ),
-                    None => format!("{stage}: elapsed={}", format_duration(elapsed)),
-                };
-                info!("{}", self.render_message(&message));
-            }
-            CoreEvent::ModelLoaded { backend, elapsed } => {
-                info!(
-                    "{}",
-                    self.render_message(&format!(
-                        "model loaded: backend={backend} elapsed={}",
-                        format_duration(elapsed)
-                    ))
-                );
-            }
-            CoreEvent::Message { level, message } => match level {
-                NotificationLevel::Warn | NotificationLevel::Error => {
-                    warn!("{}", self.render_message(&message))
+            } => match stage {
+                "audio_prepare" => {
+                    let bracket = detail
+                        .as_deref()
+                        .map(parse_audio_bracket)
+                        .unwrap_or_default();
+                    self.println(&self.format_stage_line("audio prepared", &bracket, elapsed));
                 }
-                NotificationLevel::Trace
-                | NotificationLevel::Debug
-                | NotificationLevel::Info => info!("{}", self.render_message(&message)),
+                "silence_slice" => {
+                    let bracket = detail
+                        .as_deref()
+                        .and_then(|d| parse_kv_usize(d, "chunks="))
+                        .map(|n| {
+                            self.state.lock().unwrap().silence_chunk_count = Some(n);
+                            format!("{n} chunk{}", if n != 1 { "s" } else { "" })
+                        })
+                        .unwrap_or_default();
+                    self.println(&self.format_stage_line(
+                        "sliced on silence",
+                        &bracket,
+                        elapsed,
+                    ));
+                }
+                "long_chunk_split" => {
+                    let after = detail.as_deref().and_then(|d| parse_kv_usize(d, "chunks="));
+                    let before = self.state.lock().unwrap().silence_chunk_count;
+                    if let (Some(before), Some(after)) = (before, after) {
+                        if before != after {
+                            let bracket = format!("{before} -> {after}");
+                            self.println(&self.format_stage_line(
+                                "split long chunks",
+                                &bracket,
+                                elapsed,
+                            ));
+                        }
+                    }
+                }
+                "mel_setup" => {
+                    let bracket = detail
+                        .as_deref()
+                        .and_then(|d| parse_kv_usize(d, "frames="))
+                        .map(|n| format!("{n} frames"))
+                        .unwrap_or_default();
+                    self.println(&self.format_stage_line("mel setup", &bracket, elapsed));
+                }
+                "infer_total" => {
+                    let mut state = self.state.lock().unwrap();
+                    Self::advance_chunk_bar(&mut state);
+                }
+                "chunk_infer" => {
+                    let mut state = self.state.lock().unwrap();
+                    if let Some(idx) =
+                        detail.as_deref().and_then(parse_chunk_index)
+                    {
+                        if let Some(bar) = state.chunk_bars.remove(&idx) {
+                            bar.finish_and_clear();
+                        }
+                    }
+                }
+                "extract_infer" => {
+                    let mut state = self.state.lock().unwrap();
+                    if let Some(bar) = state.chunk_overall_bar.take() {
+                        bar.finish_and_clear();
+                    }
+                    for (_, bar) in state.chunk_bars.drain() {
+                        bar.finish_and_clear();
+                    }
+                    drop(state);
+                    self.println("");
+                }
+                "output_write" => {
+                    let path = detail
+                        .as_deref()
+                        .and_then(|d| d.strip_prefix("path="))
+                        .map(|d| d.split_whitespace().next().unwrap_or(d))
+                        .unwrap_or("output");
+                    self.println(&self.format_stage_line(
+                        &format!("wrote {path}"),
+                        "",
+                        elapsed,
+                    ));
+                }
+                _ => {}
+            },
+
+            CoreEvent::Message { level, message } => match level {
+                NotificationLevel::Warn => {
+                    self.println(&format!(
+                        "  {}",
+                        self.style_warn.apply_to(&message)
+                    ));
+                }
+                NotificationLevel::Error => {
+                    self.println(&format!(
+                        "  {}",
+                        self.style_error.apply_to(&message)
+                    ));
+                }
+                NotificationLevel::Info => {
+                    self.println(&format!("  {message}"));
+                }
+                _ => {}
             },
         }
     }
+}
+
+fn parse_chunk_count_from_message(message: &str) -> Option<usize> {
+    let parts: Vec<&str> = message.split_whitespace().collect();
+    for (i, part) in parts.iter().enumerate() {
+        if part.starts_with("chunk") && i > 0 {
+            return parts[i - 1].parse().ok();
+        }
+    }
+    None
+}
+
+fn parse_chunk_index(detail: &str) -> Option<usize> {
+    let rest = detail.strip_prefix("chunk ")?;
+    let end = rest.find(|c: char| !c.is_ascii_digit())?;
+    rest[..end].parse::<usize>().ok().map(|n| n.saturating_sub(1))
+}
+
+fn parse_t_value(detail: &str) -> Option<&str> {
+    let pos = detail.find("t=")?;
+    let rest = &detail[pos..];
+    let end = rest.find(|c: char| c != 't' && c != '=' && c != '.' && !c.is_ascii_digit());
+    Some(match end {
+        Some(end) => &rest[..end],
+        None => rest,
+    })
+}
+
+fn parse_audio_bracket(detail: &str) -> String {
+    if let Some(arrow_pos) = detail.find("-> ") {
+        let rest = &detail[arrow_pos + 3..];
+        rest.split(',').next().unwrap_or(rest).trim().to_owned()
+    } else {
+        detail.split(',').next().unwrap_or(detail).trim().to_owned()
+    }
+}
+
+fn parse_kv_usize(detail: &str, key: &str) -> Option<usize> {
+    let pos = detail.find(key)?;
+    let rest = &detail[pos + key.len()..];
+    rest.split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
 }
 
 fn main() -> ExitCode {
@@ -268,22 +652,11 @@ fn run() -> Result<()> {
 
 fn extract(args: ExtractArgs) -> Result<()> {
     let request = build_extract_request(&args);
-    let format = request
-        .output
-        .as_ref()
-        .map(ExtractOutputRequest::resolved_format)
-        .unwrap_or(ServiceExtractFormat::Midi);
-    info!(
-        "starting extract: input={} model={} output={} format={} requested_device={}",
-        args.input.display(),
-        args.model.display(),
-        args.output.display(),
-        extract_format_name(format),
-        args.device.map(extract_device_name).unwrap_or("auto")
-    );
-    let notifier = CliNotifier::root();
+    let notifier = RichNotifier::new();
+    notifier.print_banner();
     let result = run_extract_with_notifier(&request, &notifier)?;
-    print_extract_summary(&args, &result);
+    notifier.finish();
+    notifier.print_summary(&args, &result);
     Ok(())
 }
 
@@ -314,68 +687,6 @@ fn build_extract_request(args: &ExtractArgs) -> ServiceExtractRequest {
     }
 }
 
-fn print_extract_summary(args: &ExtractArgs, result: &ServiceExtractResult) {
-    if result.audio.was_resampled() || result.audio.was_downmixed() {
-        eprintln!(
-            "audio: {} Hz/{} ch -> {} Hz mono",
-            result.audio.source_sample_rate,
-            result.audio.source_channels,
-            result.audio.sample_rate
-        );
-    } else {
-        eprintln!("audio: {} Hz mono", result.audio.sample_rate);
-    }
-    eprintln!("backend: {}", backend_name(result.backend));
-    if let Some(adapter) = &result.gpu_adapter {
-        eprintln!(
-            "gpu: {} (backend={}, type={}, vendor=0x{:04x}, device=0x{:04x})",
-            adapter.name,
-            adapter.backend,
-            adapter.device_type,
-            adapter.vendor_id,
-            adapter.device_id
-        );
-    }
-    eprintln!("max_chunk_seconds: {}", args.max_chunk_seconds);
-    eprintln!("chunks: {}", result.chunk_count);
-    eprintln!("frames: {}", result.total_frames);
-    eprintln!("notes: {}", result.notes.len());
-    if let Some(output) = &result.output {
-        eprintln!("wrote {}", output.path.display());
-    }
-    eprintln!("elapsed_total: {}", format_duration(result.timings.total));
-    eprintln!(
-        "elapsed_model_load: {}",
-        format_duration(result.timings.model_load)
-    );
-    eprintln!(
-        "elapsed_audio_prepare: {}",
-        format_duration(result.timings.audio_prepare)
-    );
-    eprintln!(
-        "elapsed_slice: {}",
-        format_duration(result.timings.silence_slice)
-    );
-    eprintln!(
-        "elapsed_long_chunk_split: {}",
-        format_duration(result.timings.long_chunk_split)
-    );
-    eprintln!(
-        "elapsed_mel_setup: {}",
-        format_duration(result.timings.mel_setup)
-    );
-    eprintln!(
-        "elapsed_inference: {}",
-        format_duration(result.timings.inference)
-    );
-    eprintln!(
-        "elapsed_output_write: {}",
-        format_duration(result.timings.output_write)
-    );
-    if result.chunks_before_long_split != result.chunk_count {
-        eprintln!("chunks_before_long_split: {}", result.chunks_before_long_split);
-    }
-}
 
 fn backend_name(backend: Backend) -> &'static str {
     match backend {
@@ -421,20 +732,6 @@ fn log_level_name(level: Level) -> &'static str {
     }
 }
 
-fn extract_device_name(device: ExtractDevice) -> &'static str {
-    match device {
-        ExtractDevice::Cpu => "cpu",
-        ExtractDevice::Gpu => "gpu",
-    }
-}
-
-fn extract_format_name(format: ServiceExtractFormat) -> &'static str {
-    match format {
-        ServiceExtractFormat::Midi => "midi",
-        ServiceExtractFormat::Txt => "txt",
-        ServiceExtractFormat::Csv => "csv",
-    }
-}
 
 fn inspect(
     model_path: PathBuf,
@@ -984,8 +1281,65 @@ mod tests {
     };
 
     use super::{
-        ChunkParallelism, Cli, Command, DEFAULT_MAX_CHUNK_SECONDS, parse_u32_auto,
+        ChunkParallelism, Cli, Command, DEFAULT_MAX_CHUNK_SECONDS, parse_audio_bracket,
+        parse_chunk_count_from_message, parse_chunk_index, parse_kv_usize, parse_t_value,
+        parse_u32_auto,
     };
+
+    #[test]
+    fn parse_chunk_count_from_inference_message() {
+        assert_eq!(
+            parse_chunk_count_from_message("running inference across 5 chunk(s)"),
+            Some(5)
+        );
+        assert_eq!(
+            parse_chunk_count_from_message("running inference across 1 chunk(s)"),
+            Some(1)
+        );
+        assert_eq!(parse_chunk_count_from_message("unrelated message"), None);
+    }
+
+    #[test]
+    fn parse_chunk_index_from_detail() {
+        assert_eq!(parse_chunk_index("chunk 2/5 notes=42"), Some(1));
+        assert_eq!(parse_chunk_index("chunk 1/1: t=0.000"), Some(0));
+        assert_eq!(parse_chunk_index("chunk 10/10: t=0.500"), Some(9));
+        assert_eq!(parse_chunk_index("no chunk here"), None);
+    }
+
+    #[test]
+    fn parse_t_value_from_detail() {
+        assert_eq!(parse_t_value("t=0.444"), Some("t=0.444"));
+        assert_eq!(parse_t_value("chunk 2/5: t=0.123"), Some("t=0.123"));
+        assert_eq!(parse_t_value("no t value"), None);
+    }
+
+    #[test]
+    fn parse_audio_bracket_with_resample() {
+        assert_eq!(
+            parse_audio_bracket("44100 Hz/2 ch -> 16000 Hz mono, samples=123, duration=1.23s"),
+            "16000 Hz mono"
+        );
+    }
+
+    #[test]
+    fn parse_audio_bracket_no_resample() {
+        assert_eq!(
+            parse_audio_bracket("16000 Hz mono, samples=123, duration=1.23s"),
+            "16000 Hz mono"
+        );
+    }
+
+    #[test]
+    fn parse_kv_usize_extracts_values() {
+        assert_eq!(parse_kv_usize("chunks=5", "chunks="), Some(5));
+        assert_eq!(parse_kv_usize("frames=1024", "frames="), Some(1024));
+        assert_eq!(
+            parse_kv_usize("chunks=5 max_chunk_seconds=30", "chunks="),
+            Some(5)
+        );
+        assert_eq!(parse_kv_usize("no match", "chunks="), None);
+    }
 
     #[test]
     fn parse_u32_auto_accepts_decimal_and_hex() {
