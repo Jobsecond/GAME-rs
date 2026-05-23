@@ -1,9 +1,15 @@
-use rand_mt::Mt19937GenRand64;
+use rand_mt::Mt64;
 
 use crate::{Error, Result};
 
 const FLOAT_BITS: u32 = 24;
 const FLOAT_SCALE: f32 = 1.0 / ((1u32 << FLOAT_BITS) as f32);
+
+pub fn random_u64() -> u64 {
+    let mut buf = [0u8; 8];
+    getrandom::fill(&mut buf).expect("OS RNG unavailable");
+    u64::from_le_bytes(buf)
+}
 
 pub trait RandomSource {
     fn uniform_f32(&mut self) -> Result<f32>;
@@ -18,13 +24,13 @@ pub trait RandomSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mt19937Rng {
-    inner: Mt19937GenRand64,
+    inner: Mt64,
 }
 
 impl Mt19937Rng {
     pub fn new(seed: u64) -> Self {
         Self {
-            inner: Mt19937GenRand64::new(seed),
+            inner: Mt64::new(seed),
         }
     }
 }

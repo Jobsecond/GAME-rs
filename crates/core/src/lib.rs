@@ -28,7 +28,7 @@ pub use model::{
     bind_model_weights, build_joint_attn_mask, run_encoder, run_estimator, run_segmenter_step,
 };
 pub use notify::{CoreEvent, NotificationLevel, Notifier, NullNotifier};
-pub use rng::{InjectedRng, Mt19937Rng, RandomSource};
+pub use rng::{InjectedRng, Mt19937Rng, RandomSource, random_u64};
 pub use tensor::{CpuDevice, CpuTensor, Tensor};
 #[cfg(feature = "gpu")]
 pub use tensor::{GpuAdapterSelector, GpuDevice, GpuTensor};

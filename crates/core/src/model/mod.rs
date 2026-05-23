@@ -8,7 +8,7 @@ pub mod weights;
 use std::path::Path;
 use std::time::Instant;
 
-use rand::random;
+use crate::rng::random_u64;
 
 use crate::notify::{CoreEvent, emit, with_notifier};
 use crate::profiler::cpu_profile_session;
@@ -138,7 +138,7 @@ impl Model {
         notifier: &dyn crate::Notifier,
     ) -> Result<InferResult> {
         let seed = if params.seed == 0 {
-            random::<u64>()
+            random_u64()
         } else {
             params.seed
         };

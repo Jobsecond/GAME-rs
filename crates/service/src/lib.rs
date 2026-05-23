@@ -9,8 +9,8 @@ use game_audio::{
 #[cfg(feature = "gpu")]
 use game_core::GpuAdapterSelector;
 use game_core::{MelExtractor, Model};
+use game_core::random_u64;
 use game_output::{write_midi_file, write_text_file};
-use rand::random;
 use rayon::prelude::*;
 
 pub use game_core::{
@@ -469,7 +469,7 @@ fn run_chunked_extract_with_notifier(
             "chunk parallelism forced on but GPU backend does not support it; falling back to serial",
         );
     }
-    let random_chunk_seed_base = (parallel_chunks && params.seed == 0).then(random::<u64>);
+    let random_chunk_seed_base = (parallel_chunks && params.seed == 0).then(random_u64);
     for (index, chunk) in chunks.iter().enumerate() {
         let chunk_duration_seconds =
             chunk.waveform.len() as f64 / model.config().inference.audio_sample_rate as f64;

@@ -13,5 +13,4 @@ cpu-attention-gemm-matrixmultiply = ["game-core/cpu-attention-gemm-matrixmultipl
 game-audio = { path = "../audio" }
 game-core = { path = "../core", default-features = false }
 game-output = { path = "../output" }
-rand = "0.8"
 rayon = "1"
