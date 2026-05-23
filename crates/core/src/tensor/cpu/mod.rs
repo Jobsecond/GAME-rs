@@ -218,6 +218,13 @@ mod tests {
     }
 
     #[test]
+    fn matmul_handles_views_and_rejects_unsupported_batch_shapes() {
+        tests::run_matmul_handles_views_and_rejects_unsupported_batch_shapes::<CpuTensor>(
+            &CpuDevice,
+        );
+    }
+
+    #[test]
     fn linear_applies_weight_rows_and_optional_bias() {
         tests::run_linear_applies_weight_rows_and_optional_bias::<CpuTensor>(&CpuDevice);
     }

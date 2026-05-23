@@ -69,6 +69,17 @@ pub(crate) fn run_layout_ops_preserve_view_semantics<T: Tensor>(device: &T::Devi
         &[10.0, 30.0, 40.0, 70.0, 20.0, 50.0, 60.0, 80.0],
     );
 
+    let middle_cols = axis1.clone().slice(1, 1, 3).unwrap();
+    assert_tensor(&middle_cols, &[2, 2], &[30.0, 40.0, 50.0, 60.0]);
+
+    let transposed_col = base
+        .clone()
+        .transpose(0, 1)
+        .unwrap()
+        .slice(1, 1, 2)
+        .unwrap();
+    assert_tensor(&transposed_col, &[2, 1], &[3.0, 4.0]);
+
     let kv = tensor::<T>(
         &[2, 4],
         &[1.0, 2.0, 10.0, 20.0, 3.0, 4.0, 30.0, 40.0],
@@ -117,6 +128,37 @@ pub(crate) fn run_matmul_supports_2d_and_batched_3d_inputs<T: Tensor>(device: &T
     let batched_rhs = tensor::<T>(&[2, 2, 1], &[10.0, 20.0, 30.0, 40.0], device);
     let batched = batched_lhs.matmul(&batched_rhs).unwrap();
     assert_tensor(&batched, &[2, 2, 1], &[50.0, 110.0, 390.0, 530.0]);
+}
+
+pub(crate) fn run_matmul_handles_views_and_rejects_unsupported_batch_shapes<T: Tensor>(
+    device: &T::Device,
+) {
+    let lhs = tensor::<T>(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], device);
+    let rhs_source = tensor::<T>(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], device);
+    let rhs_view = rhs_source.transpose(0, 1).unwrap();
+    let product = lhs.matmul(&rhs_view).unwrap();
+    assert_tensor(&product, &[2, 2], &[14.0, 32.0, 32.0, 77.0]);
+
+    let empty_lhs = tensor::<T>(&[2, 0], &[], device);
+    let empty_rhs = tensor::<T>(&[0, 3], &[], device);
+    let empty_product = empty_lhs.matmul(&empty_rhs).unwrap();
+    assert_tensor(&empty_product, &[2, 3], &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+
+    let higher_rank_lhs = tensor::<T>(
+        &[2, 3, 1, 2],
+        &[
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ],
+        device,
+    );
+    let flattened_batch_rhs = tensor::<T>(
+        &[6, 2, 1],
+        &[
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ],
+        device,
+    );
+    assert!(higher_rank_lhs.matmul(&flattened_batch_rhs).is_err());
 }
 
 pub(crate) fn run_linear_applies_weight_rows_and_optional_bias<T: Tensor>(device: &T::Device) {
