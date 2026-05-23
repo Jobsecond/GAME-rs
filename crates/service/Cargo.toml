@@ -6,7 +6,6 @@ edition = "2024"
 [features]
 default = []
 gpu = ["game-core/gpu"]
-mkl = ["game-core/mkl"]
 cpu-attention-gemm-gemm = ["game-core/cpu-attention-gemm-gemm"]
 cpu-attention-gemm-matrixmultiply = ["game-core/cpu-attention-gemm-matrixmultiply"]
 

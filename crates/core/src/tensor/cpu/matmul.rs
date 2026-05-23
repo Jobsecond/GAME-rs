@@ -11,7 +11,81 @@ use super::util::*;
 
 impl CpuTensor {
     pub(super) fn matmul(&self, rhs: &Self) -> Result<Self> {
-        Ok(Self::from_tensor(self.tensor.matmul(&rhs.tensor)?))
+        let lhs_shape = self.shape();
+        let rhs_shape = rhs.shape();
+        let lhs_rank = lhs_shape.len();
+        let rhs_rank = rhs_shape.len();
+
+        if lhs_rank < 2 || rhs_rank < 2 {
+            return Err(invalid_arg(format!(
+                "matmul requires rank >= 2, got {:?} and {:?}",
+                lhs_shape, rhs_shape
+            )));
+        }
+
+        let m = lhs_shape[lhs_rank - 2];
+        let k = lhs_shape[lhs_rank - 1];
+        let n = rhs_shape[rhs_rank - 1];
+        if rhs_shape[rhs_rank - 2] != k {
+            return Err(invalid_arg(format!(
+                "matmul inner dimension mismatch: {:?} and {:?}",
+                lhs_shape, rhs_shape
+            )));
+        }
+
+        if lhs_rank == 2 && rhs_rank == 2 {
+            return self.with_contiguous_data(|lhs_data| {
+                rhs.with_contiguous_data(|rhs_data| {
+                    let mut out = vec![0.0; m * n];
+                    unsafe {
+                        gemm::gemm(
+                            m, n, k,
+                            out.as_mut_ptr(), 1, n as isize, false,
+                            lhs_data.as_ptr(), 1, k as isize,
+                            rhs_data.as_ptr(), 1, n as isize,
+                            0.0, 1.0, false, false, false, Parallelism::None,
+                        );
+                    }
+                    Self::from_owned(out, &[m, n])
+                })
+            });
+        }
+
+        let batch: usize = lhs_shape[..lhs_rank - 2].iter().product();
+        let rhs_batch: usize = rhs_shape[..rhs_rank - 2].iter().product();
+        if batch != rhs_batch {
+            return Err(invalid_arg(format!(
+                "matmul batch dimension mismatch: {:?} and {:?}",
+                lhs_shape, rhs_shape
+            )));
+        }
+
+        self.with_contiguous_data(|lhs_data| {
+            rhs.with_contiguous_data(|rhs_data| {
+                let lhs_batch_stride = m * k;
+                let rhs_batch_stride = k * n;
+                let out_batch_stride = m * n;
+                let mut out = vec![0.0; batch * out_batch_stride];
+                for b in 0..batch {
+                    let lhs_ptr = unsafe { lhs_data.as_ptr().add(b * lhs_batch_stride) };
+                    let rhs_ptr = unsafe { rhs_data.as_ptr().add(b * rhs_batch_stride) };
+                    let out_ptr = unsafe { out.as_mut_ptr().add(b * out_batch_stride) };
+                    unsafe {
+                        gemm::gemm(
+                            m, n, k,
+                            out_ptr, 1, n as isize, false,
+                            lhs_ptr, 1, k as isize,
+                            rhs_ptr, 1, n as isize,
+                            0.0, 1.0, false, false, false, Parallelism::None,
+                        );
+                    }
+                }
+                let mut out_shape = lhs_shape[..lhs_rank - 2].to_vec();
+                out_shape.push(m);
+                out_shape.push(n);
+                Self::from_owned(out, &out_shape)
+            })
+        })
     }
 
     pub(super) fn linear(&self, weight: &Self, bias: Option<&Self>) -> Result<Self> {
@@ -21,8 +95,8 @@ impl CpuTensor {
                 self.shape(),
                 weight.shape(),
                 bias.is_some(),
-                self.tensor.is_contiguous(),
-                weight.tensor.is_contiguous()
+                self.is_contiguous(),
+                weight.is_contiguous()
             )
         });
         let input_shape = self.shape();

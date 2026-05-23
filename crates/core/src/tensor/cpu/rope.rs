@@ -23,7 +23,7 @@ impl CpuTensor {
                 head_dim,
                 num_heads,
                 rope_dims,
-                self.tensor.is_contiguous()
+                self.is_contiguous()
             )
         });
         let shape = self.shape().to_vec();
@@ -83,7 +83,7 @@ impl CpuTensor {
                 head_dim,
                 num_heads,
                 rope_dims,
-                self.tensor.is_contiguous()
+                self.is_contiguous()
             )
         });
         let shape = self.shape().to_vec();

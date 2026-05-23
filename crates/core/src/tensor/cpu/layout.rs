@@ -53,7 +53,7 @@ impl CpuTensor {
                 parts,
                 num_heads,
                 head_dim,
-                self.tensor.is_contiguous()
+                self.is_contiguous()
             )
         });
         let (seq_len, part_dim) =
@@ -107,30 +107,82 @@ impl CpuTensor {
     }
 
     pub(super) fn reshape(self, shape: &[usize]) -> Result<Self> {
-        Ok(Self::from_tensor(self.tensor.reshape(shape.to_vec())?))
+        let new_n = checked_num_elements(shape)?;
+        let old_n = self.num_elements();
+        if new_n != old_n {
+            return Err(invalid_arg(format!(
+                "reshape: cannot reshape {:?} ({} elements) to {:?} ({} elements)",
+                self.shape, old_n, shape, new_n
+            )));
+        }
+        if self.is_contiguous() {
+            Ok(Self {
+                data: self.data,
+                shape: shape.to_vec(),
+                strides: contiguous_strides(shape),
+                offset: self.offset,
+                device: self.device,
+            })
+        } else {
+            let data = self.to_vec()?;
+            Self::from_owned(data, shape)
+        }
     }
 
     pub(super) fn transpose(self, dim0: usize, dim1: usize) -> Result<Self> {
-        Ok(Self::from_tensor(self.tensor.transpose(dim0, dim1)?))
+        let rank = self.shape.len();
+        if dim0 >= rank || dim1 >= rank {
+            return Err(invalid_arg(format!(
+                "transpose: dimensions ({}, {}) out of range for rank {}",
+                dim0, dim1, rank
+            )));
+        }
+        let mut shape = self.shape;
+        let mut strides = self.strides;
+        shape.swap(dim0, dim1);
+        strides.swap(dim0, dim1);
+        Ok(Self {
+            data: self.data,
+            shape,
+            strides,
+            offset: self.offset,
+            device: self.device,
+        })
     }
 
     pub(super) fn contiguous(self) -> Result<Self> {
-        Ok(Self::from_tensor(self.tensor.contiguous()?))
+        if self.is_contiguous() {
+            return Ok(self);
+        }
+        let shape = self.shape.clone();
+        let data = self.to_vec()?;
+        Self::from_owned(data, &shape)
     }
 
     pub(super) fn slice(self, axis: usize, start: usize, end: usize) -> Result<Self> {
-        validate_axis(axis, self.shape().len(), "slice")?;
+        validate_axis(axis, self.shape.len(), "slice")?;
         if end < start {
             return Err(invalid_arg(format!(
                 "slice end {} is less than start {}",
                 end, start
             )));
         }
-        Ok(Self::from_tensor(self.tensor.narrow(
-            axis,
-            start,
-            end - start,
-        )?))
+        if end > self.shape[axis] {
+            return Err(invalid_arg(format!(
+                "slice end {} exceeds dimension size {} on axis {}",
+                end, self.shape[axis], axis
+            )));
+        }
+        let new_offset = self.offset + start * self.strides[axis];
+        let mut new_shape = self.shape;
+        new_shape[axis] = end - start;
+        Ok(Self {
+            data: self.data,
+            shape: new_shape,
+            strides: self.strides,
+            offset: new_offset,
+            device: self.device,
+        })
     }
 
     pub(super) fn layout_for_attention_heads(
@@ -144,7 +196,7 @@ impl CpuTensor {
                 self.shape(),
                 num_heads,
                 head_dim,
-                self.tensor.is_contiguous()
+                self.is_contiguous()
             )
         });
         if self.shape().len() != 2 {
@@ -247,7 +299,7 @@ impl CpuTensor {
             format!(
                 "shape={:?} contiguous={}",
                 self.shape(),
-                self.tensor.is_contiguous()
+                self.is_contiguous()
             )
         });
         if self.shape().len() != 3 {

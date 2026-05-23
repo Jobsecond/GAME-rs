@@ -1,4 +1,3 @@
-use candle_core::Storage;
 use rayon::prelude::*;
 
 use crate::Result;
@@ -42,25 +41,15 @@ impl CpuTensor {
                 k_t.shape()
             )));
         }
-        let (q_storage, q_layout) = q.tensor.storage_and_layout();
-        let q_data = match &*q_storage {
-            Storage::Cpu(storage) => storage.as_slice::<f32>()?,
-            _ => return Err(invalid_arg("CpuTensor expected CPU storage for q")),
-        };
-        let q_ptr = q_data[q_layout.start_offset()..].as_ptr() as usize;
-        let q_batch_stride = q_layout.stride()[0];
-        let q_rs = q_layout.stride()[1] as isize;
-        let q_cs = q_layout.stride()[2] as isize;
+        let q_ptr = q.data_ptr() as usize;
+        let q_batch_stride = q.strides[0];
+        let q_rs = q.strides[1] as isize;
+        let q_cs = q.strides[2] as isize;
 
-        let (k_storage, k_layout) = k_t.tensor.storage_and_layout();
-        let k_data = match &*k_storage {
-            Storage::Cpu(storage) => storage.as_slice::<f32>()?,
-            _ => return Err(invalid_arg("CpuTensor expected CPU storage for k_t")),
-        };
-        let k_ptr = k_data[k_layout.start_offset()..].as_ptr() as usize;
-        let k_batch_stride = k_layout.stride()[0];
-        let k_rs = k_layout.stride()[1] as isize;
-        let k_cs = k_layout.stride()[2] as isize;
+        let k_ptr = k_t.data_ptr() as usize;
+        let k_batch_stride = k_t.strides[0];
+        let k_rs = k_t.strides[1] as isize;
+        let k_cs = k_t.strides[2] as isize;
 
         let mask_shape = mask.map(|mask| mask.shape().to_vec());
         if let Some(mask_shape) = mask_shape.as_deref()
@@ -73,53 +62,36 @@ impl CpuTensor {
             )));
         }
 
-        let (mask_guard, mask_owned, mask_layout_owned) = if let Some(mask) = mask {
-            let (storage, layout) = mask.tensor.storage_and_layout();
-            let owned = if layout.contiguous_offsets().is_none() {
-                Some(mask.to_vec()?)
+        let (mask_data_owned, mask_data_borrowed): (Option<Vec<f32>>, Option<&[f32]>) =
+            if let Some(mask) = mask {
+                if mask.is_contiguous() {
+                    let n = mask.num_elements();
+                    (None, Some(&mask.data[mask.offset..mask.offset + n]))
+                } else {
+                    (Some(mask.to_vec()?), None)
+                }
             } else {
-                None
+                (None, None)
             };
-            (Some(storage), owned, Some(layout.clone()))
-        } else {
-            (None, None, None)
-        };
-        let mask_data: Option<&[f32]> = if let (Some(storage), Some(layout)) =
-            (mask_guard.as_ref(), mask_layout_owned.as_ref())
-        {
-            if let Some((start, end)) = layout.contiguous_offsets() {
-                let data = match &**storage {
-                    Storage::Cpu(storage) => storage.as_slice::<f32>()?,
-                    _ => return Err(invalid_arg("CpuTensor expected CPU storage for mask")),
-                };
-                Some(&data[start..end])
+        let mask_data: Option<&[f32]> = mask_data_borrowed.or(mask_data_owned.as_deref());
+        let mask_is_contiguous_copy = mask_data_owned.is_some();
+        let mask_outer_stride = mask.map(|mask| {
+            if mask_is_contiguous_copy {
+                key_len
             } else {
-                mask_owned.as_deref()
+                match mask.shape().len() {
+                    2 => mask.strides[0],
+                    3 => mask.strides[1],
+                    _ => 0,
+                }
             }
-        } else {
-            None
-        };
-        let mask_is_contiguous_copy = mask_owned.is_some();
-        let mask_outer_stride =
-            mask_layout_owned
-                .as_ref()
-                .map(|layout| {
-                    if mask_is_contiguous_copy {
-                        key_len
-                    } else {
-                        match layout.dims().len() {
-                            2 => layout.stride()[0],
-                            3 => layout.stride()[1],
-                            _ => 0,
-                        }
-                    }
-                });
-        let mask_head_stride = mask_layout_owned.as_ref().and_then(|layout| {
-            if layout.dims().len() == 3 {
+        });
+        let mask_head_stride = mask.and_then(|mask| {
+            if mask.shape().len() == 3 {
                 if mask_is_contiguous_copy {
                     Some(query_len * key_len)
                 } else {
-                    Some(layout.stride()[0])
+                    Some(mask.strides[0])
                 }
             } else {
                 None
@@ -232,30 +204,16 @@ impl CpuTensor {
         if heads != v_heads || key_len != v_key_len {
             return probs.matmul(v);
         }
-        let (probs_storage, probs_layout) = probs.tensor.storage_and_layout();
-        let probs_data = match &*probs_storage {
-            Storage::Cpu(storage) => storage.as_slice::<f32>()?,
-            _ => return Err(invalid_arg("CpuTensor expected CPU storage for probs")),
-        };
-        let probs_ptr = probs_data[probs_layout.start_offset()..].as_ptr() as usize;
-        let probs_batch_stride = probs_layout.stride()[0];
-        let probs_rs = probs_layout.stride()[1] as isize;
-        let probs_cs = probs_layout.stride()[2] as isize;
-        let probs_row_stride = probs_layout.stride()[1];
+        let probs_ptr = probs.data_ptr() as usize;
+        let probs_batch_stride = probs.strides[0];
+        let probs_rs = probs.strides[1] as isize;
+        let probs_cs = probs.strides[2] as isize;
+        let probs_row_stride = probs.strides[1];
 
-        let (v_storage, v_layout) = v.tensor.storage_and_layout();
-        let v_data = match &*v_storage {
-            Storage::Cpu(storage) => storage.as_slice::<f32>()?,
-            _ => {
-                return Err(invalid_arg(
-                    "CpuTensor expected CPU storage for value tensor",
-                ));
-            }
-        };
-        let v_ptr = v_data[v_layout.start_offset()..].as_ptr() as usize;
-        let v_batch_stride = v_layout.stride()[0];
-        let v_rs = v_layout.stride()[1] as isize;
-        let v_cs = v_layout.stride()[2] as isize;
+        let v_ptr = v.data_ptr() as usize;
+        let v_batch_stride = v.strides[0];
+        let v_rs = v.strides[1] as isize;
+        let v_cs = v.strides[2] as isize;
 
         let mut out = vec![0.0; heads * query_len * head_dim];
         let head_block = query_len * head_dim;
@@ -413,49 +371,28 @@ impl CpuTensor {
         let mask_shape = mask.map(|m| m.shape().to_vec());
         let mask_2d = mask_shape.as_deref().map(|s| s.len() == 2).unwrap_or(false);
 
-        // Build k_t layout pointers like original attention_score_softmax does
         let k_t = k.clone().transpose(1, 2)?;
-        let (k_storage, k_layout) = k_t.tensor.storage_and_layout();
-        let k_data = match &*k_storage {
-            Storage::Cpu(storage) => storage.as_slice::<f32>()?,
-            _ => return Err(invalid_arg("CpuTensor expected CPU storage for k_t")),
-        };
-        let k_ptr = k_data[k_layout.start_offset()..].as_ptr() as usize;
-        let k_batch_stride = k_layout.stride()[0];
-        let k_rs = k_layout.stride()[1] as isize;
-        let k_cs = k_layout.stride()[2] as isize;
+        let k_ptr = k_t.data_ptr() as usize;
+        let k_batch_stride = k_t.strides[0];
+        let k_rs = k_t.strides[1] as isize;
+        let k_cs = k_t.strides[2] as isize;
 
-        // q layout
-        let (q_storage, q_layout) = q.tensor.storage_and_layout();
-        let q_data = match &*q_storage {
-            Storage::Cpu(storage) => storage.as_slice::<f32>()?,
-            _ => return Err(invalid_arg("CpuTensor expected CPU storage for q")),
-        };
-        let q_ptr = q_data[q_layout.start_offset()..].as_ptr() as usize;
-        let q_batch_stride = q_layout.stride()[0];
-        let q_rs = q_layout.stride()[1] as isize;
-        let q_cs = q_layout.stride()[2] as isize;
+        let q_ptr = q.data_ptr() as usize;
+        let q_batch_stride = q.strides[0];
+        let q_rs = q.strides[1] as isize;
+        let q_cs = q.strides[2] as isize;
 
-        // v layout
-        let (v_storage, v_layout) = v.tensor.storage_and_layout();
-        let v_data = match &*v_storage {
-            Storage::Cpu(storage) => storage.as_slice::<f32>()?,
-            _ => return Err(invalid_arg("CpuTensor expected CPU storage for v")),
-        };
-        let v_ptr = v_data[v_layout.start_offset()..].as_ptr() as usize;
-        let v_batch_stride = v_layout.stride()[0];
-        let v_rs = v_layout.stride()[1] as isize;
-        let v_cs = v_layout.stride()[2] as isize;
+        let v_ptr = v.data_ptr() as usize;
+        let v_batch_stride = v.strides[0];
+        let v_rs = v.strides[1] as isize;
+        let v_cs = v.strides[2] as isize;
 
-        // mask data as Vec
         let mask_owned: Option<Vec<f32>> = mask.map(|m| m.to_vec()).transpose()?;
 
-        // Allocate scores as a single Vec (not a Tensor) like original pattern
         let mut scores = vec![0.0; heads * q_len * key_len];
         let score_head_stride = q_len * key_len;
         let score_row_stride = key_len;
 
-        // Phase 1: GEMM scores = q @ k_t (with scale) – parallel across heads
         let score_rs = key_len as isize;
         let score_cs = 1isize;
         if should_parallelize(heads * q_len * key_len) && key_len > 0 && head_dim > 0 {
@@ -513,7 +450,6 @@ impl CpuTensor {
             }
         }
 
-        // Phase 2: mask + softmax – parallel across ALL score rows
         let total_score_rows = heads * q_len;
         let mask_ref: Option<&[f32]> = mask_owned.as_deref();
         if should_parallelize(total_score_rows * key_len) && key_len > 0 {
@@ -555,7 +491,6 @@ impl CpuTensor {
             }
         }
 
-        // Phase 3: GEMM out = scores @ v – parallel across heads
         let mut out = vec![0.0; heads * q_len * head_dim];
         let out_head_stride = q_len * head_dim;
         if should_parallelize(heads * q_len * head_dim) && key_len > 0 && head_dim > 0 {

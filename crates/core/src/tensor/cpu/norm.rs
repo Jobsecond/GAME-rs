@@ -13,8 +13,8 @@ impl CpuTensor {
                 "input={:?} weight={:?} contiguous_input={} contiguous_weight={}",
                 self.shape(),
                 weight.shape(),
-                self.tensor.is_contiguous(),
-                weight.tensor.is_contiguous()
+                self.is_contiguous(),
+                weight.is_contiguous()
             )
         });
         if self.shape().is_empty() {

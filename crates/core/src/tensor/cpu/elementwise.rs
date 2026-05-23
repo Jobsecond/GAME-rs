@@ -199,7 +199,7 @@ impl CpuTensor {
             format!(
                 "shape={:?} contiguous={}",
                 self.shape(),
-                self.tensor.is_contiguous()
+                self.is_contiguous()
             )
         });
         let shape = self.shape().to_vec();
@@ -263,7 +263,7 @@ impl CpuTensor {
                 "shape={:?} axis={} contiguous={}",
                 self.shape(),
                 axis,
-                self.tensor.is_contiguous()
+                self.is_contiguous()
             )
         });
         if self.shape().is_empty() {

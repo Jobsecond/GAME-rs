@@ -22,8 +22,8 @@ impl CpuTensor {
                 bias.is_some(),
                 stride,
                 padding,
-                self.tensor.is_contiguous(),
-                kernel.tensor.is_contiguous()
+                self.is_contiguous(),
+                kernel.is_contiguous()
             )
         });
         if stride == 0 {
