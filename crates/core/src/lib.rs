@@ -7,11 +7,11 @@ pub mod gguf_loader;
 pub mod mel;
 pub mod model;
 pub mod notify;
+#[path = "profiler.rs"]
+mod profiler;
 pub mod rng;
 pub mod tensor;
 pub mod types;
-#[path = "profiler.rs"]
-mod profiler;
 
 pub use config::{BackboneConfig, GameModelConfig, InferenceConfig};
 pub use d3pm::{d3pm_time_schedule, remove_mutable_boundaries, remove_mutable_boundaries_into};

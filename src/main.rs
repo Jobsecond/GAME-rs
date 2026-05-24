@@ -13,7 +13,7 @@ use game_core::{
     NotificationLevel, Notifier, Result, load_gguf,
 };
 use game_service::{
-    DEFAULT_MAX_CHUNK_SECONDS, ChunkParallelism as ServiceChunkParallelism,
+    ChunkParallelism as ServiceChunkParallelism, DEFAULT_MAX_CHUNK_SECONDS,
     ExtractDevice as ServiceExtractDevice, ExtractFormat as ServiceExtractFormat,
     ExtractOutputRequest, ExtractRequest as ServiceExtractRequest,
     ExtractResult as ServiceExtractResult, GpuSelector as ServiceGpuSelector,
@@ -173,9 +173,11 @@ impl From<ChunkParallelism> for ServiceChunkParallelism {
 }
 
 const STAGE_LINE_WIDTH: usize = 50;
+const INSPECT_LABEL_WIDTH: usize = 18;
+const INSPECT_VALUE_WIDTH: usize = 52;
 
 struct RichState {
-    chunk_bars: HashMap<usize, ProgressBar>,
+    chunk_status_bars: HashMap<usize, (ProgressBar, String)>,
     chunk_overall_bar: Option<ProgressBar>,
     total_chunks: Option<usize>,
     completed_chunks: usize,
@@ -185,7 +187,6 @@ struct RichState {
 struct RichNotifier {
     multi: MultiProgress,
     state: Mutex<RichState>,
-    use_color: bool,
     use_progress: bool,
     style_label: Style,
     style_timing: Style,
@@ -193,6 +194,9 @@ struct RichNotifier {
     style_error: Style,
     style_dim: Style,
     style_title: Style,
+    style_header: Style,
+    style_processing: Style,
+    style_completed: Style,
 }
 
 impl RichNotifier {
@@ -208,38 +212,52 @@ impl RichNotifier {
             MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
         };
 
-        let (style_label, style_timing, style_warn, style_error, style_dim, style_title) =
-            if use_color {
-                (
-                    Style::new().cyan(),
-                    Style::new().green(),
-                    Style::new().yellow(),
-                    Style::new().red(),
-                    Style::new().dim(),
-                    Style::new().cyan().bold(),
-                )
-            } else {
-                let plain = Style::new();
-                (
-                    plain.clone(),
-                    plain.clone(),
-                    plain.clone(),
-                    plain.clone(),
-                    plain.clone(),
-                    plain,
-                )
-            };
+        let (
+            style_label,
+            style_timing,
+            style_warn,
+            style_error,
+            style_dim,
+            style_title,
+            style_header,
+            style_processing,
+            style_completed,
+        ) = if use_color {
+            (
+                Style::new().cyan(),
+                Style::new().green(),
+                Style::new().yellow(),
+                Style::new().red(),
+                Style::new().dim(),
+                Style::new().cyan().bold(),
+                Style::new().white().bold(),
+                Style::new().cyan().bold(),
+                Style::new().green().bold(),
+            )
+        } else {
+            let plain = Style::new();
+            (
+                plain.clone(),
+                plain.clone(),
+                plain.clone(),
+                plain.clone(),
+                plain.clone(),
+                plain.clone(),
+                plain.clone(),
+                plain.clone(),
+                plain,
+            )
+        };
 
         Self {
             multi,
             state: Mutex::new(RichState {
-                chunk_bars: HashMap::new(),
+                chunk_status_bars: HashMap::new(),
                 chunk_overall_bar: None,
                 total_chunks: None,
                 completed_chunks: 0,
                 silence_chunk_count: None,
             }),
-            use_color,
             use_progress,
             style_label,
             style_timing,
@@ -247,14 +265,27 @@ impl RichNotifier {
             style_error,
             style_dim,
             style_title,
+            style_header,
+            style_processing,
+            style_completed,
         }
     }
 
+    fn term_width(&self) -> usize {
+        let (_, cols) = console::Term::stderr().size();
+        if cols == 0 { usize::MAX } else { cols as usize }
+    }
+
+    fn truncate(&self, text: &str) -> String {
+        console::truncate_str(text, self.term_width(), "").to_string()
+    }
+
     fn println(&self, line: &str) {
+        let out = self.truncate(line);
         if self.use_progress {
-            let _ = self.multi.println(line);
+            self.multi.suspend(|| eprintln!("{out}"));
         } else {
-            eprintln!("{line}");
+            eprintln!("{out}");
         }
     }
 
@@ -270,11 +301,7 @@ impl RichNotifier {
         let colored_left = if bracket.is_empty() {
             format!("  {}", self.style_label.apply_to(label))
         } else {
-            format!(
-                "  {} [{}]",
-                self.style_label.apply_to(label),
-                bracket
-            )
+            format!("  {} [{}]", self.style_label.apply_to(label), bracket)
         };
         format!(
             "{colored_left}{:pad$}{}",
@@ -289,84 +316,82 @@ impl RichNotifier {
             return;
         }
 
-        let mut state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap();
         let chunk_idx = detail.and_then(parse_chunk_index).unwrap_or(0);
-        let total_chunks = state.total_chunks.unwrap_or(1);
 
-        if !state.chunk_bars.contains_key(&chunk_idx) {
-            let bar = if let Some(overall) = &state.chunk_overall_bar {
-                self.multi
-                    .insert_before(overall, ProgressBar::new(total as u64))
-            } else {
-                self.multi.add(ProgressBar::new(total as u64))
-            };
-            let prefix = if total_chunks > 1 {
-                format!("D3PM {}/{total_chunks}", chunk_idx + 1)
-            } else {
-                "D3PM".to_owned()
-            };
-            bar.set_style(
-                ProgressStyle::with_template(
-                    "  {prefix}  [{bar:28}] {pos}/{len} steps  {msg}  {elapsed}",
-                )
-                .unwrap()
-                .progress_chars("##-"),
+        if let Some((bar, chunk_info)) = state.chunk_status_bars.get(&chunk_idx) {
+            let step_info = format!("step {current}/{total}");
+            let msg = format!(
+                "  {} {chunk_info}  {step_info}",
+                self.style_processing.apply_to("Processing"),
             );
-            bar.set_prefix(prefix);
-            state.chunk_bars.insert(chunk_idx, bar);
-        }
-
-        let bar = &state.chunk_bars[&chunk_idx];
-        bar.set_position(current as u64);
-        let t_val = detail.and_then(parse_t_value).unwrap_or("");
-        bar.set_message(t_val.to_owned());
-
-        if current >= total {
-            bar.finish_and_clear();
-        }
-    }
-
-    fn advance_chunk_bar(state: &mut RichState) {
-        state.completed_chunks += 1;
-        if let Some(bar) = &state.chunk_overall_bar {
-            bar.set_position(state.completed_chunks as u64);
+            bar.set_message(self.truncate(&msg));
         }
     }
 
     fn finish(&self) {
         let mut state = self.state.lock().unwrap();
-        for (_, bar) in state.chunk_bars.drain() {
+        if let Some(bar) = state.chunk_overall_bar.take() {
             bar.finish_and_clear();
         }
-        if let Some(bar) = state.chunk_overall_bar.take() {
+        for (_, (bar, _)) in state.chunk_status_bars.drain() {
             bar.finish_and_clear();
         }
     }
 
     fn print_banner(&self) {
         let title = "GAME - Generative Adaptive MIDI Extractor";
-        if self.use_color {
-            self.println(&format!("{}", self.style_title.apply_to(title)));
-        } else {
-            self.println(title);
-        }
-        self.println(&"\u{2500}".repeat(title.len()));
+        self.println(&format!("{}", self.style_title.apply_to(title)));
+        self.println(&format!(
+            "{}",
+            self.style_dim.apply_to("─".repeat(title.len()))
+        ));
+        self.println("");
+    }
+
+    fn print_run_context(&self, args: &ExtractArgs) {
+        self.println(&format!("{}", self.style_header.apply_to("Run")));
+        self.println(&format!(
+            "{}",
+            self.style_dim.apply_to("─".repeat(STAGE_LINE_WIDTH))
+        ));
+        self.print_summary_kv("Model", &args.model.display().to_string());
+        self.print_summary_kv("Input", &args.input.display().to_string());
+        self.print_summary_kv("Output", &args.output.display().to_string());
+        self.print_summary_kv(
+            "Device",
+            &args
+                .device
+                .map(|device| format!("{device:?}").to_lowercase())
+                .unwrap_or_else(|| "auto".to_owned()),
+        );
+        self.print_summary_kv(
+            "Format",
+            &args
+                .format
+                .map(|format| format!("{format:?}").to_lowercase())
+                .unwrap_or_else(|| "auto".to_owned()),
+        );
+        self.print_summary_kv(
+            "Parallel",
+            &format!("{:?}", args.chunk_parallelism).to_lowercase(),
+        );
         self.println("");
     }
 
     fn print_summary(&self, _args: &ExtractArgs, result: &ServiceExtractResult) {
-        let sep = "\u{2500}".repeat(STAGE_LINE_WIDTH);
-        self.println(&sep);
+        self.println(&format!("{}", self.style_header.apply_to("Summary")));
         self.println(&format!(
-            "  {}",
-            self.style_label.apply_to("Result")
+            "{}",
+            self.style_dim.apply_to("─".repeat(STAGE_LINE_WIDTH))
         ));
-        self.println(&sep);
 
         let audio_val = if result.audio.was_resampled() || result.audio.was_downmixed() {
             format!(
-                "{} Hz/{} ch -> {} Hz mono",
-                result.audio.source_sample_rate, result.audio.source_channels, result.audio.sample_rate
+                "{} Hz/{} ch → {} Hz mono",
+                result.audio.source_sample_rate,
+                result.audio.source_channels,
+                result.audio.sample_rate
             )
         } else {
             format!("{} Hz mono", result.audio.sample_rate)
@@ -380,14 +405,23 @@ impl RichNotifier {
         self.print_summary_kv("Frames", &format_count(result.total_frames as u64));
         self.print_summary_kv("Notes", &result.notes.len().to_string());
         if let Some(output) = &result.output {
+            self.print_summary_kv("Format", &format!("{:?}", output.format).to_lowercase());
             self.print_summary_kv("Output", &output.path.display().to_string());
         }
+        self.print_summary_kv(
+            "Realtime",
+            &format!(
+                "{:.2}x",
+                if result.timings.inference.is_zero() {
+                    0.0
+                } else {
+                    result.audio.duration_seconds() / result.timings.inference.as_secs_f64()
+                }
+            ),
+        );
 
         self.println("");
-        self.println(&format!(
-            "  {}",
-            self.style_label.apply_to("Timings")
-        ));
+        self.println(&format!("{}", self.style_header.apply_to("Timings")));
         self.print_timing_row("model load", result.timings.model_load);
         self.print_timing_row("audio prepare", result.timings.audio_prepare);
         self.print_timing_row("silence slice", result.timings.silence_slice);
@@ -398,33 +432,28 @@ impl RichNotifier {
         self.print_timing_row("inference", result.timings.inference);
         self.print_timing_row("output write", result.timings.output_write);
         self.println(&format!(
-            "  {}",
-            self.style_dim.apply_to(&"\u{2500}".repeat(40))
+            "{}",
+            self.style_dim.apply_to("─".repeat(STAGE_LINE_WIDTH))
         ));
         self.print_timing_row("total", result.timings.total);
     }
 
     fn print_summary_kv(&self, label: &str, value: &str) {
         self.println(&format!(
-            "  {:<12}{}",
+            "  {:<width$}{}",
             self.style_label.apply_to(label),
-            value
+            value,
+            width = INSPECT_LABEL_WIDTH
         ));
     }
 
     fn print_timing_row(&self, label: &str, duration: Duration) {
         let value = format_duration(duration);
-        let total_dots_width = 38usize.saturating_sub(label.len() + value.len());
-        let dot_pairs = total_dots_width / 2;
-        let extra = total_dots_width % 2;
-        let dots = format!(
-            "{}{}",
-            " .".repeat(dot_pairs),
-            if extra == 1 { " " } else { "" }
-        );
         self.println(&format!(
-            "  {label} {dots} {}",
-            self.style_timing.apply_to(&value)
+            "  {:<width$}{}",
+            self.style_label.apply_to(label),
+            self.style_timing.apply_to(&value),
+            width = INSPECT_LABEL_WIDTH
         ));
     }
 }
@@ -445,16 +474,49 @@ impl Notifier for RichNotifier {
                             let bar = self.multi.add(ProgressBar::new(count as u64));
                             bar.set_style(
                                 ProgressStyle::with_template(
-                                    "  chunks [{bar:20}] {pos}/{len}  {elapsed}",
+                                    "  chunks [{bar:20}] {pos}/{len}  {msg}  {elapsed}",
                                 )
                                 .unwrap()
                                 .progress_chars("##-"),
                             );
+                            bar.set_message("starting");
                             bar.enable_steady_tick(Duration::from_millis(250));
                             state.chunk_overall_bar = Some(bar);
                         }
                     }
                     self.println("");
+                }
+                "chunk_infer" => {
+                    let chunk_info = format_chunk_status(&message);
+                    let idx = parse_chunk_index(&message).unwrap_or(0);
+                    if self.use_progress {
+                        let mut state = self.state.lock().unwrap();
+                        let bar = if let Some(overall) = &state.chunk_overall_bar {
+                            self.multi.insert_before(overall, ProgressBar::new(0))
+                        } else {
+                            self.multi.add(ProgressBar::new(0))
+                        };
+                        bar.set_style(ProgressStyle::with_template("{msg}").unwrap());
+                        let msg = format!(
+                            "  {} {chunk_info}",
+                            self.style_processing.apply_to("Processing")
+                        );
+                        bar.set_message(self.truncate(&msg));
+                        state
+                            .chunk_status_bars
+                            .insert(idx, (bar, chunk_info.clone()));
+                        if let Some(overall) = &state.chunk_overall_bar {
+                            overall.set_message(self.truncate(&format!(
+                                "{} {chunk_info}",
+                                self.style_processing.apply_to("Active"),
+                            )));
+                        }
+                    } else {
+                        self.println(&format!(
+                            "  {} {chunk_info}",
+                            self.style_processing.apply_to("Processing")
+                        ));
+                    }
                 }
                 _ => {}
             },
@@ -491,11 +553,7 @@ impl Notifier for RichNotifier {
                             format!("{n} chunk{}", if n != 1 { "s" } else { "" })
                         })
                         .unwrap_or_default();
-                    self.println(&self.format_stage_line(
-                        "sliced on silence",
-                        &bracket,
-                        elapsed,
-                    ));
+                    self.println(&self.format_stage_line("sliced on silence", &bracket, elapsed));
                 }
                 "long_chunk_split" => {
                     let after = detail.as_deref().and_then(|d| parse_kv_usize(d, "chunks="));
@@ -520,26 +578,44 @@ impl Notifier for RichNotifier {
                     self.println(&self.format_stage_line("mel setup", &bracket, elapsed));
                 }
                 "infer_total" => {
+                    let idx = detail.as_deref().and_then(parse_chunk_index).unwrap_or(0);
+                    let elapsed_str = format!("elapsed={}", format_duration(elapsed));
                     let mut state = self.state.lock().unwrap();
-                    Self::advance_chunk_bar(&mut state);
-                }
-                "chunk_infer" => {
-                    let mut state = self.state.lock().unwrap();
-                    if let Some(idx) =
-                        detail.as_deref().and_then(parse_chunk_index)
-                    {
-                        if let Some(bar) = state.chunk_bars.remove(&idx) {
-                            bar.finish_and_clear();
-                        }
+                    if let Some((bar, chunk_info)) = state.chunk_status_bars.get(&idx) {
+                        let msg = format!(
+                            "   {} {chunk_info}  {}",
+                            self.style_completed.apply_to("Completed"),
+                            self.style_timing.apply_to(&elapsed_str),
+                        );
+                        bar.set_message(self.truncate(&msg));
+                        bar.finish_and_clear();
+                    } else if !self.use_progress {
+                        let chunk_label = detail.as_deref().unwrap_or("chunk");
+                        self.println(&format!(
+                            "   {} {chunk_label}  {}",
+                            self.style_completed.apply_to("Completed"),
+                            self.style_timing.apply_to(&elapsed_str),
+                        ));
+                    }
+                    state.completed_chunks += 1;
+                    if let Some(bar) = &state.chunk_overall_bar {
+                        bar.set_position(state.completed_chunks as u64);
+                        bar.set_message(self.truncate(&format!(
+                            "{} {}/{}",
+                            self.style_completed.apply_to("Done"),
+                            state.completed_chunks,
+                            state.total_chunks.unwrap_or(state.completed_chunks)
+                        )));
                     }
                 }
+                "chunk_infer" => {}
                 "extract_infer" => {
                     let mut state = self.state.lock().unwrap();
                     if let Some(bar) = state.chunk_overall_bar.take() {
                         bar.finish_and_clear();
                     }
-                    for (_, bar) in state.chunk_bars.drain() {
-                        bar.finish_and_clear();
+                    for (_, (bar, _)) in state.chunk_status_bars.drain() {
+                        bar.finish();
                     }
                     drop(state);
                     self.println("");
@@ -550,27 +626,22 @@ impl Notifier for RichNotifier {
                         .and_then(|d| d.strip_prefix("path="))
                         .map(|d| d.split_whitespace().next().unwrap_or(d))
                         .unwrap_or("output");
-                    self.println(&self.format_stage_line(
-                        &format!("wrote {path}"),
-                        "",
-                        elapsed,
-                    ));
+                    let path = PathBuf::from(path);
+                    let display = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("output");
+                    self.println(&self.format_stage_line(&format!("wrote {display}"), "", elapsed));
                 }
                 _ => {}
             },
 
             CoreEvent::Message { level, message } => match level {
                 NotificationLevel::Warn => {
-                    self.println(&format!(
-                        "  {}",
-                        self.style_warn.apply_to(&message)
-                    ));
+                    self.println(&format!("  {}", self.style_warn.apply_to(&message)));
                 }
                 NotificationLevel::Error => {
-                    self.println(&format!(
-                        "  {}",
-                        self.style_error.apply_to(&message)
-                    ));
+                    self.println(&format!("  {}", self.style_error.apply_to(&message)));
                 }
                 NotificationLevel::Info => {
                     self.println(&format!("  {message}"));
@@ -594,17 +665,10 @@ fn parse_chunk_count_from_message(message: &str) -> Option<usize> {
 fn parse_chunk_index(detail: &str) -> Option<usize> {
     let rest = detail.strip_prefix("chunk ")?;
     let end = rest.find(|c: char| !c.is_ascii_digit())?;
-    rest[..end].parse::<usize>().ok().map(|n| n.saturating_sub(1))
-}
-
-fn parse_t_value(detail: &str) -> Option<&str> {
-    let pos = detail.find("t=")?;
-    let rest = &detail[pos..];
-    let end = rest.find(|c: char| c != 't' && c != '=' && c != '.' && !c.is_ascii_digit());
-    Some(match end {
-        Some(end) => &rest[..end],
-        None => rest,
-    })
+    rest[..end]
+        .parse::<usize>()
+        .ok()
+        .map(|n| n.saturating_sub(1))
 }
 
 fn parse_audio_bracket(detail: &str) -> String {
@@ -623,6 +687,16 @@ fn parse_kv_usize(detail: &str, key: &str) -> Option<usize> {
         .next()?
         .parse()
         .ok()
+}
+
+fn format_chunk_status(message: &str) -> String {
+    if let Some(pos) = message.find(": infer start ") {
+        let chunk_id = &message[..pos];
+        let rest = &message[pos + ": infer start ".len()..];
+        format!("{chunk_id}  {rest}")
+    } else {
+        message.to_owned()
+    }
 }
 
 fn main() -> ExitCode {
@@ -654,8 +728,10 @@ fn extract(args: ExtractArgs) -> Result<()> {
     let request = build_extract_request(&args);
     let notifier = RichNotifier::new();
     notifier.print_banner();
-    let result = run_extract_with_notifier(&request, &notifier)?;
+    notifier.print_run_context(&args);
+    let result = run_extract_with_notifier(&request, &notifier);
     notifier.finish();
+    let result = result?;
     notifier.print_summary(&args, &result);
     Ok(())
 }
@@ -686,7 +762,6 @@ fn build_extract_request(args: &ExtractArgs) -> ServiceExtractRequest {
         max_chunk_seconds: args.max_chunk_seconds,
     }
 }
-
 
 fn backend_name(backend: Backend) -> &'static str {
     match backend {
@@ -732,7 +807,6 @@ fn log_level_name(level: Level) -> &'static str {
     }
 }
 
-
 fn inspect(
     model_path: PathBuf,
     show_tensors: usize,
@@ -774,79 +848,76 @@ fn inspect(
     );
     println!();
 
-    println!("gguf:");
-    println!("  version: {}", model.gguf_version);
-    println!("  architecture: {}", model.config.architecture);
-    println!(
-        "  quantization_version: {}",
+    print_inspect_section("gguf");
+    print_inspect_kv("version", model.gguf_version.to_string());
+    print_inspect_kv("architecture", model.config.architecture.as_str());
+    print_inspect_kv(
+        "quantization",
         model
             .quantization_version
             .map(|value| value.to_string())
-            .unwrap_or_else(|| "none".to_owned())
+            .unwrap_or_else(|| "none".to_owned()),
     );
-    println!(
-        "  metadata_keys: {}",
-        format_count(model.metadata_count as u64)
+    print_inspect_kv("metadata keys", format_count(model.metadata_count as u64));
+    print_inspect_kv("tensor count", format_count(model.tensor_count() as u64));
+    print_inspect_kv("parameter count", format_count(total_parameters));
+    print_inspect_kv(
+        "loaded weights",
+        format!(
+            "{} bytes ({})",
+            format_count(total_loaded_bytes),
+            format_bytes(total_loaded_bytes)
+        ),
     );
-    println!(
-        "  tensor_count: {}",
-        format_count(model.tensor_count() as u64)
-    );
-    println!("  parameter_count: {}", format_count(total_parameters));
-    println!(
-        "  loaded_weights: {} bytes ({})",
-        format_count(total_loaded_bytes),
-        format_bytes(total_loaded_bytes)
-    );
-    println!();
 
     if let Some(prefix) = tensor_prefix.as_deref() {
-        println!("tensor_filter:");
-        println!("  prefix: {prefix}");
-        println!(
-            "  matched_tensors: {}",
-            format_count(filtered_stats.tensor_count as u64)
+        print_inspect_section("tensor_filter");
+        print_inspect_kv("prefix", prefix);
+        print_inspect_kv(
+            "matched tensors",
+            format_count(filtered_stats.tensor_count as u64),
         );
-        println!(
-            "  matched_parameters: {}",
-            format_count(filtered_stats.parameter_count)
+        print_inspect_kv(
+            "matched parameters",
+            format_count(filtered_stats.parameter_count),
         );
-        println!(
-            "  matched_bytes: {}",
-            format_bytes(filtered_stats.byte_count)
-        );
-        println!();
+        print_inspect_kv("matched bytes", format_bytes(filtered_stats.byte_count));
     }
 
-    println!("model_config:");
-    println!("  name: {}", display_or_dash(&model.config.name));
-    println!("  version: {}", display_or_dash(&model.config.version));
-    println!("  mode: {}", model.config.mode);
-    println!("  embedding_dim: {}", model.config.embedding_dim);
-    println!("  input_dim: {}", model.config.in_dim);
-    println!("  estimator_out_dim: {}", model.config.estimator_out_dim);
-    println!("  region_cycle_len: {}", model.config.region_cycle_len);
-    println!("  use_languages: {}", model.config.use_languages);
-    println!("  num_languages: {}", model.config.num_languages);
-    println!();
+    print_inspect_section("model_config");
+    print_inspect_kv("name", display_or_dash(&model.config.name));
+    print_inspect_kv("version", display_or_dash(&model.config.version));
+    print_inspect_kv("mode", model.config.mode.to_string());
+    print_inspect_kv("embedding dim", model.config.embedding_dim.to_string());
+    print_inspect_kv("input dim", model.config.in_dim.to_string());
+    print_inspect_kv("estimator out", model.config.estimator_out_dim.to_string());
+    print_inspect_kv("region cycle", model.config.region_cycle_len.to_string());
+    print_inspect_kv("use languages", model.config.use_languages.to_string());
+    print_inspect_kv("num languages", model.config.num_languages.to_string());
 
     let inference = &model.config.inference;
-    println!("inference:");
-    println!("  sample_rate: {}", inference.audio_sample_rate);
-    println!("  hop_size: {}", inference.hop_size);
-    println!("  timestep_seconds: {:.6}", inference.timestep());
-    println!("  fft_size: {}", inference.fft_size);
-    println!("  win_size: {}", inference.win_size);
-    println!(
-        "  spectrogram: type={} bins={} fmin={} fmax={}",
-        inference.spectrogram_type, inference.n_mels, inference.fmin, inference.fmax
+    print_inspect_section("inference");
+    print_inspect_kv("sample rate", inference.audio_sample_rate.to_string());
+    print_inspect_kv("hop size", inference.hop_size.to_string());
+    print_inspect_kv("timestep", format!("{:.6}s", inference.timestep()));
+    print_inspect_kv("fft size", inference.fft_size.to_string());
+    print_inspect_kv("win size", inference.win_size.to_string());
+    print_inspect_kv(
+        "spectrogram",
+        format!(
+            "type={} bins={} fmin={} fmax={}",
+            inference.spectrogram_type, inference.n_mels, inference.fmin, inference.fmax
+        ),
     );
-    println!(
-        "  midi: min={} max={} bins={} std={}",
-        inference.midi_min, inference.midi_max, inference.midi_num_bins, inference.midi_std
+    print_inspect_kv(
+        "midi",
+        format!(
+            "min={} max={} bins={} std={}",
+            inference.midi_min, inference.midi_max, inference.midi_num_bins, inference.midi_std
+        ),
     );
-    println!(
-        "  lang_map: {}",
+    print_inspect_kv(
+        "lang map",
         if inference.lang_map.is_empty() {
             "none".to_owned()
         } else {
@@ -856,60 +927,52 @@ fn inspect(
                 .map(|(lang, id)| format!("{lang}={id}"))
                 .collect::<Vec<_>>()
                 .join(", ")
-        }
+        },
     );
-    println!();
 
-    println!("backbones:");
+    print_inspect_section("backbones");
     print_backbone("encoder", &model.config.encoder);
     print_backbone("segmenter", &model.config.segmenter);
     print_backbone("estimator", &model.config.estimator);
-    println!();
 
-    println!("tensor_types:");
+    print_inspect_section("tensor_types");
     for (tensor_type, count) in tensor_type_counts(&model) {
-        println!("  {tensor_type}: {}", format_count(count as u64));
+        print_inspect_kv(&tensor_type, format_count(count as u64));
     }
-    println!();
 
-    println!("tensor_prefixes:");
+    print_inspect_section("tensor_prefixes");
     for (prefix, stats) in tensor_prefix_stats(&model) {
-        println!(
-            "  {prefix}: tensors={} params={} bytes={}",
-            format_count(stats.tensor_count as u64),
-            format_count(stats.parameter_count),
-            format_bytes(stats.byte_count)
+        print_inspect_kv(
+            &prefix,
+            format!(
+                "tensors={} params={} bytes={}",
+                format_count(stats.tensor_count as u64),
+                format_count(stats.parameter_count),
+                format_bytes(stats.byte_count)
+            ),
         );
     }
 
     if show_tensors > 0 {
-        println!();
-        println!(
-            "{}:",
-            if tensor_prefix.is_some() {
-                "largest_matching_tensors"
-            } else {
-                "largest_tensors"
-            }
-        );
+        print_inspect_section(if tensor_prefix.is_some() {
+            "largest_matching_tensors"
+        } else {
+            "largest_tensors"
+        });
         for (index, (name, tensor)) in largest_tensors(&filtered_tensors, show_tensors)
             .into_iter()
             .enumerate()
         {
-            print_tensor_summary(index + 1, name, tensor);
+            print_tensor_summary(Some(index + 1), name, tensor);
         }
 
-        println!();
-        println!(
-            "{}:",
-            if tensor_prefix.is_some() {
-                "sample_matching_tensors"
-            } else {
-                "sample_tensors"
-            }
-        );
+        print_inspect_section(if tensor_prefix.is_some() {
+            "sample_matching_tensors"
+        } else {
+            "sample_tensors"
+        });
         for (name, tensor) in filtered_tensors.iter().take(show_tensors) {
-            print_tensor_summary(0, name, tensor);
+            print_tensor_summary(None, name, tensor);
         }
     }
 
@@ -953,30 +1016,92 @@ fn largest_tensors<'a>(
     tensors
 }
 
+fn print_inspect_section(title: &str) {
+    println!("{title}:");
+    println!("{}", "─".repeat(title.len().max(INSPECT_LABEL_WIDTH)));
+}
+
+fn print_inspect_kv(label: &str, value: impl AsRef<str>) {
+    let value = value.as_ref();
+    let pad = " ".repeat(INSPECT_LABEL_WIDTH.saturating_sub(label.len()));
+    for (index, line) in wrap_text(value, INSPECT_VALUE_WIDTH)
+        .into_iter()
+        .enumerate()
+    {
+        if index == 0 {
+            println!("  {label}{pad} {line}");
+        } else {
+            println!("  {:width$} {line}", "", width = INSPECT_LABEL_WIDTH);
+        }
+    }
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_owned()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let next_len = if current.is_empty() {
+            word.len()
+        } else {
+            current.len() + 1 + word.len()
+        };
+        if !current.is_empty() && next_len > width {
+            lines.push(current);
+            current = word.to_owned();
+        } else if current.is_empty() {
+            current.push_str(word);
+        } else {
+            current.push(' ');
+            current.push_str(word);
+        }
+    }
+
+    if current.is_empty() {
+        lines.push(text.to_owned());
+    } else {
+        lines.push(current);
+    }
+
+    lines
+}
+
 fn print_backbone(name: &str, backbone: &BackboneConfig) {
-    println!(
-        "  {name}: cls={} dim={} layers={} heads={} head_dim={} ffn_type={}",
-        display_or_dash(&backbone.cls),
-        backbone.dim,
-        backbone.num_layers,
-        backbone.num_heads,
-        backbone.head_dim,
-        backbone.ffn_type
+    print_inspect_kv(
+        name,
+        format!(
+            "cls={} dim={} layers={} heads={} head_dim={} ffn_type={}",
+            display_or_dash(&backbone.cls),
+            backbone.dim,
+            backbone.num_layers,
+            backbone.num_heads,
+            backbone.head_dim,
+            backbone.ffn_type
+        ),
     );
-    println!(
-        "    conv: c_kernel={} m_kernel={} use_ls={} use_out_norm={} skip_first_ffn={} skip_out_ffn={}",
-        backbone.c_kernel_size,
-        backbone.m_kernel_size,
-        backbone.use_ls,
-        backbone.use_out_norm,
-        backbone.skip_first_ffn,
-        backbone.skip_out_ffn
+    print_inspect_kv(
+        "conv",
+        format!(
+            "c_kernel={} m_kernel={} use_ls={} use_out_norm={} skip_first_ffn={} skip_out_ffn={}",
+            backbone.c_kernel_size,
+            backbone.m_kernel_size,
+            backbone.use_ls,
+            backbone.use_out_norm,
+            backbone.skip_first_ffn,
+            backbone.skip_out_ffn
+        ),
     );
 
     if backbone.return_latent {
-        println!(
-            "    latent: enabled=true layer_idx={} out_dim={}",
-            backbone.latent_layer_idx, backbone.latent_out_dim
+        print_inspect_kv(
+            "latent",
+            format!(
+                "enabled=true layer_idx={} out_dim={}",
+                backbone.latent_layer_idx, backbone.latent_out_dim
+            ),
         );
     }
 
@@ -986,40 +1111,45 @@ fn print_backbone(name: &str, backbone: &BackboneConfig) {
         || backbone.c_kernel_size_x != 0
         || backbone.m_kernel_size_x != 0
     {
-        println!(
-            "    joint: region_tokens={} merge={} attn_type={} rope_mode={} qk_norm={} region_bias={} use_rope={} use_pool_offset={} theta={}",
-            backbone.region_token_num,
-            backbone.pool_merge_mode,
-            backbone.attn_type,
-            backbone.rope_mode,
-            backbone.qk_norm,
-            backbone.use_region_bias,
-            backbone.use_rope,
-            backbone.use_pool_offset,
-            backbone.theta
+        print_inspect_kv(
+            "joint",
+            format!(
+                "region_tokens={} merge={} attn_type={} rope_mode={} qk_norm={} region_bias={} use_rope={} use_pool_offset={} theta={}",
+                backbone.region_token_num,
+                backbone.pool_merge_mode,
+                backbone.attn_type,
+                backbone.rope_mode,
+                backbone.qk_norm,
+                backbone.use_region_bias,
+                backbone.use_rope,
+                backbone.use_pool_offset,
+                backbone.theta
+            ),
         );
-        println!(
-            "    joint_conv: pool(c={}, m={}) x(c={}, m={})",
-            backbone.c_kernel_size_pool,
-            backbone.m_kernel_size_pool,
-            backbone.c_kernel_size_x,
-            backbone.m_kernel_size_x
+        print_inspect_kv(
+            "joint_conv",
+            format!(
+                "pool(c={}, m={}) x(c={}, m={})",
+                backbone.c_kernel_size_pool,
+                backbone.m_kernel_size_pool,
+                backbone.c_kernel_size_x,
+                backbone.m_kernel_size_x
+            ),
         );
     }
 }
 
-fn print_tensor_summary(index: usize, name: &str, tensor: &LoadedTensor) {
-    let prefix = if index == 0 {
-        "  ".to_owned()
-    } else {
-        format!("  {index}.")
-    };
-    println!(
-        "{prefix} {name}: shape={:?} type={} numel={} bytes={}",
-        tensor.shape,
-        tensor.tensor_type,
-        format_count(tensor.num_elements() as u64),
-        format_bytes(tensor.byte_len() as u64)
+fn print_tensor_summary(index: Option<usize>, name: &str, tensor: &LoadedTensor) {
+    let label = index.map_or_else(|| name.to_owned(), |index| format!("{index}. {name}"));
+    print_inspect_kv(
+        &label,
+        format!(
+            "shape={:?} type={} numel={} bytes={}",
+            tensor.shape,
+            tensor.tensor_type,
+            format_count(tensor.num_elements() as u64),
+            format_bytes(tensor.byte_len() as u64)
+        ),
     );
 }
 
@@ -1276,13 +1406,13 @@ mod tests {
     use game_core::Note;
     use game_service::{
         ExtractDevice as ServiceExtractDevice, ExtractFormat as ServiceExtractFormat,
-        ExtractRequest,
-        extract as run_extract_pipeline, infer_extract_format as service_infer_extract_format,
+        ExtractRequest, extract as run_extract_pipeline,
+        infer_extract_format as service_infer_extract_format,
     };
 
     use super::{
-        ChunkParallelism, Cli, Command, DEFAULT_MAX_CHUNK_SECONDS, parse_audio_bracket,
-        parse_chunk_count_from_message, parse_chunk_index, parse_kv_usize, parse_t_value,
+        ChunkParallelism, Cli, Command, DEFAULT_MAX_CHUNK_SECONDS, format_chunk_status,
+        parse_audio_bracket, parse_chunk_count_from_message, parse_chunk_index, parse_kv_usize,
         parse_u32_auto,
     };
 
@@ -1305,13 +1435,6 @@ mod tests {
         assert_eq!(parse_chunk_index("chunk 1/1: t=0.000"), Some(0));
         assert_eq!(parse_chunk_index("chunk 10/10: t=0.500"), Some(9));
         assert_eq!(parse_chunk_index("no chunk here"), None);
-    }
-
-    #[test]
-    fn parse_t_value_from_detail() {
-        assert_eq!(parse_t_value("t=0.444"), Some("t=0.444"));
-        assert_eq!(parse_t_value("chunk 2/5: t=0.123"), Some("t=0.123"));
-        assert_eq!(parse_t_value("no t value"), None);
     }
 
     #[test]
@@ -1342,6 +1465,19 @@ mod tests {
     }
 
     #[test]
+    fn format_chunk_status_strips_infer_start() {
+        assert_eq!(
+            format_chunk_status("chunk 1/5: infer start offset=0.00s duration=4.56s"),
+            "chunk 1/5  offset=0.00s duration=4.56s"
+        );
+    }
+
+    #[test]
+    fn format_chunk_status_passthrough_unknown() {
+        assert_eq!(format_chunk_status("something else"), "something else");
+    }
+
+    #[test]
     fn parse_u32_auto_accepts_decimal_and_hex() {
         assert_eq!(parse_u32_auto("1234").unwrap(), 1234);
         assert_eq!(parse_u32_auto("0x10de").unwrap(), 0x10de);
@@ -1362,7 +1498,10 @@ mod tests {
             service_infer_extract_format(Path::new("notes.csv")),
             Some(ServiceExtractFormat::Csv)
         );
-        assert_eq!(service_infer_extract_format(Path::new("notes.unknown")), None);
+        assert_eq!(
+            service_infer_extract_format(Path::new("notes.unknown")),
+            None
+        );
     }
 
     #[test]
@@ -1505,8 +1644,7 @@ mod tests {
         })
         .unwrap();
         let expected = parse_expected_notes(&expected_path).unwrap();
-        let metrics =
-            compare_notes_by_frame(&expected, &actual.notes, actual.timestep_seconds);
+        let metrics = compare_notes_by_frame(&expected, &actual.notes, actual.timestep_seconds);
 
         eprintln!(
             "vocal2 CPU regression: expected_notes={} actual_notes={} expected_frames={} actual_frames={} voicedness_match={:.4} pitch_mae={:.4} pitch_le_0_5={:.4}",

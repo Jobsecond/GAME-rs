@@ -66,9 +66,11 @@ impl CpuTensor {
         }
 
         let padded = time
-            .checked_add(padding.checked_mul(2).ok_or_else(|| {
-                invalid_arg("conv1d_dw padding overflow")
-            })?)
+            .checked_add(
+                padding
+                    .checked_mul(2)
+                    .ok_or_else(|| invalid_arg("conv1d_dw padding overflow"))?,
+            )
             .ok_or_else(|| invalid_arg("conv1d_dw padded size overflow"))?;
         let out_time = if padded < kernel_size {
             0

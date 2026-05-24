@@ -8,14 +8,13 @@ use game_audio::{
 };
 #[cfg(feature = "gpu")]
 use game_core::GpuAdapterSelector;
-use game_core::{MelExtractor, Model};
 use game_core::random_u64;
+use game_core::{MelExtractor, Model};
 use game_output::{write_midi_file, write_text_file};
 use rayon::prelude::*;
 
 pub use game_core::{
-    Backend, CoreEvent, Error, InferParams, Note, NotificationLevel, Notifier, NullNotifier,
-    Result,
+    Backend, CoreEvent, Error, InferParams, Note, NotificationLevel, Notifier, NullNotifier, Result,
 };
 pub use game_output::{MidiWriteOptions, TextOutputFormat, TextWriteOptions};
 
@@ -244,7 +243,9 @@ impl Notifier for PrefixedNotifier<'_> {
                 level,
                 message: self.prefix_text(&message),
             },
-            CoreEvent::ModelLoaded { backend, elapsed } => CoreEvent::ModelLoaded { backend, elapsed },
+            CoreEvent::ModelLoaded { backend, elapsed } => {
+                CoreEvent::ModelLoaded { backend, elapsed }
+            }
         });
     }
 }
@@ -270,8 +271,9 @@ pub fn extract_with_notifier(
     validate_request(request)?;
 
     let total_started_at = Instant::now();
-    let (model, model_load) =
-        timed_result(|| load_model_for_extract(&request.model_path, request.device, &request.gpu, notifier))?;
+    let (model, model_load) = timed_result(|| {
+        load_model_for_extract(&request.model_path, request.device, &request.gpu, notifier)
+    })?;
     let backend = model.backend();
     let gpu_adapter = gpu_adapter_info(&model);
     if let Some(adapter) = &gpu_adapter {
@@ -291,10 +293,18 @@ pub fn extract_with_notifier(
 
     emit_status(notifier, "audio_prepare", "preparing audio");
     let (waveform, audio_prepare) = timed_result(|| {
-        prepare_wav_for_inference(&request.input_path, model.config().inference.audio_sample_rate)
+        prepare_wav_for_inference(
+            &request.input_path,
+            model.config().inference.audio_sample_rate,
+        )
     })?;
     let audio = PreparedAudioInfo::from(&waveform);
-    emit_timing(notifier, "audio_prepare", audio_prepare, Some(audio_prepare_detail(&audio)));
+    emit_timing(
+        notifier,
+        "audio_prepare",
+        audio_prepare,
+        Some(audio_prepare_detail(&audio)),
+    );
 
     let slicer_config = SlicerConfig {
         sample_rate: waveform.sample_rate,
@@ -462,7 +472,10 @@ fn run_chunked_extract_with_notifier(
 ) -> Result<ChunkedExtractResult> {
     let chunk_count = chunks.len();
     let parallel_chunks = chunk_parallelism_enabled(model, chunk_count, chunk_parallelism);
-    if chunk_parallelism == ChunkParallelism::On && !parallel_chunks && model.backend() != Backend::Cpu {
+    if chunk_parallelism == ChunkParallelism::On
+        && !parallel_chunks
+        && model.backend() != Backend::Cpu
+    {
         emit_message(
             notifier,
             NotificationLevel::Warn,
