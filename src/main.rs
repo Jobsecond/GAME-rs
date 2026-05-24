@@ -581,13 +581,7 @@ impl Notifier for RichNotifier {
                     let idx = detail.as_deref().and_then(parse_chunk_index).unwrap_or(0);
                     let elapsed_str = format!("elapsed={}", format_duration(elapsed));
                     let mut state = self.state.lock().unwrap();
-                    if let Some((bar, chunk_info)) = state.chunk_status_bars.get(&idx) {
-                        let msg = format!(
-                            "   {} {chunk_info}  {}",
-                            self.style_completed.apply_to("Completed"),
-                            self.style_timing.apply_to(&elapsed_str),
-                        );
-                        bar.set_message(self.truncate(&msg));
+                    if let Some((bar, _)) = state.chunk_status_bars.remove(&idx) {
                         bar.finish_and_clear();
                     } else if !self.use_progress {
                         let chunk_label = detail.as_deref().unwrap_or("chunk");

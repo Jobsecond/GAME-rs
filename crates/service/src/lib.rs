@@ -611,7 +611,10 @@ fn infer_chunk(
 }
 
 fn derive_chunk_seed(base_seed: u64, index: usize) -> u64 {
-    let mut value = base_seed.wrapping_add((index as u64).wrapping_add(1) * 0x9E37_79B9_7F4A_7C15);
+    let mix = (index as u64)
+        .wrapping_add(1)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut value = base_seed.wrapping_add(mix);
     value ^= value >> 30;
     value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
     value ^= value >> 27;
@@ -838,6 +841,12 @@ mod tests {
 
         let err = extract(&request).unwrap_err();
         assert!(err.to_string().contains("GPU selector"));
+    }
+
+    #[test]
+    fn derive_chunk_seed_wraps_without_overflowing() {
+        assert_ne!(derive_chunk_seed(0, 0), 0);
+        assert_ne!(derive_chunk_seed(u64::MAX, usize::MAX), 0);
     }
 
     #[test]
