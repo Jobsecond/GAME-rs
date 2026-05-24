@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -175,17 +175,22 @@ impl From<ChunkParallelism> for ServiceChunkParallelism {
 const STAGE_LINE_WIDTH: usize = 50;
 const INSPECT_LABEL_WIDTH: usize = 18;
 const INSPECT_VALUE_WIDTH: usize = 52;
+const SPINNER_TICKS: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const CHUNK_LABEL_WIDTH: usize = 28;
+const CHUNK_PROGRESS_BAR_WIDTH: usize = 8;
 
 struct RichState {
-    chunk_status_bars: HashMap<usize, (ProgressBar, String)>,
-    chunk_overall_bar: Option<ProgressBar>,
+    chunk_labels: HashMap<usize, String>,
+    chunk_status_bars: HashMap<usize, ProgressBar>,
     total_chunks: Option<usize>,
     completed_chunks: usize,
     silence_chunk_count: Option<usize>,
+    chunk_parallelism_on: bool,
 }
 
 struct RichNotifier {
     multi: MultiProgress,
+    root: ProgressBar,
     state: Mutex<RichState>,
     use_progress: bool,
     style_label: Style,
@@ -193,9 +198,6 @@ struct RichNotifier {
     style_warn: Style,
     style_error: Style,
     style_dim: Style,
-    style_title: Style,
-    style_header: Style,
-    style_processing: Style,
     style_completed: Style,
 }
 
@@ -211,52 +213,41 @@ impl RichNotifier {
         } else {
             MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
         };
+        let root = multi.add(ProgressBar::new_spinner());
+        root.set_style(root_progress_style(false));
 
-        let (
-            style_label,
-            style_timing,
-            style_warn,
-            style_error,
-            style_dim,
-            style_title,
-            style_header,
-            style_processing,
-            style_completed,
-        ) = if use_color {
-            (
-                Style::new().cyan(),
-                Style::new().green(),
-                Style::new().yellow(),
-                Style::new().red(),
-                Style::new().dim(),
-                Style::new().cyan().bold(),
-                Style::new().white().bold(),
-                Style::new().cyan().bold(),
-                Style::new().green().bold(),
-            )
-        } else {
-            let plain = Style::new();
-            (
-                plain.clone(),
-                plain.clone(),
-                plain.clone(),
-                plain.clone(),
-                plain.clone(),
-                plain.clone(),
-                plain.clone(),
-                plain.clone(),
-                plain,
-            )
-        };
+        let (style_label, style_timing, style_warn, style_error, style_dim, style_completed) =
+            if use_color {
+                (
+                    Style::new().cyan(),
+                    Style::new().green(),
+                    Style::new().yellow(),
+                    Style::new().red(),
+                    Style::new().dim(),
+                    Style::new().green().bold(),
+                )
+            } else {
+                let plain = Style::new();
+                (
+                    plain.clone(),
+                    plain.clone(),
+                    plain.clone(),
+                    plain.clone(),
+                    plain.clone(),
+                    plain,
+                )
+            };
 
         Self {
             multi,
+            root,
             state: Mutex::new(RichState {
+                chunk_labels: HashMap::new(),
                 chunk_status_bars: HashMap::new(),
-                chunk_overall_bar: None,
                 total_chunks: None,
                 completed_chunks: 0,
                 silence_chunk_count: None,
+                chunk_parallelism_on: false,
             }),
             use_progress,
             style_label,
@@ -264,10 +255,19 @@ impl RichNotifier {
             style_warn,
             style_error,
             style_dim,
-            style_title,
-            style_header,
-            style_processing,
             style_completed,
+        }
+    }
+
+    fn start(&self, args: &ExtractArgs) {
+        self.state.lock().unwrap().chunk_parallelism_on =
+            args.chunk_parallelism == ChunkParallelism::On;
+        if !self.use_progress {
+            self.println(&format!(
+                "Extract {} -> {}",
+                args.input.display(),
+                args.output.display()
+            ));
         }
     }
 
@@ -287,6 +287,56 @@ impl RichNotifier {
         } else {
             eprintln!("{out}");
         }
+    }
+
+    fn set_root_style(&self, with_counts: bool) {
+        self.root.set_style(root_progress_style(with_counts));
+    }
+
+    fn set_root_message(&self, message: &str) {
+        self.root.set_message(self.truncate(message));
+    }
+
+    fn chunk_processing_message(&self) -> &'static str {
+        if self.state.lock().unwrap().chunk_parallelism_on {
+            "Processing chunks in parallel..."
+        } else {
+            "Processing chunks..."
+        }
+    }
+
+    fn ensure_chunk_bar(&self, chunk_idx: usize) -> ProgressBar {
+        let mut state = self.state.lock().unwrap();
+        if let Some(bar) = state.chunk_status_bars.get(&chunk_idx) {
+            return bar.clone();
+        }
+
+        let before_bar = state
+            .chunk_status_bars
+            .iter()
+            .filter_map(|(&idx, bar)| (idx > chunk_idx).then_some((idx, bar.clone())))
+            .min_by_key(|(idx, _)| *idx)
+            .map(|(_, bar)| bar);
+        let after_bar = state
+            .chunk_status_bars
+            .iter()
+            .filter_map(|(&idx, bar)| (idx < chunk_idx).then_some((idx, bar.clone())))
+            .max_by_key(|(idx, _)| *idx)
+            .map(|(_, bar)| bar);
+
+        let bar = if let Some(before_bar) = before_bar {
+            self.multi
+                .insert_before(&before_bar, ProgressBar::new_spinner())
+        } else if let Some(after_bar) = after_bar {
+            self.multi
+                .insert_after(&after_bar, ProgressBar::new_spinner())
+        } else {
+            self.multi
+                .insert_after(&self.root, ProgressBar::new_spinner())
+        };
+        bar.set_style(child_pending_style());
+        state.chunk_status_bars.insert(chunk_idx, bar.clone());
+        bar
     }
 
     fn format_stage_line(&self, label: &str, bracket: &str, elapsed: Duration) -> String {
@@ -312,80 +362,38 @@ impl RichNotifier {
     }
 
     fn handle_d3pm_progress(&self, current: usize, total: usize, detail: Option<&str>) {
-        if total <= 1 || !self.use_progress {
+        if !self.use_progress {
             return;
         }
 
-        let state = self.state.lock().unwrap();
         let chunk_idx = detail.and_then(parse_chunk_index).unwrap_or(0);
+        let state = self.state.lock().unwrap();
+        let chunk_info = state
+            .chunk_labels
+            .get(&chunk_idx)
+            .cloned()
+            .unwrap_or_else(|| format!("chunk {}", chunk_idx + 1));
+        drop(state);
 
-        if let Some((bar, chunk_info)) = state.chunk_status_bars.get(&chunk_idx) {
-            let step_info = format!("step {current}/{total}");
-            let msg = format!(
-                "  {} {chunk_info}  {step_info}",
-                self.style_processing.apply_to("Processing"),
-            );
-            bar.set_message(self.truncate(&msg));
-        }
+        let bar = self.ensure_chunk_bar(chunk_idx);
+        bar.set_style(child_numeric_progress_style());
+        bar.set_length(total as u64);
+        bar.set_position(current as u64);
+        bar.set_message(self.truncate(&chunk_info));
+        self.set_root_message(self.chunk_processing_message());
     }
 
     fn finish(&self) {
         let mut state = self.state.lock().unwrap();
-        if let Some(bar) = state.chunk_overall_bar.take() {
+        self.root.set_message("");
+        self.root.finish_and_clear();
+        for (_, bar) in state.chunk_status_bars.drain() {
             bar.finish_and_clear();
         }
-        for (_, (bar, _)) in state.chunk_status_bars.drain() {
-            bar.finish_and_clear();
-        }
+        state.chunk_labels.clear();
     }
 
-    fn print_banner(&self) {
-        let title = "GAME - Generative Adaptive MIDI Extractor";
-        self.println(&format!("{}", self.style_title.apply_to(title)));
-        self.println(&format!(
-            "{}",
-            self.style_dim.apply_to("─".repeat(title.len()))
-        ));
-        self.println("");
-    }
-
-    fn print_run_context(&self, args: &ExtractArgs) {
-        self.println(&format!("{}", self.style_header.apply_to("Run")));
-        self.println(&format!(
-            "{}",
-            self.style_dim.apply_to("─".repeat(STAGE_LINE_WIDTH))
-        ));
-        self.print_summary_kv("Model", &args.model.display().to_string());
-        self.print_summary_kv("Input", &args.input.display().to_string());
-        self.print_summary_kv("Output", &args.output.display().to_string());
-        self.print_summary_kv(
-            "Device",
-            &args
-                .device
-                .map(|device| format!("{device:?}").to_lowercase())
-                .unwrap_or_else(|| "auto".to_owned()),
-        );
-        self.print_summary_kv(
-            "Format",
-            &args
-                .format
-                .map(|format| format!("{format:?}").to_lowercase())
-                .unwrap_or_else(|| "auto".to_owned()),
-        );
-        self.print_summary_kv(
-            "Parallel",
-            &format!("{:?}", args.chunk_parallelism).to_lowercase(),
-        );
-        self.println("");
-    }
-
-    fn print_summary(&self, _args: &ExtractArgs, result: &ServiceExtractResult) {
-        self.println(&format!("{}", self.style_header.apply_to("Summary")));
-        self.println(&format!(
-            "{}",
-            self.style_dim.apply_to("─".repeat(STAGE_LINE_WIDTH))
-        ));
-
+    fn print_summary(&self, result: &ServiceExtractResult) {
         let audio_val = if result.audio.was_resampled() || result.audio.was_downmixed() {
             format!(
                 "{} Hz/{} ch → {} Hz mono",
@@ -396,64 +404,72 @@ impl RichNotifier {
         } else {
             format!("{} Hz mono", result.audio.sample_rate)
         };
-        self.print_summary_kv("Audio", &audio_val);
-        self.print_summary_kv("Backend", backend_name(result.backend));
+
+        let realtime = if result.timings.inference.is_zero() {
+            0.0
+        } else {
+            result.audio.duration_seconds() / result.timings.inference.as_secs_f64()
+        };
+        let chunks_val = if result.chunks_before_long_split != result.chunk_count {
+            format!(
+                "{} -> {}",
+                result.chunks_before_long_split, result.chunk_count
+            )
+        } else {
+            result.chunk_count.to_string()
+        };
+
+        if !self.use_progress {
+            self.println("");
+        }
+
+        self.println(&format!(
+            "{} {} notes in {} ({realtime:.2}x realtime)",
+            self.style_completed.apply_to("Extracted"),
+            result.notes.len(),
+            self.style_timing
+                .apply_to(format_duration(result.timings.total))
+        ));
+        self.println(&format!(
+            "  {} {} | {} {} | {} {}",
+            self.style_label.apply_to("Audio"),
+            audio_val,
+            self.style_label.apply_to("Frames"),
+            format_count(result.total_frames as u64),
+            self.style_label.apply_to("Chunks"),
+            chunks_val
+        ));
+
         if let Some(adapter) = &result.gpu_adapter {
-            self.print_summary_kv("GPU", &adapter.name);
+            self.println(&format!(
+                "  {} {} ({})",
+                self.style_label.apply_to("Backend"),
+                backend_name(result.backend),
+                adapter.name
+            ));
+        } else {
+            self.println(&format!(
+                "  {} {}",
+                self.style_label.apply_to("Backend"),
+                backend_name(result.backend)
+            ));
         }
-        self.print_summary_kv("Chunks", &result.chunk_count.to_string());
-        self.print_summary_kv("Frames", &format_count(result.total_frames as u64));
-        self.print_summary_kv("Notes", &result.notes.len().to_string());
+
         if let Some(output) = &result.output {
-            self.print_summary_kv("Format", &format!("{:?}", output.format).to_lowercase());
-            self.print_summary_kv("Output", &output.path.display().to_string());
+            self.println(&format!(
+                "  {} {} ({})",
+                self.style_label.apply_to("Output"),
+                output.path.display(),
+                format!("{:?}", output.format).to_lowercase()
+            ));
         }
-        self.print_summary_kv(
-            "Realtime",
-            &format!(
-                "{:.2}x",
-                if result.timings.inference.is_zero() {
-                    0.0
-                } else {
-                    result.audio.duration_seconds() / result.timings.inference.as_secs_f64()
-                }
-            ),
-        );
-
-        self.println("");
-        self.println(&format!("{}", self.style_header.apply_to("Timings")));
-        self.print_timing_row("model load", result.timings.model_load);
-        self.print_timing_row("audio prepare", result.timings.audio_prepare);
-        self.print_timing_row("silence slice", result.timings.silence_slice);
-        if result.chunks_before_long_split != result.chunk_count {
-            self.print_timing_row("long chunk split", result.timings.long_chunk_split);
-        }
-        self.print_timing_row("mel setup", result.timings.mel_setup);
-        self.print_timing_row("inference", result.timings.inference);
-        self.print_timing_row("output write", result.timings.output_write);
         self.println(&format!(
-            "{}",
-            self.style_dim.apply_to("─".repeat(STAGE_LINE_WIDTH))
-        ));
-        self.print_timing_row("total", result.timings.total);
-    }
-
-    fn print_summary_kv(&self, label: &str, value: &str) {
-        self.println(&format!(
-            "  {:<width$}{}",
-            self.style_label.apply_to(label),
-            value,
-            width = INSPECT_LABEL_WIDTH
-        ));
-    }
-
-    fn print_timing_row(&self, label: &str, duration: Duration) {
-        let value = format_duration(duration);
-        self.println(&format!(
-            "  {:<width$}{}",
-            self.style_label.apply_to(label),
-            self.style_timing.apply_to(&value),
-            width = INSPECT_LABEL_WIDTH
+            "  {} load={} audio={} infer={} write={}",
+            self.style_label.apply_to("Timings"),
+            format_duration(result.timings.model_load),
+            format_duration(result.timings.audio_prepare),
+            format_duration(result.timings.inference),
+            format_duration(result.timings.output_write)
         ));
     }
 }
@@ -470,51 +486,36 @@ impl Notifier for RichNotifier {
                     if let Some(count) = parse_chunk_count_from_message(&message) {
                         let mut state = self.state.lock().unwrap();
                         state.total_chunks = Some(count);
-                        if count > 1 && self.use_progress {
-                            let bar = self.multi.add(ProgressBar::new(count as u64));
-                            bar.set_style(
-                                ProgressStyle::with_template(
-                                    "  chunks [{bar:20}] {pos}/{len}  {msg}  {elapsed}",
-                                )
-                                .unwrap()
-                                .progress_chars("##-"),
-                            );
-                            bar.set_message("starting");
-                            bar.enable_steady_tick(Duration::from_millis(250));
-                            state.chunk_overall_bar = Some(bar);
+                        state.completed_chunks = 0;
+                        state.chunk_labels.clear();
+                        for (_, bar) in state.chunk_status_bars.drain() {
+                            bar.finish_and_clear();
                         }
+                        drop(state);
+                        self.root.set_position(0);
+                        self.root.set_length(count as u64);
+                        self.root.reset_elapsed();
+                        self.set_root_style(true);
+                        self.root.enable_steady_tick(Duration::from_millis(200));
+                        self.set_root_message(self.chunk_processing_message());
                     }
-                    self.println("");
                 }
                 "chunk_infer" => {
                     let chunk_info = format_chunk_status(&message);
                     let idx = parse_chunk_index(&message).unwrap_or(0);
-                    if self.use_progress {
+                    {
                         let mut state = self.state.lock().unwrap();
-                        let bar = if let Some(overall) = &state.chunk_overall_bar {
-                            self.multi.insert_before(overall, ProgressBar::new(0))
-                        } else {
-                            self.multi.add(ProgressBar::new(0))
-                        };
-                        bar.set_style(ProgressStyle::with_template("{msg}").unwrap());
-                        let msg = format!(
-                            "  {} {chunk_info}",
-                            self.style_processing.apply_to("Processing")
-                        );
-                        bar.set_message(self.truncate(&msg));
-                        state
-                            .chunk_status_bars
-                            .insert(idx, (bar, chunk_info.clone()));
-                        if let Some(overall) = &state.chunk_overall_bar {
-                            overall.set_message(self.truncate(&format!(
-                                "{} {chunk_info}",
-                                self.style_processing.apply_to("Active"),
-                            )));
-                        }
+                        state.chunk_labels.insert(idx, chunk_info.clone());
+                    }
+                    if self.use_progress {
+                        let bar = self.ensure_chunk_bar(idx);
+                        bar.set_style(child_pending_style());
+                        bar.set_message(self.truncate(&chunk_info));
+                        self.set_root_message(self.chunk_processing_message());
                     } else {
                         self.println(&format!(
                             "  {} {chunk_info}",
-                            self.style_processing.apply_to("Processing")
+                            self.style_label.apply_to("Processing")
                         ));
                     }
                 }
@@ -579,40 +580,36 @@ impl Notifier for RichNotifier {
                 }
                 "infer_total" => {
                     let idx = detail.as_deref().and_then(parse_chunk_index).unwrap_or(0);
-                    let elapsed_str = format!("elapsed={}", format_duration(elapsed));
                     let mut state = self.state.lock().unwrap();
-                    if let Some((bar, _)) = state.chunk_status_bars.remove(&idx) {
+                    state.chunk_labels.remove(&idx);
+                    if let Some(bar) = state.chunk_status_bars.remove(&idx) {
                         bar.finish_and_clear();
-                    } else if !self.use_progress {
-                        let chunk_label = detail.as_deref().unwrap_or("chunk");
-                        self.println(&format!(
-                            "   {} {chunk_label}  {}",
-                            self.style_completed.apply_to("Completed"),
-                            self.style_timing.apply_to(&elapsed_str),
-                        ));
                     }
                     state.completed_chunks += 1;
-                    if let Some(bar) = &state.chunk_overall_bar {
-                        bar.set_position(state.completed_chunks as u64);
-                        bar.set_message(self.truncate(&format!(
-                            "{} {}/{}",
-                            self.style_completed.apply_to("Done"),
-                            state.completed_chunks,
-                            state.total_chunks.unwrap_or(state.completed_chunks)
-                        )));
+                    let completed_chunks = state.completed_chunks;
+                    let total_chunks = state.total_chunks.unwrap_or(completed_chunks);
+                    drop(state);
+                    if self.use_progress {
+                        self.root.set_position(completed_chunks as u64);
+                        let _ = total_chunks;
+                        self.set_root_message(self.chunk_processing_message());
                     }
                 }
                 "chunk_infer" => {}
                 "extract_infer" => {
                     let mut state = self.state.lock().unwrap();
-                    if let Some(bar) = state.chunk_overall_bar.take() {
+                    for (_, bar) in state.chunk_status_bars.drain() {
                         bar.finish_and_clear();
                     }
-                    for (_, (bar, _)) in state.chunk_status_bars.drain() {
-                        bar.finish();
-                    }
+                    state.chunk_labels.clear();
                     drop(state);
-                    self.println("");
+                    if self.use_progress {
+                        self.root.disable_steady_tick();
+                        self.root.set_message("");
+                        self.root.finish_and_clear();
+                    } else {
+                        self.println("");
+                    }
                 }
                 "output_write" => {
                     let path = detail
@@ -620,30 +617,73 @@ impl Notifier for RichNotifier {
                         .and_then(|d| d.strip_prefix("path="))
                         .map(|d| d.split_whitespace().next().unwrap_or(d))
                         .unwrap_or("output");
-                    let path = PathBuf::from(path);
-                    let display = path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("output");
-                    self.println(&self.format_stage_line(&format!("wrote {display}"), "", elapsed));
+                    let display = display_path_name(Path::new(path));
+                    if self.use_progress {
+                        self.set_root_message(&format!("Wrote {display}"));
+                    } else {
+                        self.println(&self.format_stage_line(
+                            &format!("wrote {display}"),
+                            "",
+                            elapsed,
+                        ));
+                    }
                 }
                 _ => {}
             },
 
             CoreEvent::Message { level, message } => match level {
                 NotificationLevel::Warn => {
-                    self.println(&format!("  {}", self.style_warn.apply_to(&message)));
+                    self.println(&format!(
+                        "  {} {}",
+                        self.style_warn.apply_to("warning:"),
+                        message
+                    ));
                 }
                 NotificationLevel::Error => {
-                    self.println(&format!("  {}", self.style_error.apply_to(&message)));
+                    self.println(&format!(
+                        "  {} {}",
+                        self.style_error.apply_to("error:"),
+                        message
+                    ));
                 }
                 NotificationLevel::Info => {
-                    self.println(&format!("  {message}"));
+                    self.println(&format!("  {}", self.style_dim.apply_to(&message)));
                 }
                 _ => {}
             },
         }
     }
+}
+
+fn root_progress_style(with_counts: bool) -> ProgressStyle {
+    if with_counts {
+        ProgressStyle::with_template("{spinner:.white} {msg:.dim} ({pos}/{len})  {elapsed:.dim}")
+            .unwrap()
+            .tick_strings(&SPINNER_TICKS)
+    } else {
+        ProgressStyle::with_template("{spinner:.white} {msg:.dim}")
+            .unwrap()
+            .tick_strings(&SPINNER_TICKS)
+    }
+}
+
+fn child_pending_style() -> ProgressStyle {
+    ProgressStyle::with_template(&format!("{{msg:{CHUNK_LABEL_WIDTH}.dim}}")).unwrap()
+}
+
+fn child_numeric_progress_style() -> ProgressStyle {
+    ProgressStyle::with_template(&format!(
+        "{{msg:{CHUNK_LABEL_WIDTH}.dim}} [{{bar:{CHUNK_PROGRESS_BAR_WIDTH}.green/black.dim}}] D3PM Step {{pos}}/{{len}}"
+    ))
+    .unwrap()
+    .progress_chars("=> ")
+}
+
+fn display_path_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn parse_chunk_count_from_message(message: &str) -> Option<usize> {
@@ -686,8 +726,20 @@ fn parse_kv_usize(detail: &str, key: &str) -> Option<usize> {
 fn format_chunk_status(message: &str) -> String {
     if let Some(pos) = message.find(": infer start ") {
         let chunk_id = &message[..pos];
+        let chunk_label = chunk_id
+            .split_once('/')
+            .map(|(chunk_number, _)| chunk_number)
+            .unwrap_or(chunk_id);
         let rest = &message[pos + ": infer start ".len()..];
-        format!("{chunk_id}  {rest}")
+        let duration = rest
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("duration="))
+            .unwrap_or_default();
+        if duration.is_empty() {
+            chunk_label.to_owned()
+        } else {
+            format!("{chunk_label} (dur: {duration})")
+        }
     } else {
         message.to_owned()
     }
@@ -721,12 +773,11 @@ fn run() -> Result<()> {
 fn extract(args: ExtractArgs) -> Result<()> {
     let request = build_extract_request(&args);
     let notifier = RichNotifier::new();
-    notifier.print_banner();
-    notifier.print_run_context(&args);
+    notifier.start(&args);
     let result = run_extract_with_notifier(&request, &notifier);
     notifier.finish();
     let result = result?;
-    notifier.print_summary(&args, &result);
+    notifier.print_summary(&result);
     Ok(())
 }
 
@@ -1462,7 +1513,7 @@ mod tests {
     fn format_chunk_status_strips_infer_start() {
         assert_eq!(
             format_chunk_status("chunk 1/5: infer start offset=0.00s duration=4.56s"),
-            "chunk 1/5  offset=0.00s duration=4.56s"
+            "chunk 1 (dur: 4.56s)"
         );
     }
 
