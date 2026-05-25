@@ -9,6 +9,7 @@ pub(super) const ELEMENT_WORKGROUP_SIZE: u32 = 64;
 pub(super) const MAX_DISPATCH_X: u32 = 65_535;
 pub(super) const ROW_WORKGROUP_X: u32 = 8;
 pub(super) const ROW_WORKGROUP_Y: u32 = 8;
+pub(super) const MATMUL_TILE: u32 = 16;
 pub(super) const ROPE_WORKGROUP_X: u32 = 32;
 pub(super) const ROPE_WORKGROUP_Y: u32 = 4;
 

@@ -18,37 +18,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let base = outer_index * params.axis_len * params.inner + inner_index;
-    var max_value = -3.4028235e38;
-    var axis_index: u32 = 0u;
-    loop {
-        if (axis_index >= params.axis_len) {
-            break;
-        }
-        let value = x[base + axis_index * params.inner];
-        max_value = max(max_value, value);
-        axis_index = axis_index + 1u;
+    let stride = params.inner;
+
+    // Online max + sum in a single pass (no intermediate writes).
+    var max_val = x[base];
+    var sum_val = 1.0;
+    for (var i = 1u; i < params.axis_len; i = i + 1u) {
+        let val = x[base + i * stride];
+        let new_max = max(max_val, val);
+        sum_val = sum_val * exp(max_val - new_max) + exp(val - new_max);
+        max_val = new_max;
     }
 
-    var sum = 0.0;
-    axis_index = 0u;
-    loop {
-        if (axis_index >= params.axis_len) {
-            break;
-        }
-        let index = base + axis_index * params.inner;
-        let value = exp(x[index] - max_value);
-        dst[index] = value;
-        sum = sum + value;
-        axis_index = axis_index + 1u;
-    }
-
-    axis_index = 0u;
-    loop {
-        if (axis_index >= params.axis_len) {
-            break;
-        }
-        let index = base + axis_index * params.inner;
-        dst[index] = dst[index] / sum;
-        axis_index = axis_index + 1u;
+    let inv_sum = 1.0 / sum_val;
+    for (var i = 0u; i < params.axis_len; i = i + 1u) {
+        let idx = base + i * stride;
+        dst[idx] = exp(x[idx] - max_val) * inv_sum;
     }
 }

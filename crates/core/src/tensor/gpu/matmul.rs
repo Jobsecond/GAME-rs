@@ -60,8 +60,8 @@ impl GpuTensor {
             &device.inner.pipelines.matmul,
             &[&lhs.buffer, &rhs.buffer, &out_buffer, &params_buffer],
             (
-                div_ceil_u32(params.n, ROW_WORKGROUP_X),
-                div_ceil_u32(params.m, ROW_WORKGROUP_Y),
+                div_ceil_u32(params.n, MATMUL_TILE),
+                div_ceil_u32(params.m, MATMUL_TILE),
                 params.batch,
             ),
             "matmul",
@@ -153,8 +153,8 @@ impl GpuTensor {
                 &params_buffer,
             ],
             (
-                div_ceil_u32(params.out_dim, ROW_WORKGROUP_X),
-                div_ceil_u32(params.rows, ROW_WORKGROUP_Y),
+                div_ceil_u32(params.out_dim, MATMUL_TILE),
+                div_ceil_u32(params.rows, MATMUL_TILE),
                 1,
             ),
             "linear",
