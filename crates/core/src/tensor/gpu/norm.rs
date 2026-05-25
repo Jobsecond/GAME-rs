@@ -2,7 +2,6 @@ use crate::Result;
 
 use super::base::GpuTensor;
 use super::params::*;
-use super::pipelines::*;
 use super::util::*;
 
 impl GpuTensor {
@@ -43,7 +42,7 @@ impl GpuTensor {
         input.device.dispatch_compute(
             &input.device.inner.pipelines.rms_norm,
             &[&input.buffer, &weight.buffer, &out_buffer, &params_buffer],
-            (div_ceil_u32(params.rows, ELEMENT_WORKGROUP_SIZE), 1, 1),
+            (params.rows, 1, 1),
             "rms_norm",
             None,
         )?;

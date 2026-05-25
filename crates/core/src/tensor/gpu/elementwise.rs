@@ -178,11 +178,7 @@ impl GpuTensor {
         input.device.dispatch_compute(
             &input.device.inner.pipelines.softmax,
             &[&input.buffer, &out_buffer, &params_buffer],
-            (
-                div_ceil_u32(params.inner.max(1), ROW_WORKGROUP_X),
-                div_ceil_u32(params.outer.max(1), ROW_WORKGROUP_Y),
-                1,
-            ),
+            (params.outer * params.inner, 1, 1),
             "softmax",
             None,
         )?;
