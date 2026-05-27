@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use rayon::prelude::*;
 
 use crate::Result;
@@ -5,7 +7,7 @@ use crate::profiler::op_scope_with;
 
 use super::CpuTensor;
 use super::elementwise::apply_softmax_inplace;
-use super::matmul::attention_gemm_f32;
+use super::matmul::{attention_gemm_f32, attention_gemm_f32_accum};
 use super::util::*;
 
 impl CpuTensor {
@@ -368,6 +370,12 @@ impl CpuTensor {
                 v.shape()
             )));
         }
+
+        let block_k = attention_block_k();
+        if block_k > 0 && key_len > block_k {
+            return Self::fused_attention_blocked(q, k, v, mask, scale, heads, q_len, key_len, head_dim, block_k);
+        }
+
         let mask_shape = mask.map(|m| m.shape().to_vec());
         let mask_2d = mask_shape.as_deref().map(|s| s.len() == 2).unwrap_or(false);
 
@@ -545,6 +553,203 @@ impl CpuTensor {
         }
 
         Self::from_owned(out, &[heads, q_len, head_dim])
+    }
+
+    fn fused_attention_blocked(
+        q: &Self,
+        k: &Self,
+        v: &Self,
+        mask: Option<&Self>,
+        scale: f32,
+        heads: usize,
+        q_len: usize,
+        key_len: usize,
+        head_dim: usize,
+        block_k: usize,
+    ) -> Result<Self> {
+        let q_ptr = q.data_ptr() as usize;
+        let q_head_stride = q.strides[0];
+        let q_rs = q.strides[1] as isize;
+        let q_cs = q.strides[2] as isize;
+
+        let k_ptr = k.data_ptr() as usize;
+        let k_head_stride = k.strides[0];
+        let k_key_stride = k.strides[1] as isize;
+        let k_dim_stride = k.strides[2] as isize;
+
+        let v_ptr = v.data_ptr() as usize;
+        let v_head_stride = v.strides[0];
+        let v_key_stride = v.strides[1] as isize;
+        let v_dim_stride = v.strides[2] as isize;
+
+        let mask_owned: Option<Vec<f32>> = mask.map(|m| m.to_vec()).transpose()?;
+        let mask_ref: Option<&[f32]> = mask_owned.as_deref();
+        let mask_2d = mask.map(|m| m.shape().len() == 2).unwrap_or(false);
+
+        let mut output = vec![0.0f32; heads * q_len * head_dim];
+        let out_head_stride = q_len * head_dim;
+        let sz = std::mem::size_of::<f32>();
+
+        if should_parallelize(heads * q_len * head_dim) && q_len > 0 && head_dim > 0 {
+            output
+                .par_chunks_mut(out_head_stride)
+                .enumerate()
+                .for_each(|(head, out_head)| {
+                    blocked_attention_head(
+                        head, out_head, q_len, key_len, head_dim, block_k, scale,
+                        (q_ptr + head * q_head_stride * sz) as *const f32, q_cs, q_rs,
+                        (k_ptr + head * k_head_stride * sz) as *const f32, k_key_stride, k_dim_stride,
+                        (v_ptr + head * v_head_stride * sz) as *const f32, v_key_stride, v_dim_stride,
+                        mask_ref, mask_2d,
+                    );
+                });
+        } else {
+            for head in 0..heads {
+                let out_head = &mut output[head * out_head_stride..(head + 1) * out_head_stride];
+                blocked_attention_head(
+                    head, out_head, q_len, key_len, head_dim, block_k, scale,
+                    (q_ptr + head * q_head_stride * sz) as *const f32, q_cs, q_rs,
+                    (k_ptr + head * k_head_stride * sz) as *const f32, k_key_stride, k_dim_stride,
+                    (v_ptr + head * v_head_stride * sz) as *const f32, v_key_stride, v_dim_stride,
+                    mask_ref, mask_2d,
+                );
+            }
+        }
+
+        Self::from_owned(output, &[heads, q_len, head_dim])
+    }
+}
+
+fn attention_block_k() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("GAME_ATTENTION_BLOCK_K")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(128)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn blocked_attention_head(
+    head: usize,
+    out_head: &mut [f32],
+    q_len: usize,
+    key_len: usize,
+    head_dim: usize,
+    block_k: usize,
+    scale: f32,
+    q_head_ptr: *const f32,
+    q_cs: isize,
+    q_rs: isize,
+    k_head_ptr: *const f32,
+    k_key_stride: isize,
+    k_dim_stride: isize,
+    v_head_ptr: *const f32,
+    v_key_stride: isize,
+    v_dim_stride: isize,
+    mask_data: Option<&[f32]>,
+    mask_2d: bool,
+) {
+    let mut running_max = vec![f32::NEG_INFINITY; q_len];
+    let mut running_sum = vec![0.0f32; q_len];
+    let mut partial_scores = vec![0.0f32; q_len * block_k];
+
+    for block_start in (0..key_len).step_by(block_k) {
+        let bk = (block_start + block_k).min(key_len) - block_start;
+
+        // Q[head] @ K_block^T * scale → partial_scores[q_len, bk]
+        // K_block^T: transpose expressed via swapped strides
+        let k_block_ptr = unsafe { k_head_ptr.offset(block_start as isize * k_key_stride) };
+        let ps = &mut partial_scores[..q_len * bk];
+        unsafe {
+            attention_gemm_f32(
+                q_len,
+                bk,
+                head_dim,
+                scale,
+                q_head_ptr,
+                q_cs,
+                q_rs,
+                k_block_ptr,
+                k_key_stride,
+                k_dim_stride,
+                ps.as_mut_ptr(),
+                1,
+                bk as isize,
+            );
+        }
+
+        // Online softmax: apply mask, update running max/sum, rescale output, compute exp weights
+        for i in 0..q_len {
+            let row_scores = &mut ps[i * bk..(i + 1) * bk];
+
+            if let Some(mdata) = mask_data {
+                let mask_base = if mask_2d {
+                    i * key_len + block_start
+                } else {
+                    head * q_len * key_len + i * key_len + block_start
+                };
+                for j in 0..bk {
+                    row_scores[j] += mdata[mask_base + j];
+                }
+            }
+
+            let mut block_max = f32::NEG_INFINITY;
+            for &s in row_scores.iter() {
+                if s > block_max {
+                    block_max = s;
+                }
+            }
+
+            let m_new = running_max[i].max(block_max);
+            let correction = (running_max[i] - m_new).exp();
+
+            let out_row = &mut out_head[i * head_dim..(i + 1) * head_dim];
+            for val in out_row.iter_mut() {
+                *val *= correction;
+            }
+
+            let mut block_sum = 0.0f32;
+            for s in row_scores.iter_mut() {
+                *s = (*s - m_new).exp();
+                block_sum += *s;
+            }
+
+            running_sum[i] = running_sum[i] * correction + block_sum;
+            running_max[i] = m_new;
+        }
+
+        // out_head += exp_scores @ V_block (accumulating GEMM)
+        let v_block_ptr = unsafe { v_head_ptr.offset(block_start as isize * v_key_stride) };
+        unsafe {
+            attention_gemm_f32_accum(
+                q_len,
+                head_dim,
+                bk,
+                1.0,
+                ps.as_ptr(),
+                1,
+                bk as isize,
+                v_block_ptr,
+                v_dim_stride,
+                v_key_stride,
+                out_head.as_mut_ptr(),
+                1,
+                head_dim as isize,
+            );
+        }
+    }
+
+    // Final normalize: output /= running_sum
+    for i in 0..q_len {
+        let out_row = &mut out_head[i * head_dim..(i + 1) * head_dim];
+        if running_sum[i] > 0.0 {
+            let inv_sum = 1.0 / running_sum[i];
+            for val in out_row.iter_mut() {
+                *val *= inv_sum;
+            }
+        }
     }
 }
 

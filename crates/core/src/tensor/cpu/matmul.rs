@@ -285,6 +285,43 @@ pub(super) unsafe fn attention_gemm_f32(
     }
 }
 
+#[cfg(feature = "cpu-attention-gemm-matrixmultiply")]
+#[inline]
+pub(super) unsafe fn attention_gemm_f32_accum(
+    rows: usize,
+    cols: usize,
+    inner: usize,
+    product_scale: f32,
+    lhs: *const f32,
+    lhs_cs: isize,
+    lhs_rs: isize,
+    rhs: *const f32,
+    rhs_cs: isize,
+    rhs_rs: isize,
+    dst: *mut f32,
+    dst_cs: isize,
+    dst_rs: isize,
+) {
+    unsafe {
+        matrixmultiply::sgemm(
+            rows,
+            inner,
+            cols,
+            product_scale,
+            lhs,
+            lhs_rs,
+            lhs_cs,
+            rhs,
+            rhs_rs,
+            rhs_cs,
+            1.0,
+            dst,
+            dst_rs,
+            dst_cs,
+        );
+    }
+}
+
 #[cfg(not(feature = "cpu-attention-gemm-matrixmultiply"))]
 #[inline]
 pub(super) unsafe fn attention_gemm_f32(
@@ -318,6 +355,48 @@ pub(super) unsafe fn attention_gemm_f32(
             rhs_cs,
             rhs_rs,
             0.0,
+            product_scale,
+            false,
+            false,
+            false,
+            Parallelism::None,
+        );
+    }
+}
+
+#[cfg(not(feature = "cpu-attention-gemm-matrixmultiply"))]
+#[inline]
+pub(super) unsafe fn attention_gemm_f32_accum(
+    rows: usize,
+    cols: usize,
+    inner: usize,
+    product_scale: f32,
+    lhs: *const f32,
+    lhs_cs: isize,
+    lhs_rs: isize,
+    rhs: *const f32,
+    rhs_cs: isize,
+    rhs_rs: isize,
+    dst: *mut f32,
+    dst_cs: isize,
+    dst_rs: isize,
+) {
+    unsafe {
+        gemm::gemm(
+            rows,
+            cols,
+            inner,
+            dst,
+            dst_cs,
+            dst_rs,
+            true,
+            lhs,
+            lhs_cs,
+            lhs_rs,
+            rhs,
+            rhs_cs,
+            rhs_rs,
+            1.0,
             product_scale,
             false,
             false,
