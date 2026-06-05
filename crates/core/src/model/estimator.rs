@@ -74,7 +74,8 @@ pub fn run_estimator<T: Tensor>(
     let global_positions = build_global_positions(n_regions, seq_len)?;
     let region_ids = build_region_rope_ids(regions, n_regions)?;
     let total_len = n_regions + seq_len;
-    let mask_data = build_joint_attn_mask(regions, n_regions);
+    let mask_data = build_joint_attn_mask(regions, n_regions)
+        .map_err(|err| Error::message(format!("estimator mask failed: {err}")))?;
     let mask = T::from_data(&mask_data, &[total_len, total_len], x_est.device())
         .map_err(|err| Error::message(format!("estimator mask allocation failed: {err}")))?;
 

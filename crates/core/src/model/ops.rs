@@ -46,10 +46,22 @@ pub fn cgmlp<T: Tensor>(x: &T, weights: &CgmlpWeights<T>) -> Result<T> {
         .map_err(|err| Error::message(format!("cgmlp pw2 failed: {err}")))
 }
 
-pub fn build_joint_attn_mask(regions: &[i32], n_regions: usize) -> Vec<f32> {
+pub fn build_joint_attn_mask(regions: &[i32], n_regions: usize) -> Result<Vec<f32>> {
     let seq_len = regions.len();
     let total = n_regions + seq_len;
-    let mut mask = vec![BLOCKED_MASK_VALUE; total * total];
+
+    // Cap the joint-attention mask size (O(n²)) to prevent DoS via huge inputs.
+    // 32M elements = 32M * 4 bytes = 128 MB, same cap as GAME_MAX_ATTENTION_SCORE_ELEMENTS.
+    const MAX_MASK_ELEMENTS: usize = 32 * 1024 * 1024;
+    let mask_elements = total.saturating_mul(total);
+    if mask_elements > MAX_MASK_ELEMENTS {
+        return Err(Error::message(format!(
+            "joint attention mask size {mask_elements} exceeds cap {MAX_MASK_ELEMENTS} \
+            (n_regions={n_regions} seq_len={seq_len})"
+        )));
+    }
+
+    let mut mask = vec![BLOCKED_MASK_VALUE; mask_elements];
 
     let region = |index: usize| -> i32 {
         if index < n_regions {
@@ -83,7 +95,7 @@ pub fn build_joint_attn_mask(regions: &[i32], n_regions: usize) -> Vec<f32> {
         }
     }
 
-    mask
+    Ok(mask)
 }
 
 pub(crate) fn split_last_dim_two<T: Tensor>(tensor: &T) -> Result<(T, T)> {

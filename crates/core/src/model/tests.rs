@@ -12,7 +12,7 @@ use crate::{CpuDevice, CpuTensor, InferParams, InjectedRng, Tensor};
 
 #[test]
 fn joint_attention_mask_matches_region_rules() {
-    let mask = build_joint_attn_mask(&[1, 1, 2, 0], 2);
+    let mask = build_joint_attn_mask(&[1, 1, 2, 0], 2).unwrap();
     let side = 6usize;
 
     assert_eq!(mask.len(), side * side);

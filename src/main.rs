@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
+use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Mutex, OnceLock};
@@ -22,6 +23,38 @@ use game_service::{
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use log::Level;
 use serde_json::{Map, Value, json};
+
+thread_local! {
+    static PANIC_CONTEXT: std::cell::RefCell<PanicContext> = std::cell::RefCell::new(PanicContext::default());
+}
+
+#[derive(Debug, Default, Clone)]
+struct PanicContext {
+    input_file: String,
+    stage: String,
+}
+
+impl PanicContext {
+    fn set(input_file: impl Into<String>, stage: impl Into<String>) {
+        PANIC_CONTEXT.with(|ctx| {
+            let mut c = ctx.borrow_mut();
+            c.input_file = input_file.into();
+            c.stage = stage.into();
+        });
+    }
+
+    fn display(&self) -> String {
+        if self.input_file.is_empty() && self.stage.is_empty() {
+            String::new()
+        } else if self.input_file.is_empty() {
+            format!("stage={}", self.stage)
+        } else if self.stage.is_empty() {
+            format!("file={}", self.input_file)
+        } else {
+            format!("file={} stage={}", self.input_file, self.stage)
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Rust port of GAME GGUF inference")]
@@ -486,6 +519,7 @@ impl RichNotifier {
 
 impl Notifier for RichNotifier {
     fn notify(&self, event: CoreEvent) {
+        log_event(&event);
         match event {
             CoreEvent::ModelLoaded { backend, elapsed } => {
                 self.println(&self.format_stage_line("model loaded", backend, elapsed));
@@ -756,6 +790,7 @@ fn format_chunk_status(message: &str) -> String {
 }
 
 fn main() -> ExitCode {
+    install_panic_hook();
     init_logging();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -764,6 +799,64 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn log_event(event: &CoreEvent) {
+    use log::{error, warn, info};
+    match event {
+        CoreEvent::Status { stage, message } => {
+            info!("[{}] {}", stage, message);
+        }
+        CoreEvent::Progress {
+            stage,
+            current,
+            total,
+            detail,
+        } => {
+            let detail_str = detail
+                .as_ref()
+                .map(|d| format!(" ({})", d))
+                .unwrap_or_default();
+            info!("[{}] progress {}/{}{}", stage, current, total, detail_str);
+        }
+        CoreEvent::Timing {
+            stage,
+            elapsed,
+            detail,
+        } => {
+            let detail_str = detail
+                .as_ref()
+                .map(|d| format!(" {}", d))
+                .unwrap_or_default();
+            info!("[{}] timing {:.3}s{}", stage, elapsed.as_secs_f64(), detail_str);
+        }
+        CoreEvent::ModelLoaded { backend, elapsed } => {
+            info!("model loaded on {} backend in {:.3}s", backend, elapsed.as_secs_f64());
+        }
+        CoreEvent::Message { level, message } => {
+            match level {
+                NotificationLevel::Trace => log::trace!("{}", message),
+                NotificationLevel::Debug => log::debug!("{}", message),
+                NotificationLevel::Info => info!("{}", message),
+                NotificationLevel::Warn => warn!("{}", message),
+                NotificationLevel::Error => error!("{}", message),
+            }
+        }
+    }
+}
+
+fn install_panic_hook() {
+    let default_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |panic_info| {
+        PANIC_CONTEXT.with(|ctx| {
+            let context = ctx.borrow();
+            let context_msg = context.display();
+            if !context_msg.is_empty() {
+                eprintln!("panic breadcrumb: {context_msg}");
+            }
+        });
+        default_hook(panic_info);
+    }));
 }
 
 fn run() -> Result<()> {
@@ -781,6 +874,10 @@ fn run() -> Result<()> {
 }
 
 fn extract(args: ExtractArgs) -> Result<()> {
+    PanicContext::set(
+        args.input.display().to_string(),
+        "extract",
+    );
     let request = build_extract_request(&args);
     let notifier = RichNotifier::new();
     notifier.start(&args);
