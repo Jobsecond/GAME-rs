@@ -1,7 +1,10 @@
 [package]
 name = "game-audio"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "WAV decode, resample, mono mixdown, and silence-based slicing for game-crabml"
 
 [dependencies]
 game-core = { path = "../core" }

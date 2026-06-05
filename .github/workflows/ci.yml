@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Enforcing gate: the code is pure portable Rust, so build + test must pass on
+  # every supported OS and CPU-attention backend. `cpu-attention-gemm-gemm` is the
+  # default (no feature flag); `cpu-attention-gemm-matrixmultiply` is the A/B path.
+  # The two are mutually exclusive (compile_error!), so they are tested separately.
+  test:
+    name: test (${{ matrix.os }} / ${{ matrix.features }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        features:
+          - "--no-default-features"
+          - "--no-default-features --features cpu-attention-gemm-matrixmultiply"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
+      - name: Build
+        run: cargo build --workspace --locked ${{ matrix.features }}
+      - name: Test
+        run: cargo test --workspace --locked ${{ matrix.features }}
+
+  # Enforcing gate: GitHub-hosted runners have no GPU, so the wgpu backend can only
+  # be compile-checked, not run. This still catches breakage in the gpu-gated code.
+  gpu-check:
+    name: gpu compile-check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gpu
+      - name: Check (gpu feature)
+        run: cargo check --workspace --locked --features gpu
+
+  # Advisory (non-blocking) for now: the tree has a pre-existing clippy backlog and
+  # some deliberately hand-formatted SIMD kernels. This job surfaces findings without
+  # failing the build. Once the backlog is cleared, drop `continue-on-error` and add
+  # `-D warnings` to make it an enforcing gate.
+  lint:
+    name: fmt + clippy (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy (default CPU backend)
+        run: cargo clippy --workspace --all-targets --locked --no-default-features
+      - name: clippy (matrixmultiply backend)
+        run: cargo clippy --workspace --all-targets --locked --no-default-features --features cpu-attention-gemm-matrixmultiply
+      - name: clippy (gpu backend)
+        run: cargo clippy --workspace --all-targets --locked --features gpu

@@ -321,7 +321,17 @@ impl GGUFFile {
         let mut reader = GGUFReader::new(&bytes);
         let header = decode_header(&mut reader)?;
 
-        let mut on_disk_tensor_infos = Vec::with_capacity(header.tensor_count);
+        // Cap the capacity hint so a corrupt `tensor_count` cannot trigger a huge
+        // pre-allocation (capacity-overflow panic / allocator abort). The loop still
+        // iterates `tensor_count` times, but each entry is validated against the buffer
+        // by `decode_on_disk_tensor_info`, so a count larger than the file fails cleanly
+        // on the first short read.
+        const MAX_TENSOR_COUNT_HINT: usize = 1 << 20;
+        let tensor_capacity = header
+            .tensor_count
+            .min(reader.remaining())
+            .min(MAX_TENSOR_COUNT_HINT);
+        let mut on_disk_tensor_infos = Vec::with_capacity(tensor_capacity);
         for _ in 0..header.tensor_count {
             on_disk_tensor_infos.push(decode_on_disk_tensor_info(&mut reader, header.version)?);
         }
@@ -401,6 +411,10 @@ impl<'a> GGUFReader<'a> {
 
     fn position(&self) -> usize {
         self.position
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.position)
     }
 
     fn read_exact(&mut self, len: usize) -> Result<&'a [u8]> {
@@ -519,6 +533,16 @@ impl<'a> GGUFReader<'a> {
         }
         let typ = GGUFMetadataValueType::try_from(self.read_u32()?)?;
         let len = self.read_len(version)?;
+        // Every array element occupies at least one byte on disk, so a declared
+        // length larger than the bytes remaining is impossible. Reject it here so a
+        // crafted file cannot drive an enormous `Vec::with_capacity` in the
+        // `read_vec_*` helpers below (capacity-overflow panic / allocator abort).
+        if len > self.remaining() {
+            return Err(Error::Format(format!(
+                "GGUF array declares {len} elements but only {} bytes remain in the file",
+                self.remaining()
+            )));
+        }
         match typ {
             GGUFMetadataValueType::U8 => Ok(GGUFMetadataArray::U8Array(self.read_vec_u8(len)?)),
             GGUFMetadataValueType::I8 => Ok(GGUFMetadataArray::I8Array(self.read_vec_i8(len)?)),
@@ -746,4 +770,65 @@ fn align_up(value: usize, alignment: usize) -> Result<usize> {
 fn u64_to_usize(value: u64) -> Result<usize> {
     usize::try_from(value)
         .map_err(|_| Error::Format(format!("value {value} does not fit into usize")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TYPE_STRING: u32 = 8;
+    const TYPE_ARRAY: u32 = 9;
+    const TYPE_U64: u32 = 10;
+
+    fn push_str(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    // GGUF v3 header prefix: magic, version, tensor_count, metadata_kv_count.
+    fn push_header_prefix(buf: &mut Vec<u8>, tensor_count: u64, metadata_kv_count: u64) {
+        buf.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&tensor_count.to_le_bytes());
+        buf.extend_from_slice(&metadata_kv_count.to_le_bytes());
+    }
+
+    #[test]
+    fn oversized_metadata_array_length_is_rejected_without_panicking() {
+        // One metadata KV whose value is an array<u64> declaring u64::MAX elements in a
+        // tiny file. Before the fix this drove `Vec::with_capacity(usize::MAX)` and
+        // panicked; now it must return a clean Format error.
+        let mut buf = Vec::new();
+        push_header_prefix(&mut buf, 0, 1);
+        push_str(&mut buf, "x");
+        buf.extend_from_slice(&TYPE_ARRAY.to_le_bytes());
+        buf.extend_from_slice(&TYPE_U64.to_le_bytes());
+        buf.extend_from_slice(&u64::MAX.to_le_bytes());
+
+        let bytes: Arc<[u8]> = Arc::from(buf);
+        let err = GGUFFile::decode(bytes).unwrap_err();
+        assert!(
+            matches!(err, Error::Format(ref msg) if msg.contains("remain")),
+            "expected array-length Format error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_tensor_count_is_rejected_without_panicking() {
+        // Valid header (with general.architecture) but tensor_count = u64::MAX and no
+        // tensor-info bytes. The capacity hint must stay bounded and the first entry
+        // must fail cleanly on a short read instead of pre-allocating usize::MAX.
+        let mut buf = Vec::new();
+        push_header_prefix(&mut buf, u64::MAX, 1);
+        push_str(&mut buf, KEY_GENERAL_ARCHITECTURE);
+        buf.extend_from_slice(&TYPE_STRING.to_le_bytes());
+        push_str(&mut buf, "game-me");
+
+        let bytes: Arc<[u8]> = Arc::from(buf);
+        let err = GGUFFile::decode(bytes).unwrap_err();
+        assert!(
+            matches!(err, Error::Format(_)),
+            "expected Format error, got {err:?}"
+        );
+    }
 }

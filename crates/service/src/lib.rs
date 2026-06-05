@@ -504,7 +504,7 @@ fn run_chunked_extract_with_notifier(
             .par_iter()
             .enumerate()
             .map(|(index, chunk)| {
-                infer_chunk(
+                infer_chunk_caught(
                     model,
                     chunk,
                     params,
@@ -520,7 +520,7 @@ fn run_chunked_extract_with_notifier(
             .iter()
             .enumerate()
             .map(|(index, chunk)| {
-                infer_chunk(
+                infer_chunk_caught(
                     model,
                     chunk,
                     params,
@@ -570,6 +570,60 @@ fn chunk_parallelism_enabled(
         && chunk_count > 1
         && rayon::current_num_threads() > 1
         && std::env::var_os("GAME_DISABLE_CHUNK_PARALLELISM").is_none()
+}
+
+/// Runs [`infer_chunk`] but converts a panic into a typed [`Error`] instead of
+/// letting it unwind. In the parallel path Rayon re-raises a worker panic on the
+/// collecting thread, which would bypass the CLI's clean error/exit-code handling
+/// and abort with a raw backtrace. Catching it here keeps a single bad chunk from
+/// taking down the whole process: the error flows through the normal `Result`
+/// aggregation and the operator gets an attributable message.
+fn infer_chunk_caught(
+    model: &Model,
+    chunk: &SliceChunk,
+    params: &InferParams,
+    index: usize,
+    chunk_count: usize,
+    random_chunk_seed_base: Option<u64>,
+    notifier: &dyn Notifier,
+) -> Result<ChunkInferenceResult> {
+    catch_chunk_panic(index, chunk_count, || {
+        infer_chunk(
+            model,
+            chunk,
+            params,
+            index,
+            chunk_count,
+            random_chunk_seed_base,
+            notifier,
+        )
+    })
+}
+
+/// Runs `f`, converting a panic into a typed [`Error`] tagged with the chunk
+/// position. `AssertUnwindSafe` is sound here because each chunk's inference is
+/// independent: on panic we discard that chunk's partial work and surface an
+/// error rather than continuing to read possibly-broken state.
+fn catch_chunk_panic<T>(
+    index: usize,
+    chunk_count: usize,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let detail = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_owned());
+            Err(Error::message(format!(
+                "chunk {}/{} panicked during inference: {detail}",
+                index + 1,
+                chunk_count
+            )))
+        }
+    }
 }
 
 fn infer_chunk(
@@ -785,7 +839,8 @@ mod tests {
 
     use super::{
         DEFAULT_MAX_CHUNK_SECONDS, ExtractDevice, ExtractFormat, ExtractRequest, GpuSelector,
-        extract, infer_extract_format, resolve_extract_format,
+        catch_chunk_panic, derive_chunk_seed, extract, infer_extract_format,
+        resolve_extract_format,
     };
 
     #[test]
@@ -847,6 +902,21 @@ mod tests {
     fn derive_chunk_seed_wraps_without_overflowing() {
         assert_ne!(derive_chunk_seed(0, 0), 0);
         assert_ne!(derive_chunk_seed(u64::MAX, usize::MAX), 0);
+    }
+
+    #[test]
+    fn catch_chunk_panic_converts_panic_to_tagged_error() {
+        let result = catch_chunk_panic::<()>(2, 5, || panic!("kernel exploded"));
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("chunk 3/5"), "missing chunk tag: {msg}");
+        assert!(msg.contains("kernel exploded"), "missing payload: {msg}");
+    }
+
+    #[test]
+    fn catch_chunk_panic_passes_ok_through() {
+        let result = catch_chunk_panic(0, 1, || Ok(42usize));
+        assert_eq!(result.unwrap(), 42);
     }
 
     #[test]

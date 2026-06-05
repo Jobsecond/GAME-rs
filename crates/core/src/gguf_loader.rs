@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use bytemuck::cast_slice;
+use bytemuck::try_cast_slice;
 
 use crate::config::{BackboneConfig, GameModelConfig};
 use crate::error::{Error, Result};
@@ -252,7 +252,18 @@ fn decode_tensor_data(
                 });
             }
 
-            Ok(cast_slice::<u8, f32>(&bytes[..expected_bytes]).to_vec())
+            let data = &bytes[..expected_bytes];
+            // `try_cast_slice` only succeeds when `data` is 4-byte aligned. A crafted
+            // or corrupt GGUF can place tensor data at an unaligned offset, so fall back
+            // to a byte-wise decode instead of letting `cast_slice` panic. `expected_bytes`
+            // is a multiple of 4, so `chunks_exact(4)` consumes the slice with no remainder.
+            match try_cast_slice::<u8, f32>(data) {
+                Ok(floats) => Ok(floats.to_vec()),
+                Err(_) => Ok(data
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect()),
+            }
         }
         _ => Err(Error::UnsupportedTensorType {
             name: name.to_owned(),
@@ -426,6 +437,30 @@ mod tests {
 
         let decoded = decode_tensor_data("x", GGMLType::F32, &bytes, &[3]).unwrap();
         assert_eq!(decoded, vec![1.0, 2.5, -3.0]);
+    }
+
+    #[test]
+    fn f32_tensor_decode_handles_unaligned_input() {
+        // Force the f32 region to begin at a non-4-byte-aligned address so the fast
+        // `try_cast_slice` path fails and the byte-wise fallback runs. Before the fix
+        // this slice made `cast_slice` panic instead of returning a value.
+        let values = [1.0f32, 2.5, -3.0];
+        let mut storage = vec![0u8; 4 + values.len() * 4];
+        let base = storage.as_ptr() as usize;
+        let offset = if (base + 1) % 4 != 0 { 1 } else { 2 };
+        for (i, value) in values.iter().enumerate() {
+            let start = offset + i * 4;
+            storage[start..start + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let unaligned = &storage[offset..offset + values.len() * 4];
+        assert_ne!(
+            unaligned.as_ptr() as usize % 4,
+            0,
+            "test setup must be unaligned"
+        );
+
+        let decoded = decode_tensor_data("x", GGMLType::F32, unaligned, &[3]).unwrap();
+        assert_eq!(decoded, values.to_vec());
     }
 
     #[test]

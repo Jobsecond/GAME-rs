@@ -259,9 +259,19 @@ impl RichNotifier {
         }
     }
 
+    /// Locks the shared state, recovering from a poisoned mutex instead of
+    /// panicking. A worker thread can panic mid-inference while holding this
+    /// lock; the protected `RichState` is only progress-bar bookkeeping and stays
+    /// structurally valid, so we take the inner guard and carry on rather than
+    /// cascading into a second panic during shutdown (`finish`/`print_summary`).
+    fn state(&self) -> std::sync::MutexGuard<'_, RichState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn start(&self, args: &ExtractArgs) {
-        self.state.lock().unwrap().chunk_parallelism_on =
-            args.chunk_parallelism == ChunkParallelism::On;
+        self.state().chunk_parallelism_on = args.chunk_parallelism == ChunkParallelism::On;
         if !self.use_progress {
             self.println(&format!(
                 "Extract {} -> {}",
@@ -298,7 +308,7 @@ impl RichNotifier {
     }
 
     fn chunk_processing_message(&self) -> &'static str {
-        if self.state.lock().unwrap().chunk_parallelism_on {
+        if self.state().chunk_parallelism_on {
             "Processing chunks in parallel..."
         } else {
             "Processing chunks..."
@@ -306,7 +316,7 @@ impl RichNotifier {
     }
 
     fn ensure_chunk_bar(&self, chunk_idx: usize) -> ProgressBar {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         if let Some(bar) = state.chunk_status_bars.get(&chunk_idx) {
             return bar.clone();
         }
@@ -367,7 +377,7 @@ impl RichNotifier {
         }
 
         let chunk_idx = detail.and_then(parse_chunk_index).unwrap_or(0);
-        let state = self.state.lock().unwrap();
+        let state = self.state();
         let chunk_info = state
             .chunk_labels
             .get(&chunk_idx)
@@ -384,7 +394,7 @@ impl RichNotifier {
     }
 
     fn finish(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         self.root.set_message("");
         self.root.finish_and_clear();
         for (_, bar) in state.chunk_status_bars.drain() {
@@ -484,7 +494,7 @@ impl Notifier for RichNotifier {
             CoreEvent::Status { stage, message } => match stage {
                 "extract_infer" => {
                     if let Some(count) = parse_chunk_count_from_message(&message) {
-                        let mut state = self.state.lock().unwrap();
+                        let mut state = self.state();
                         state.total_chunks = Some(count);
                         state.completed_chunks = 0;
                         state.chunk_labels.clear();
@@ -504,7 +514,7 @@ impl Notifier for RichNotifier {
                     let chunk_info = format_chunk_status(&message);
                     let idx = parse_chunk_index(&message).unwrap_or(0);
                     {
-                        let mut state = self.state.lock().unwrap();
+                        let mut state = self.state();
                         state.chunk_labels.insert(idx, chunk_info.clone());
                     }
                     if self.use_progress {
@@ -550,7 +560,7 @@ impl Notifier for RichNotifier {
                         .as_deref()
                         .and_then(|d| parse_kv_usize(d, "chunks="))
                         .map(|n| {
-                            self.state.lock().unwrap().silence_chunk_count = Some(n);
+                            self.state().silence_chunk_count = Some(n);
                             format!("{n} chunk{}", if n != 1 { "s" } else { "" })
                         })
                         .unwrap_or_default();
@@ -558,7 +568,7 @@ impl Notifier for RichNotifier {
                 }
                 "long_chunk_split" => {
                     let after = detail.as_deref().and_then(|d| parse_kv_usize(d, "chunks="));
-                    let before = self.state.lock().unwrap().silence_chunk_count;
+                    let before = self.state().silence_chunk_count;
                     if let (Some(before), Some(after)) = (before, after) {
                         if before != after {
                             let bracket = format!("{before} -> {after}");
@@ -580,7 +590,7 @@ impl Notifier for RichNotifier {
                 }
                 "infer_total" => {
                     let idx = detail.as_deref().and_then(parse_chunk_index).unwrap_or(0);
-                    let mut state = self.state.lock().unwrap();
+                    let mut state = self.state();
                     state.chunk_labels.remove(&idx);
                     if let Some(bar) = state.chunk_status_bars.remove(&idx) {
                         bar.finish_and_clear();
@@ -597,7 +607,7 @@ impl Notifier for RichNotifier {
                 }
                 "chunk_infer" => {}
                 "extract_infer" => {
-                    let mut state = self.state.lock().unwrap();
+                    let mut state = self.state();
                     for (_, bar) in state.chunk_status_bars.drain() {
                         bar.finish_and_clear();
                     }
