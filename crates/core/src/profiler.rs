@@ -1,11 +1,17 @@
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::notify::{CoreEvent, NotificationLevel, emit};
 
 static CPU_PROFILING_ENABLED: OnceLock<bool> = OnceLock::new();
-static CPU_PROFILER_STATE: OnceLock<Mutex<CpuProfilerState>> = OnceLock::new();
+
+// Per-thread profiling state. Using thread_local! ensures concurrent chunks on different
+// Rayon threads don't overwrite each other's profiling data. The session activation state
+// is still coordinated via the single `session_active` cell.
+thread_local! {
+    static CPU_PROFILER_STATE: std::cell::RefCell<CpuProfilerState> = std::cell::RefCell::new(CpuProfilerState::default());
+}
 
 #[derive(Default)]
 struct CpuProfilerState {
@@ -71,13 +77,14 @@ pub(crate) fn cpu_profile_session(label: &'static str) -> CpuProfileSession {
         };
     }
 
-    let mut state = profiler_state().lock().unwrap();
-    state.active = true;
-    state.label.clear();
-    state.label.push_str(label);
-    state.scopes.clear();
-    state.ops.clear();
-    drop(state);
+    CPU_PROFILER_STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.active = true;
+        s.label.clear();
+        s.label.push_str(label);
+        s.scopes.clear();
+        s.ops.clear();
+    });
 
     CpuProfileSession {
         active: true,
@@ -152,10 +159,12 @@ impl Drop for CpuProfileSession {
         }
 
         let elapsed = self.started_at.elapsed();
-        let mut state = profiler_state().lock().unwrap_or_else(|p| p.into_inner());
-        log_profile_section("scope", &state.label, elapsed, &state.scopes);
-        log_profile_section("op", &state.label, elapsed, &state.ops);
-        state.active = false;
+        CPU_PROFILER_STATE.with(|state| {
+            let mut s = state.borrow_mut();
+            log_profile_section("scope", &s.label, elapsed, &s.scopes);
+            log_profile_section("op", &s.label, elapsed, &s.ops);
+            s.active = false;
+        });
     }
 }
 
@@ -166,29 +175,27 @@ impl Drop for ProfileScope {
         }
 
         let elapsed = self.started_at.elapsed();
-        let mut state = profiler_state().lock().unwrap_or_else(|p| p.into_inner());
-        let map = match self.kind {
-            ProfileKind::Scope => &mut state.scopes,
-            ProfileKind::Op => &mut state.ops,
-        };
-        let entry = map
-            .entry(ProfileKey {
-                label: self.label,
-                details: self.details.clone(),
-            })
-            .or_default();
-        entry.calls += 1;
-        entry.total += elapsed;
-        entry.max = entry.max.max(elapsed);
+        CPU_PROFILER_STATE.with(|state| {
+            let mut s = state.borrow_mut();
+            let map = match self.kind {
+                ProfileKind::Scope => &mut s.scopes,
+                ProfileKind::Op => &mut s.ops,
+            };
+            let entry = map
+                .entry(ProfileKey {
+                    label: self.label,
+                    details: self.details.clone(),
+                })
+                .or_default();
+            entry.calls += 1;
+            entry.total += elapsed;
+            entry.max = entry.max.max(elapsed);
+        });
     }
 }
 
-fn profiler_state() -> &'static Mutex<CpuProfilerState> {
-    CPU_PROFILER_STATE.get_or_init(|| Mutex::new(CpuProfilerState::default()))
-}
-
 fn is_session_active() -> bool {
-    profiler_state().lock().unwrap().active
+    CPU_PROFILER_STATE.with(|state| state.borrow().active)
 }
 
 fn log_profile_section(

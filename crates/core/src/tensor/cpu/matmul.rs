@@ -250,6 +250,16 @@ impl CpuTensor {
 
 #[cfg(feature = "cpu-attention-gemm-matrixmultiply")]
 #[inline]
+/// # Safety
+///
+/// The caller must ensure:
+/// - `lhs`, `rhs`, and `dst` are valid, properly-aligned pointers for their respective sizes.
+/// - The pointed-to memory is correctly bounded: `lhs` must cover `rows * inner` elements
+///   (via stride `lhs_rs`), `rhs` must cover `inner * cols` elements (via stride `rhs_rs`),
+///   and `dst` must cover `rows * cols` elements (via stride `dst_rs`).
+/// - All memory regions are properly scoped and don't alias or overlap during the call.
+/// - Strides are signed and in units of elements (f32), not bytes.
+/// - Shape validation (rows, cols, inner > 0 and shape consistency) happens upstream.
 pub(super) unsafe fn attention_gemm_f32(
     rows: usize,
     cols: usize,
@@ -287,6 +297,16 @@ pub(super) unsafe fn attention_gemm_f32(
 
 #[cfg(feature = "cpu-attention-gemm-matrixmultiply")]
 #[inline]
+/// # Safety
+///
+/// The caller must ensure:
+/// - `lhs`, `rhs`, and `dst` are valid, properly-aligned pointers for their respective sizes.
+/// - The pointed-to memory is correctly bounded: `lhs` must cover `rows * inner` elements
+///   (via stride `lhs_rs`), `rhs` must cover `inner * cols` elements (via stride `rhs_rs`),
+///   and `dst` must cover `rows * cols` elements (via stride `dst_rs`).
+/// - All memory regions are properly scoped and don't alias or overlap during the call.
+/// - Strides are signed and in units of elements (f32), not bytes.
+/// - Shape validation (rows, cols, inner > 0 and shape consistency) happens upstream.
 pub(super) unsafe fn attention_gemm_f32_accum(
     rows: usize,
     cols: usize,
@@ -324,6 +344,16 @@ pub(super) unsafe fn attention_gemm_f32_accum(
 
 #[cfg(not(feature = "cpu-attention-gemm-matrixmultiply"))]
 #[inline]
+/// # Safety
+///
+/// The caller must ensure:
+/// - `lhs`, `rhs`, and `dst` are valid, properly-aligned pointers for their respective sizes.
+/// - The pointed-to memory is correctly bounded: `lhs` must cover `rows * inner` elements
+///   (via stride `lhs_rs`), `rhs` must cover `inner * cols` elements (via stride `rhs_rs`),
+///   and `dst` must cover `rows * cols` elements (via stride `dst_rs`).
+/// - All memory regions are properly scoped and don't alias or overlap during the call.
+/// - Strides are signed and in units of elements (f32), not bytes.
+/// - Shape validation (rows, cols, inner > 0 and shape consistency) happens upstream.
 pub(super) unsafe fn attention_gemm_f32(
     rows: usize,
     cols: usize,
@@ -366,6 +396,16 @@ pub(super) unsafe fn attention_gemm_f32(
 
 #[cfg(not(feature = "cpu-attention-gemm-matrixmultiply"))]
 #[inline]
+/// # Safety
+///
+/// The caller must ensure:
+/// - `lhs`, `rhs`, and `dst` are valid, properly-aligned pointers for their respective sizes.
+/// - The pointed-to memory is correctly bounded: `lhs` must cover `rows * inner` elements
+///   (via stride `lhs_rs`), `rhs` must cover `inner * cols` elements (via stride `rhs_rs`),
+///   and `dst` must cover `rows * cols` elements (via stride `dst_rs`).
+/// - All memory regions are properly scoped and don't alias or overlap during the call.
+/// - Strides are signed and in units of elements (f32), not bytes.
+/// - Shape validation (rows, cols, inner > 0 and shape consistency) happens upstream.
 pub(super) unsafe fn attention_gemm_f32_accum(
     rows: usize,
     cols: usize,
