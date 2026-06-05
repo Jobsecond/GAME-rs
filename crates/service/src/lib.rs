@@ -533,7 +533,20 @@ fn run_chunked_extract_with_notifier(
             .collect::<Vec<_>>()
     };
 
-    let mut results = results.into_iter().collect::<Result<Vec<_>>>()?;
+    let mut results = results
+        .into_iter()
+        .enumerate()
+        .map(|(index, r)| {
+            r.map_err(|err| {
+                let msg = err.to_string();
+                if msg.contains("chunk") {
+                    err
+                } else {
+                    Error::message(format!("chunk {}/{}: {err}", index + 1, chunk_count))
+                }
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     results.sort_unstable_by_key(|result| result.index);
 
     let mut notes = Vec::new();

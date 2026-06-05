@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
-use crate::{Note, Result};
+use crate::{Error, Note, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextOutputFormat {
@@ -56,7 +56,11 @@ pub fn write_text_file(
     format: TextOutputFormat,
     options: &TextWriteOptions,
 ) -> Result<()> {
-    fs::write(path.as_ref(), format_notes_text(notes, format, options))?;
+    let path_ref = path.as_ref();
+    fs::write(path_ref, format_notes_text(notes, format, options))
+        .map_err(|err| Error::message(format!("failed to write {} {}: {err}",
+            if format == TextOutputFormat::Csv { "CSV" } else { "TXT" },
+            path_ref.display())))?;
     Ok(())
 }
 

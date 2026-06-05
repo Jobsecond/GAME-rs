@@ -82,3 +82,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked --no-default-features --features cpu-attention-gemm-matrixmultiply
       - name: clippy (gpu backend)
         run: cargo clippy --workspace --all-targets --locked --features gpu
+      - name: cargo-deny
+        run: cargo install cargo-deny && cargo deny check advisories
+
+

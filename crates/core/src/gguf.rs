@@ -388,7 +388,8 @@ pub struct GGUFFileLoader {
 
 impl GGUFFileLoader {
     pub fn new(path: &str, _mlock: bool) -> Result<Self> {
-        let bytes = std::fs::read(Path::new(path))?;
+        let bytes = std::fs::read(Path::new(path))
+            .map_err(|err| Error::message(format!("failed to read GGUF {}: {err}", path)))?;
         Ok(Self {
             bytes: Arc::<[u8]>::from(bytes),
         })

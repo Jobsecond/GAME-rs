@@ -133,7 +133,9 @@ pub fn write_midi_file(
     options: &MidiWriteOptions,
 ) -> Result<()> {
     let bytes = encode_midi(notes, options)?;
-    fs::write(path.as_ref(), bytes)?;
+    let path_ref = path.as_ref();
+    fs::write(path_ref, bytes)
+        .map_err(|err| Error::message(format!("failed to write MIDI {}: {err}", path_ref.display())))?;
     Ok(())
 }
 
