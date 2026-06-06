@@ -232,6 +232,7 @@ struct RichNotifier {
     style_error: Style,
     style_dim: Style,
     style_completed: Style,
+    log_events: bool,
 }
 
 impl RichNotifier {
@@ -240,6 +241,7 @@ impl RichNotifier {
         let is_tty = term.is_term();
         let use_color = is_tty && std::env::var_os("NO_COLOR").is_none();
         let use_progress = is_tty;
+        let log_events = !use_progress && rust_log_requested();
 
         let multi = if use_progress {
             MultiProgress::with_draw_target(ProgressDrawTarget::stderr())
@@ -289,6 +291,7 @@ impl RichNotifier {
             style_error,
             style_dim,
             style_completed,
+            log_events,
         }
     }
 
@@ -329,6 +332,18 @@ impl RichNotifier {
             self.multi.suspend(|| eprintln!("{out}"));
         } else {
             eprintln!("{out}");
+        }
+    }
+
+    fn log_core_event(&self, event: &CoreEvent) {
+        if !self.log_events {
+            return;
+        }
+
+        if self.use_progress {
+            self.multi.suspend(|| log_event(event));
+        } else {
+            log_event(event);
         }
     }
 
@@ -519,7 +534,7 @@ impl RichNotifier {
 
 impl Notifier for RichNotifier {
     fn notify(&self, event: CoreEvent) {
-        log_event(&event);
+        self.log_core_event(&event);
         match event {
             CoreEvent::ModelLoaded { backend, elapsed } => {
                 self.println(&self.format_stage_line("model loaded", backend, elapsed));
@@ -765,6 +780,12 @@ fn parse_kv_usize(detail: &str, key: &str) -> Option<usize> {
         .next()?
         .parse()
         .ok()
+}
+
+fn rust_log_requested() -> bool {
+    std::env::var_os("RUST_LOG")
+        .map(|value| !value.as_os_str().is_empty())
+        .unwrap_or(false)
 }
 
 fn format_chunk_status(message: &str) -> String {
