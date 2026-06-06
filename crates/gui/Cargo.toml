@@ -1,0 +1,25 @@
+[package]
+name = "game-gui"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Jobsecond"]
+description = "egui frontend for game-crabml WAV-to-MIDI extraction"
+rust-version = "1.92"
+
+[features]
+default = []
+gpu = ["game-core/gpu", "game-service/gpu"]
+cpu-attention-gemm-gemm = ["game-core/cpu-attention-gemm-gemm", "game-service/cpu-attention-gemm-gemm"]
+cpu-attention-gemm-matrixmultiply = ["game-core/cpu-attention-gemm-matrixmultiply", "game-service/cpu-attention-gemm-matrixmultiply"]
+
+[dependencies]
+crossbeam = "0.8"
+eframe = { version = "0.34", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.34"
+game-core = { path = "../core", default-features = false }
+game-service = { path = "../service", default-features = false }
+rfd = "0.17"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }
