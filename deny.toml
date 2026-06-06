@@ -1,12 +1,12 @@
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-unsound = "warn"
+version = 2
+unmaintained = "workspace"
+unsound = "workspace"
 yanked = "warn"
 
 [licenses]
-allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC"]
-deny = ["GPL-2.0", "GPL-3.0", "AGPL-3.0"]
+version = 2
+allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unlicense", "Unicode-3.0"]
 
 [bans]
 multiple-versions = "warn"
