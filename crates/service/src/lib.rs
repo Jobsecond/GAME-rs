@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, Arc, Condvar, OnceLock};
 use std::time::{Duration, Instant};
 
 use game_audio::{
@@ -19,6 +20,65 @@ pub use game_core::{
 pub use game_output::{MidiWriteOptions, TextOutputFormat, TextWriteOptions};
 
 pub const DEFAULT_MAX_CHUNK_SECONDS: usize = 60;
+
+/// Semaphore for limiting concurrent chunk inference to prevent memory exhaustion.
+/// Initialized once per process with capacity = number of Rayon threads.
+struct ChunkSemaphore {
+    inner: Arc<(Mutex<usize>, Condvar)>,
+}
+
+impl Clone for ChunkSemaphore {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl ChunkSemaphore {
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: Arc::new((Mutex::new(capacity), Condvar::new())),
+        }
+    }
+
+    fn acquire(&self) {
+        let (lock, cond) = &*self.inner;
+        let mut count = lock.lock().unwrap();
+        while *count == 0 {
+            count = cond.wait(count).unwrap();
+        }
+        *count -= 1;
+    }
+
+    fn release(&self) {
+        let (lock, cond) = &*self.inner;
+        let mut count = lock.lock().unwrap();
+        *count += 1;
+        cond.notify_one();
+    }
+}
+
+struct SemaphoreGuard(ChunkSemaphore);
+impl Drop for SemaphoreGuard {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+static CHUNK_SEMAPHORE: OnceLock<ChunkSemaphore> = OnceLock::new();
+
+fn get_chunk_semaphore() -> ChunkSemaphore {
+    CHUNK_SEMAPHORE
+        .get_or_init(|| {
+            let max_concurrent = std::env::var("GAME_MAX_CONCURRENT_CHUNKS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or_else(|| rayon::current_num_threads());
+            ChunkSemaphore::new(max_concurrent)
+        })
+        .clone()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExtractDevice {
@@ -591,6 +651,9 @@ fn chunk_parallelism_enabled(
 /// and abort with a raw backtrace. Catching it here keeps a single bad chunk from
 /// taking down the whole process: the error flows through the normal `Result`
 /// aggregation and the operator gets an attributable message.
+///
+/// Also acquires a semaphore permit before inference to limit concurrent chunks
+/// and prevent memory exhaustion when many chunks are queued on Rayon workers.
 fn infer_chunk_caught(
     model: &Model,
     chunk: &SliceChunk,
@@ -601,6 +664,9 @@ fn infer_chunk_caught(
     notifier: &dyn Notifier,
 ) -> Result<ChunkInferenceResult> {
     catch_chunk_panic(index, chunk_count, || {
+        let sem = get_chunk_semaphore();
+        sem.acquire();
+        let _guard = SemaphoreGuard(sem);
         infer_chunk(
             model,
             chunk,
