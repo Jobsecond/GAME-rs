@@ -802,7 +802,7 @@ fn main() -> ExitCode {
 }
 
 fn log_event(event: &CoreEvent) {
-    use log::{error, warn, info};
+    use log::{error, info, warn};
     match event {
         CoreEvent::Status { stage, message } => {
             info!("[{}] {}", stage, message);
@@ -828,20 +828,27 @@ fn log_event(event: &CoreEvent) {
                 .as_ref()
                 .map(|d| format!(" {}", d))
                 .unwrap_or_default();
-            info!("[{}] timing {:.3}s{}", stage, elapsed.as_secs_f64(), detail_str);
+            info!(
+                "[{}] timing {:.3}s{}",
+                stage,
+                elapsed.as_secs_f64(),
+                detail_str
+            );
         }
         CoreEvent::ModelLoaded { backend, elapsed } => {
-            info!("model loaded on {} backend in {:.3}s", backend, elapsed.as_secs_f64());
+            info!(
+                "model loaded on {} backend in {:.3}s",
+                backend,
+                elapsed.as_secs_f64()
+            );
         }
-        CoreEvent::Message { level, message } => {
-            match level {
-                NotificationLevel::Trace => log::trace!("{}", message),
-                NotificationLevel::Debug => log::debug!("{}", message),
-                NotificationLevel::Info => info!("{}", message),
-                NotificationLevel::Warn => warn!("{}", message),
-                NotificationLevel::Error => error!("{}", message),
-            }
-        }
+        CoreEvent::Message { level, message } => match level {
+            NotificationLevel::Trace => log::trace!("{}", message),
+            NotificationLevel::Debug => log::debug!("{}", message),
+            NotificationLevel::Info => info!("{}", message),
+            NotificationLevel::Warn => warn!("{}", message),
+            NotificationLevel::Error => error!("{}", message),
+        },
     }
 }
 
@@ -874,10 +881,7 @@ fn run() -> Result<()> {
 }
 
 fn extract(args: ExtractArgs) -> Result<()> {
-    PanicContext::set(
-        args.input.display().to_string(),
-        "extract",
-    );
+    PanicContext::set(args.input.display().to_string(), "extract");
     let request = build_extract_request(&args);
     let notifier = RichNotifier::new();
     notifier.start(&args);
@@ -1851,11 +1855,15 @@ mod tests {
         audio_name: &str,
         max_chunk_seconds: usize,
     ) {
+        let model_path = root.join("assets").join("models").join("large.gguf");
         let audio_path = root.join("assets").join("audio").join(audio_name);
-        if !audio_path.exists() {
+        if let Some(missing) = [&model_path, &audio_path]
+            .into_iter()
+            .find(|path| !path.exists())
+        {
             eprintln!(
                 "skipping CPU-vs-GPU regression: missing {}",
-                audio_path.display()
+                missing.display()
             );
             return;
         }

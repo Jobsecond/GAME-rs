@@ -373,7 +373,9 @@ impl CpuTensor {
 
         let block_k = attention_block_k();
         if block_k > 0 && key_len > block_k {
-            return Self::fused_attention_blocked(q, k, v, mask, scale, heads, q_len, key_len, head_dim, block_k);
+            return Self::fused_attention_blocked(
+                q, k, v, mask, scale, heads, q_len, key_len, head_dim, block_k,
+            );
         }
 
         let mask_shape = mask.map(|m| m.shape().to_vec());
@@ -596,22 +598,48 @@ impl CpuTensor {
                 .enumerate()
                 .for_each(|(head, out_head)| {
                     blocked_attention_head(
-                        head, out_head, q_len, key_len, head_dim, block_k, scale,
-                        (q_ptr + head * q_head_stride * sz) as *const f32, q_cs, q_rs,
-                        (k_ptr + head * k_head_stride * sz) as *const f32, k_key_stride, k_dim_stride,
-                        (v_ptr + head * v_head_stride * sz) as *const f32, v_key_stride, v_dim_stride,
-                        mask_ref, mask_2d,
+                        head,
+                        out_head,
+                        q_len,
+                        key_len,
+                        head_dim,
+                        block_k,
+                        scale,
+                        (q_ptr + head * q_head_stride * sz) as *const f32,
+                        q_cs,
+                        q_rs,
+                        (k_ptr + head * k_head_stride * sz) as *const f32,
+                        k_key_stride,
+                        k_dim_stride,
+                        (v_ptr + head * v_head_stride * sz) as *const f32,
+                        v_key_stride,
+                        v_dim_stride,
+                        mask_ref,
+                        mask_2d,
                     );
                 });
         } else {
             for head in 0..heads {
                 let out_head = &mut output[head * out_head_stride..(head + 1) * out_head_stride];
                 blocked_attention_head(
-                    head, out_head, q_len, key_len, head_dim, block_k, scale,
-                    (q_ptr + head * q_head_stride * sz) as *const f32, q_cs, q_rs,
-                    (k_ptr + head * k_head_stride * sz) as *const f32, k_key_stride, k_dim_stride,
-                    (v_ptr + head * v_head_stride * sz) as *const f32, v_key_stride, v_dim_stride,
-                    mask_ref, mask_2d,
+                    head,
+                    out_head,
+                    q_len,
+                    key_len,
+                    head_dim,
+                    block_k,
+                    scale,
+                    (q_ptr + head * q_head_stride * sz) as *const f32,
+                    q_cs,
+                    q_rs,
+                    (k_ptr + head * k_head_stride * sz) as *const f32,
+                    k_key_stride,
+                    k_dim_stride,
+                    (v_ptr + head * v_head_stride * sz) as *const f32,
+                    v_key_stride,
+                    v_dim_stride,
+                    mask_ref,
+                    mask_2d,
                 );
             }
         }

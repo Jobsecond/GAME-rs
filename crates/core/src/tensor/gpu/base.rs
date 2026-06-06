@@ -187,11 +187,6 @@ impl GpuDevice {
         match self.inner.device.poll(wgpu::Maintain::wait()) {
             wgpu::MaintainResult::Ok => {}
             wgpu::MaintainResult::SubmissionQueueEmpty => {}
-            wgpu::MaintainResult::Timeout => {
-                return Err(Error::message(
-                    "GPU readback timeout: device hung or driver TDR triggered"
-                ))
-            }
         }
         rx.recv()
             .map_err(|err| Error::message(format!("failed to receive GPU map status: {err}")))?

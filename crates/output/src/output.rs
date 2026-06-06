@@ -57,10 +57,17 @@ pub fn write_text_file(
     options: &TextWriteOptions,
 ) -> Result<()> {
     let path_ref = path.as_ref();
-    fs::write(path_ref, format_notes_text(notes, format, options))
-        .map_err(|err| Error::message(format!("failed to write {} {}: {err}",
-            if format == TextOutputFormat::Csv { "CSV" } else { "TXT" },
-            path_ref.display())))?;
+    fs::write(path_ref, format_notes_text(notes, format, options)).map_err(|err| {
+        Error::message(format!(
+            "failed to write {} {}: {err}",
+            if format == TextOutputFormat::Csv {
+                "CSV"
+            } else {
+                "TXT"
+            },
+            path_ref.display()
+        ))
+    })?;
     Ok(())
 }
 

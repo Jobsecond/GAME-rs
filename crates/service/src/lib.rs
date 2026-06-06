@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Arc, Condvar, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use game_audio::{
@@ -985,7 +985,7 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        DEFAULT_MAX_CHUNK_SECONDS, ChunkSemaphore, ExtractDevice, ExtractFormat, ExtractRequest,
+        ChunkSemaphore, DEFAULT_MAX_CHUNK_SECONDS, ExtractDevice, ExtractFormat, ExtractRequest,
         GpuSelector, SemaphoreGuard, catch_chunk_panic, derive_chunk_seed, extract,
         infer_extract_format, resolve_extract_format,
     };
