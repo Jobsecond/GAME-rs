@@ -147,7 +147,7 @@ pub(super) fn suffix_broadcast_block_len(
     }
 
     let rank_diff = out.len() - rhs.len();
-    if out[..rank_diff].iter().any(|&dim| dim == 0) {
+    if out[..rank_diff].contains(&0) {
         return None;
     }
     if out[rank_diff..] != rhs[..] {

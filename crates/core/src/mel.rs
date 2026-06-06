@@ -328,7 +328,7 @@ fn reflect_pad(signal: &[f32], pad_l: usize, pad_r: usize) -> Result<Vec<f32>> {
 
 fn pad_sizes(win_length: usize, hop_length: usize) -> (usize, usize) {
     let diff = win_length - hop_length;
-    (diff / 2, (diff + 1) / 2)
+    (diff / 2, diff.div_ceil(2))
 }
 
 #[cfg(test)]

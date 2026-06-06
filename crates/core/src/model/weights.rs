@@ -981,7 +981,7 @@ fn validate_supported_config(cfg: &GameModelConfig) -> Result<()> {
     Ok(())
 }
 
-fn layer_scale_name<'a>(enabled: bool, name: &'a str) -> Option<&'a str> {
+fn layer_scale_name(enabled: bool, name: &str) -> Option<&str> {
     enabled.then_some(name)
 }
 

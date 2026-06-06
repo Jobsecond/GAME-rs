@@ -74,7 +74,7 @@ fn get_chunk_semaphore() -> ChunkSemaphore {
             let max_concurrent = std::env::var("GAME_MAX_CONCURRENT_CHUNKS")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or_else(|| rayon::current_num_threads());
+                .unwrap_or_else(rayon::current_num_threads);
             ChunkSemaphore::new(max_concurrent)
         })
         .clone()

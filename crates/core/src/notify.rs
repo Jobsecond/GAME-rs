@@ -50,7 +50,7 @@ impl Notifier for NullNotifier {
 }
 
 thread_local! {
-    static CURRENT_NOTIFIER: RefCell<Vec<(usize, usize)>> = RefCell::new(Vec::new());
+    static CURRENT_NOTIFIER: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
 }
 
 pub(crate) fn with_notifier<T>(notifier: &dyn Notifier, f: impl FnOnce() -> T) -> T {

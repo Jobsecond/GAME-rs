@@ -16,9 +16,9 @@ fn joint_attention_mask_matches_region_rules() {
     let side = 6usize;
 
     assert_eq!(mask.len(), side * side);
-    assert_eq!(mask[0 * side + 1], 0.0);
-    assert_eq!(mask[0 * side + 2], 0.0);
-    assert_eq!(mask[0 * side + 4], -10_000.0);
+    assert_eq!(mask[1], 0.0);
+    assert_eq!(mask[2], 0.0);
+    assert_eq!(mask[4], -10_000.0);
     assert_eq!(mask[2 * side + 3], 0.0);
     assert_eq!(mask[4 * side + 5], -10_000.0);
     assert_eq!(mask[5 * side + 5], -10_000.0);
@@ -278,7 +278,6 @@ fn fake_config() -> GameModelConfig {
             midi_std: 1.0,
             ..Default::default()
         },
-        ..Default::default()
     }
 }
 

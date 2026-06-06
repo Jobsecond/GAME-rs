@@ -89,7 +89,7 @@ pub fn encode_midi(notes: &[Note], options: &MidiWriteOptions) -> Result<Vec<u8>
         tick: last_tick,
         kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
     });
-    events.sort_by(|left, right| left.tick.cmp(&right.tick));
+    events.sort_by_key(|left| left.tick);
 
     let mut prev_tick = 0u64;
     let mut track = Vec::with_capacity(events.len());

@@ -1043,7 +1043,7 @@ fn inspect(
     print_inspect_section("model_config");
     print_inspect_kv("name", display_or_dash(&model.config.name));
     print_inspect_kv("version", display_or_dash(&model.config.version));
-    print_inspect_kv("mode", model.config.mode.to_string());
+    print_inspect_kv("mode", &model.config.mode);
     print_inspect_kv("embedding dim", model.config.embedding_dim.to_string());
     print_inspect_kv("input dim", model.config.in_dim.to_string());
     print_inspect_kv("estimator out", model.config.estimator_out_dim.to_string());
