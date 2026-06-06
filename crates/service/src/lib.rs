@@ -81,6 +81,10 @@ fn get_chunk_semaphore() -> ChunkSemaphore {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Specifies which compute device to use for inference.
+/// - `Auto`: Try GPU if available, fall back to CPU on failure.
+/// - `Cpu`: Use CPU backend only.
+/// - `Gpu`: Use GPU backend (error if unavailable).
 pub enum ExtractDevice {
     #[default]
     Auto,
@@ -89,6 +93,10 @@ pub enum ExtractDevice {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Controls whether to parallelize inference across multiple audio chunks.
+/// - `Auto`: Enable if multiple chunks, CPU backend, and multiple Rayon threads.
+/// - `On`: Force parallel inference (error if conditions not met).
+/// - `Off`: Force serial inference.
 pub enum ChunkParallelism {
     #[default]
     Auto,
@@ -97,6 +105,7 @@ pub enum ChunkParallelism {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Output file format for extracted notes.
 pub enum ExtractFormat {
     Midi,
     Txt,
@@ -104,9 +113,14 @@ pub enum ExtractFormat {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// GPU adapter selection criteria.
+/// Selectors are combined with AND logic: all non-None fields must match.
 pub struct GpuSelector {
+    /// Match adapter name containing this substring (case-insensitive).
     pub name_substring: Option<String>,
+    /// Match adapter vendor ID (e.g., 0x10de = NVIDIA).
     pub vendor_id: Option<u32>,
+    /// Match adapter device ID.
     pub device_id: Option<u32>,
 }
 
@@ -142,14 +156,24 @@ impl ExtractOutputRequest {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Request to extract notes from audio.
+/// See `extract_with_notifier()` for the main entry point.
 pub struct ExtractRequest {
+    /// Path to GGUF model file.
     pub model_path: PathBuf,
+    /// Path to WAV audio file to process.
     pub input_path: PathBuf,
+    /// Optional output file (path + format). If None, inference runs but no file is written.
     pub output: Option<ExtractOutputRequest>,
+    /// Which compute device to use (Auto/Cpu/Gpu).
     pub device: ExtractDevice,
+    /// GPU adapter selection criteria (ignored if device != Gpu).
     pub gpu: GpuSelector,
+    /// Inference parameters (language, d3pm_nsteps, thresholds, seed, etc.).
     pub infer_params: InferParams,
+    /// Whether to parallelize across chunks (Auto/On/Off).
     pub chunk_parallelism: ChunkParallelism,
+    /// Max duration of a single chunk before hard-splitting. Prevents OOM on very long audio.
     pub max_chunk_seconds: usize,
 }
 
@@ -169,12 +193,15 @@ impl Default for ExtractRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Result of an audio extraction.
 pub struct ExtractOutputResult {
     pub path: PathBuf,
     pub format: ExtractFormat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Information about the GPU adapter used for inference.
+/// Derived from `wgpu::AdapterInfo` and hoisted to avoid public dependency on wgpu.
 pub struct GpuAdapterInfo {
     pub name: String,
     pub backend: String,
@@ -233,16 +260,27 @@ pub struct ExtractTimings {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Result of successful audio-to-MIDI extraction.
 pub struct ExtractResult {
+    /// Extracted note events with timing, duration, pitch, and voicing.
     pub notes: Vec<Note>,
+    /// Which backend was used (CPU or GPU).
     pub backend: Backend,
+    /// GPU adapter info if GPU was used; None if CPU.
     pub gpu_adapter: Option<GpuAdapterInfo>,
+    /// Audio information (sample rate, channels, resampling applied, etc.).
     pub audio: PreparedAudioInfo,
+    /// Total number of mel frames extracted from audio.
     pub total_frames: usize,
+    /// Duration of one mel frame in seconds (depends on sample rate and hop size).
     pub timestep_seconds: f32,
+    /// Number of chunks after all splitting (silence boundaries + hard length limits).
     pub chunk_count: usize,
+    /// Number of chunks before hard-splitting long chunks (after silence slicing only).
     pub chunks_before_long_split: usize,
+    /// Where output was written, if requested.
     pub output: Option<ExtractOutputResult>,
+    /// Timings for each inference stage.
     pub timings: ExtractTimings,
 }
 
@@ -320,10 +358,40 @@ impl PrefixedNotifier<'_> {
     }
 }
 
+/// Convenience wrapper for `extract_with_notifier` using a null notifier.
+/// Use `extract_with_notifier` directly if you want progress events.
 pub fn extract(request: &ExtractRequest) -> Result<ExtractResult> {
     extract_with_notifier(request, &NullNotifier)
 }
 
+/// Main entry point for audio-to-MIDI extraction.
+///
+/// # Workflow
+///
+/// 1. Loads a GGUF model on the specified device (GPU with CPU fallback, or CPU).
+/// 2. Decodes the input WAV file and resamples if needed.
+/// 3. Slices audio on silence boundaries, splits long chunks, and runs inference in
+///    parallel (if enabled and conditions permit).
+/// 4. Aggregates extracted notes and optionally writes output file (MIDI/TXT/CSV).
+/// 5. Emits structured events to the notifier for progress tracking and logging.
+///
+/// # Important Contracts
+///
+/// - **Seed behavior**: If `request.infer_params.seed == 0`, a random seed is used;
+///   parallel chunks derive deterministic per-chunk seeds from a base seed.
+///   This enables reproducibility when the same seed is provided.
+///
+/// - **Note units**: Output note timing is in seconds (float); pitch is in MIDI numbers
+///   where 60 = C4, and can be fractional for microtonal pitches.
+///
+/// - **Concurrency limits**: At most `GAME_MAX_CONCURRENT_CHUNKS` (default: number of
+///   Rayon threads) chunks are being processed simultaneously. The rest wait in the
+///   queue, bounded by a semaphore to prevent RAM exhaustion.
+///
+/// # Errors
+///
+/// Returns `Error` on GGUF parsing, WAV decoding, model inference, or I/O failures.
+/// GPU timeouts (TDR, VRAM OOM) return a clean error; the service layer retries on CPU.
 pub fn extract_with_notifier(
     request: &ExtractRequest,
     notifier: &dyn Notifier,
