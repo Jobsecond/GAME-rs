@@ -917,9 +917,9 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        DEFAULT_MAX_CHUNK_SECONDS, ExtractDevice, ExtractFormat, ExtractRequest, GpuSelector,
-        catch_chunk_panic, derive_chunk_seed, extract, infer_extract_format,
-        resolve_extract_format,
+        DEFAULT_MAX_CHUNK_SECONDS, ChunkSemaphore, ExtractDevice, ExtractFormat, ExtractRequest,
+        GpuSelector, SemaphoreGuard, catch_chunk_panic, derive_chunk_seed, extract,
+        infer_extract_format, resolve_extract_format,
     };
 
     #[test]
@@ -1004,5 +1004,33 @@ mod tests {
             ExtractRequest::default().max_chunk_seconds,
             DEFAULT_MAX_CHUNK_SECONDS
         );
+    }
+
+    #[test]
+    fn semaphore_allows_concurrent_acquires_up_to_capacity() {
+        let sem = ChunkSemaphore::new(2);
+        sem.acquire();
+        sem.acquire();
+        // Both acquired, no hang; would deadlock if capacity was wrong.
+        // Release in reverse order to clean up.
+        drop(SemaphoreGuard(sem.clone()));
+        drop(SemaphoreGuard(sem));
+    }
+
+    #[test]
+    fn derive_chunk_seed_is_deterministic() {
+        let seed1 = derive_chunk_seed(12345, 0);
+        let seed2 = derive_chunk_seed(12345, 0);
+        assert_eq!(seed1, seed2, "derive_chunk_seed must be deterministic");
+    }
+
+    #[test]
+    fn derive_chunk_seed_varies_by_index() {
+        let seed_0 = derive_chunk_seed(12345, 0);
+        let seed_1 = derive_chunk_seed(12345, 1);
+        let seed_2 = derive_chunk_seed(12345, 2);
+        assert_ne!(seed_0, seed_1);
+        assert_ne!(seed_1, seed_2);
+        assert_ne!(seed_0, seed_2);
     }
 }
