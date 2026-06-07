@@ -18,16 +18,76 @@ impl GuiApp {
 }
 
 fn configure_egui(ctx: &egui::Context) {
-    ctx.set_visuals(egui::Visuals::light());
+    let visuals = fluent_visuals();
+    ctx.set_visuals(visuals.clone());
 
     let mut style = (*ctx.global_style()).clone();
-    style.spacing.item_spacing = egui::vec2(12.0, 10.0);
+    style.spacing.item_spacing = egui::vec2(12.0, 8.0);
     style.spacing.button_padding = egui::vec2(12.0, 6.0);
     style.spacing.interact_size = egui::vec2(72.0, 28.0);
-    style.visuals = egui::Visuals::light();
+    style.spacing.window_margin = egui::Margin::symmetric(18, 18);
+    style.text_styles.insert(
+        egui::TextStyle::Body,
+        egui::FontId::new(14.0, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Button,
+        egui::FontId::new(14.0, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Heading,
+        egui::FontId::new(22.0, egui::FontFamily::Proportional),
+    );
+    style.visuals = visuals;
     ctx.set_global_style(style);
 
     ctx.set_fonts(build_system_fonts());
+}
+
+fn fluent_visuals() -> egui::Visuals {
+    let mut visuals = egui::Visuals::light();
+    visuals.panel_fill = pages::APP_BG;
+    visuals.window_fill = pages::SURFACE;
+    visuals.window_corner_radius = egui::CornerRadius::same(8);
+    visuals.window_stroke = egui::Stroke::new(1.0, pages::STROKE);
+    visuals.menu_corner_radius = egui::CornerRadius::same(4);
+    visuals.faint_bg_color = pages::SUBTLE_SURFACE;
+    visuals.extreme_bg_color = pages::SURFACE;
+    visuals.text_edit_bg_color = Some(pages::SURFACE);
+    visuals.hyperlink_color = pages::ACCENT;
+    visuals.selection.bg_fill = pages::ACCENT;
+    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    visuals.weak_text_color = Some(pages::TEXT_SECONDARY);
+    visuals.override_text_color = Some(pages::TEXT_PRIMARY);
+    visuals.slider_trailing_fill = true;
+
+    let corner = egui::CornerRadius::same(4);
+    visuals.widgets.noninteractive.corner_radius = corner;
+    visuals.widgets.noninteractive.bg_fill = pages::SURFACE;
+    visuals.widgets.noninteractive.weak_bg_fill = pages::SUBTLE_SURFACE;
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, pages::STROKE);
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, pages::TEXT_PRIMARY);
+
+    visuals.widgets.inactive.corner_radius = corner;
+    visuals.widgets.inactive.bg_fill = pages::SURFACE;
+    visuals.widgets.inactive.weak_bg_fill = pages::SURFACE;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, pages::CONTROL_STROKE);
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, pages::TEXT_PRIMARY);
+
+    visuals.widgets.hovered.corner_radius = corner;
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(250, 250, 250);
+    visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(250, 250, 250);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(96, 96, 96));
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, pages::TEXT_PRIMARY);
+
+    visuals.widgets.active.corner_radius = corner;
+    visuals.widgets.active.bg_fill = pages::SURFACE;
+    visuals.widgets.active.weak_bg_fill = pages::SURFACE;
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, pages::ACCENT_HOVER);
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, pages::TEXT_PRIMARY);
+
+    visuals.widgets.open = visuals.widgets.hovered.clone();
+    visuals
 }
 
 fn build_system_fonts() -> egui::FontDefinitions {
@@ -319,7 +379,11 @@ impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().inner_margin(18.0))
+            .frame(
+                egui::Frame::default()
+                    .fill(pages::APP_BG)
+                    .inner_margin(egui::Margin::symmetric(22, 22)),
+            )
             .show_inside(ui, |ui| {
                 pages::render_page(ui, &mut self.state, &ctx);
             });

@@ -1,16 +1,25 @@
 use std::time::Duration;
 
-use crate::state::{AppState, ChunkStatus, GuiLogLevel, StageTiming, format_duration};
+use crate::state::{
+    AppState, ChunkProgress, ChunkStatus, GuiLogLevel, StageTiming, format_duration,
+};
+
+use super::{
+    ACCENT, STROKE, TEXT_PRIMARY, TEXT_SECONDARY, page_title, section_frame, section_title,
+};
 
 pub fn render(ui: &mut egui::Ui, state: &mut AppState) {
     ui.ctx().request_repaint_after(Duration::from_millis(100));
 
-    ui.heading(if state.cancel_requested {
-        "Cancelling extraction"
-    } else {
-        "Extraction in progress"
-    });
-    ui.add_space(8.0);
+    page_title(
+        ui,
+        if state.cancel_requested {
+            "Cancelling extraction"
+        } else {
+            "Extraction in progress"
+        },
+    );
+    ui.add_space(14.0);
 
     render_overall(ui, state);
     ui.add_space(12.0);
@@ -31,86 +40,159 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 fn render_overall(ui: &mut egui::Ui, state: &AppState) {
-    if let Some((current, total)) = state.overall_progress {
-        let fraction = if total == 0 {
-            0.0
-        } else {
-            current as f32 / total as f32
-        };
-        ui.add(
-            egui::ProgressBar::new(fraction)
-                .text(format!("{current}/{total} chunks"))
-                .desired_width(f32::INFINITY)
-                .animate(state.is_running && !state.cancel_requested),
-        );
-    } else {
-        ui.add(
-            egui::ProgressBar::new(0.0)
-                .text("Starting")
-                .desired_width(f32::INFINITY)
-                .animate(state.is_running && !state.cancel_requested),
-        );
-    }
+    let fraction = overall_fraction(state);
+    let label = match state.overall_progress {
+        Some((current, total)) => {
+            let percent = (fraction * 100.0).round() as usize;
+            format!("{percent}% - {current}/{total} chunks complete")
+        }
+        None => "Starting".to_owned(),
+    };
 
-    ui.add_space(6.0);
-    ui.label(&state.overall_status);
+    progress_header(ui, "Overall", &label, false);
+    ui.add_space(4.0);
+    progress_track(ui, fraction, ACCENT, 8.0);
+
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new(&state.overall_status).color(TEXT_SECONDARY));
     if !state.status_text.is_empty() {
-        ui.label(&state.status_text);
+        ui.label(egui::RichText::new(&state.status_text).color(TEXT_SECONDARY));
     }
 }
 
 fn render_chunks(ui: &mut egui::Ui, state: &AppState) {
-    egui::Frame::group(ui.style()).show(ui, |ui| {
+    section_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.heading("Chunks");
-        ui.add_space(4.0);
+        section_title(ui, "Chunks");
+        ui.add_space(8.0);
 
         if state.chunk_progress.is_empty() {
             ui.label("Waiting for chunk discovery...");
             return;
         }
 
-        for chunk in &state.chunk_progress {
-            let fraction = if chunk.d3pm_total == 0 {
-                0.0
-            } else {
-                chunk.d3pm_current as f32 / chunk.d3pm_total as f32
-            };
-            let text = match &chunk.status {
-                ChunkStatus::Pending => format!("{}: pending", chunk.label),
-                ChunkStatus::Running => format!(
-                    "{}: D3PM step {}/{}",
-                    chunk.label, chunk.d3pm_current, chunk.d3pm_total
-                ),
-                ChunkStatus::Completed => format!("{}: complete", chunk.label),
-                ChunkStatus::Failed(message) => format!("{}: {message}", chunk.label),
-            };
+        egui::ScrollArea::vertical()
+            .id_salt("chunk_progress")
+            .max_height(320.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                for (index, chunk) in state.chunk_progress.iter().enumerate() {
+                    let fraction = chunk_fraction(chunk);
+                    let (detail, fill) = chunk_detail(ui, chunk, fraction);
+                    let active = matches!(chunk.status, ChunkStatus::Running);
 
-            let mut bar = egui::ProgressBar::new(fraction)
-                .text(text)
-                .desired_width(f32::INFINITY)
-                .animate(matches!(chunk.status, ChunkStatus::Running));
-
-            match &chunk.status {
-                ChunkStatus::Completed => {
-                    bar = bar.fill(egui::Color32::from_rgb(66, 150, 92));
+                    progress_header(ui, &chunk.label, &detail, active);
+                    ui.add_space(4.0);
+                    progress_track(ui, fraction, fill, 6.0);
+                    if index + 1 < state.chunk_progress.len() {
+                        ui.add_space(10.0);
+                    }
                 }
-                ChunkStatus::Failed(_) => {
-                    bar = bar.fill(ui.visuals().error_fg_color);
-                }
-                _ => {}
-            }
-
-            ui.add(bar);
-        }
+            });
     });
 }
 
-fn render_timings(ui: &mut egui::Ui, state: &AppState) {
-    egui::Frame::group(ui.style()).show(ui, |ui| {
+fn progress_header(ui: &mut egui::Ui, label: &str, detail: &str, active: bool) {
+    ui.horizontal(|ui| {
         ui.set_width(ui.available_width());
-        ui.heading("Stage Timings");
-        ui.add_space(4.0);
+        if active {
+            ui.add(egui::Spinner::new().size(14.0));
+            ui.add_space(2.0);
+        }
+        ui.label(egui::RichText::new(label).color(TEXT_PRIMARY));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(egui::RichText::new(detail).color(TEXT_SECONDARY));
+        });
+    });
+}
+
+fn progress_track(
+    ui: &mut egui::Ui,
+    fraction: f32,
+    fill: egui::Color32,
+    height: f32,
+) -> egui::Response {
+    let desired_size = egui::vec2(ui.available_width(), height);
+    let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+    let fraction = fraction.clamp(0.0, 1.0);
+    let radius = egui::CornerRadius::same((height / 2.0).round() as u8);
+
+    ui.painter()
+        .rect_filled(rect, radius, egui::Color32::from_rgb(230, 230, 230));
+
+    let fill_width = rect.width() * fraction;
+    if fill_width >= 0.5 {
+        let fill_rect = egui::Rect::from_min_size(rect.min, egui::vec2(fill_width, rect.height()));
+        ui.painter().rect_filled(fill_rect, radius, fill);
+    }
+
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        egui::Stroke::new(1.0, STROKE),
+        egui::StrokeKind::Inside,
+    );
+
+    response
+}
+
+fn chunk_detail(ui: &egui::Ui, chunk: &ChunkProgress, fraction: f32) -> (String, egui::Color32) {
+    match &chunk.status {
+        ChunkStatus::Pending => ("Pending".to_owned(), egui::Color32::TRANSPARENT),
+        ChunkStatus::Running => (
+            format!(
+                "D3PM {}/{} - {}%",
+                chunk.d3pm_current,
+                chunk.d3pm_total,
+                (fraction * 100.0).round() as usize
+            ),
+            ACCENT,
+        ),
+        ChunkStatus::Completed => ("Complete".to_owned(), egui::Color32::from_rgb(16, 124, 16)),
+        ChunkStatus::Failed(message) => (message.clone(), ui.visuals().error_fg_color),
+    }
+}
+
+fn overall_fraction(state: &AppState) -> f32 {
+    if !state.chunk_progress.is_empty() {
+        let total_progress = state.chunk_progress.iter().map(chunk_fraction).sum::<f32>();
+        return total_progress / state.chunk_progress.len() as f32;
+    }
+
+    state
+        .overall_progress
+        .map(|(current, total)| {
+            if total == 0 {
+                0.0
+            } else {
+                current as f32 / total as f32
+            }
+        })
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0)
+}
+
+fn chunk_fraction(chunk: &ChunkProgress) -> f32 {
+    match &chunk.status {
+        ChunkStatus::Pending => 0.0,
+        ChunkStatus::Completed => 1.0,
+        ChunkStatus::Running | ChunkStatus::Failed(_) => {
+            if chunk.d3pm_total == 0 {
+                0.0
+            } else {
+                chunk.d3pm_current as f32 / chunk.d3pm_total as f32
+            }
+        }
+    }
+    .clamp(0.0, 1.0)
+}
+
+fn render_timings(ui: &mut egui::Ui, state: &AppState) {
+    section_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        section_title(ui, "Stage Timings");
+        ui.add_space(8.0);
 
         egui::Grid::new("stage_timings")
             .num_columns(3)
@@ -135,10 +217,10 @@ fn render_timings(ui: &mut egui::Ui, state: &AppState) {
 }
 
 fn render_log(ui: &mut egui::Ui, state: &AppState) {
-    egui::Frame::group(ui.style()).show(ui, |ui| {
+    section_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.heading("Event Log");
-        ui.add_space(4.0);
+        section_title(ui, "Event Log");
+        ui.add_space(8.0);
         egui::ScrollArea::vertical()
             .id_salt("event_log")
             .stick_to_bottom(true)

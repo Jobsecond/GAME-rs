@@ -3,41 +3,46 @@ use std::process::Command;
 
 use crate::state::{AppState, backend_name, format_count, format_duration, output_format_name};
 
+use super::{TEXT_SECONDARY, page_title, primary_button, section_frame, section_title};
+
 pub fn render(ui: &mut egui::Ui, state: &mut AppState) {
     let Some(summary) = ResultSummary::from_state(state) else {
-        ui.heading("No extraction result");
+        page_title(ui, "No extraction result");
         if ui.button("Back to Configuration").clicked() {
             state.reset_to_config();
         }
         return;
     };
 
-    ui.heading("Extraction Complete");
-    ui.add_space(10.0);
+    page_title(ui, "Extraction Complete");
+    ui.add_space(14.0);
 
-    egui::Grid::new("result_summary")
-        .num_columns(2)
-        .spacing([24.0, 7.0])
-        .show(ui, |ui| {
-            row(ui, "Backend", &summary.backend);
-            row(ui, "Total notes", &summary.note_count);
-            row(ui, "Chunks", &summary.chunk_count);
-            row(ui, "Audio duration", &summary.audio_duration);
-            row(ui, "Frames", &summary.total_frames);
-            row(ui, "Total time", &summary.total_time);
-            if let Some(output) = &summary.output_display {
-                row(ui, "Output", output);
-            }
-        });
+    section_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        egui::Grid::new("result_summary")
+            .num_columns(2)
+            .spacing([28.0, 8.0])
+            .show(ui, |ui| {
+                row(ui, "Backend", &summary.backend);
+                row(ui, "Total notes", &summary.note_count);
+                row(ui, "Chunks", &summary.chunk_count);
+                row(ui, "Audio duration", &summary.audio_duration);
+                row(ui, "Frames", &summary.total_frames);
+                row(ui, "Total time", &summary.total_time);
+                if let Some(output) = &summary.output_display {
+                    row(ui, "Output", output);
+                }
+            });
+    });
 
     ui.add_space(16.0);
-    egui::Frame::group(ui.style()).show(ui, |ui| {
+    section_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.heading("Timing Breakdown");
-        ui.add_space(4.0);
+        section_title(ui, "Timing Breakdown");
+        ui.add_space(8.0);
         egui::Grid::new("result_timings")
             .num_columns(2)
-            .spacing([24.0, 6.0])
+            .spacing([28.0, 8.0])
             .show(ui, |ui| {
                 row(ui, "Model load", &summary.model_load);
                 row(ui, "Audio prep", &summary.audio_prepare);
@@ -57,7 +62,7 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState) {
     ui.add_space(16.0);
     ui.horizontal(|ui| {
         if ui
-            .add(egui::Button::new("Extract Again").min_size(egui::vec2(130.0, 32.0)))
+            .add(primary_button("Extract Again").min_size(egui::vec2(130.0, 32.0)))
             .clicked()
         {
             state.reset_to_config();
@@ -80,7 +85,7 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 fn row(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.label(label);
+    ui.label(egui::RichText::new(label).color(TEXT_SECONDARY));
     ui.label(value);
     ui.end_row();
 }

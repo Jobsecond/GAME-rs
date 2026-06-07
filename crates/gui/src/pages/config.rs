@@ -4,104 +4,147 @@ use game_service::{ChunkParallelism, ExtractDevice, ExtractFormat};
 
 use crate::state::{AppState, chunk_parallelism_name, device_name, output_format_name};
 
+use super::{
+    APP_BG, CONTROL_FILL, TEXT_SECONDARY, control_frame, error_frame, page_title, primary_button,
+    section_frame, section_title,
+};
+
 pub fn render(ui: &mut egui::Ui, state: &mut AppState, ctx: &egui::Context) {
     apply_dropped_files(state, ctx);
 
-    ui.heading("Configuration");
-    ui.add_space(8.0);
+    egui::Panel::bottom("config_action_bar")
+        .exact_size(58.0)
+        .frame(
+            egui::Frame::NONE
+                .fill(APP_BG)
+                .inner_margin(egui::Margin::symmetric(0, 10)),
+        )
+        .show_inside(ui, |ui| {
+            render_action_bar(ui, state, ctx);
+        });
+
+    egui::CentralPanel::default()
+        .frame(egui::Frame::NONE)
+        .show_inside(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("config_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    render_config_body(ui, state, ctx);
+                    ui.add_space(8.0);
+                });
+        });
+}
+
+fn render_config_body(ui: &mut egui::Ui, state: &mut AppState, ctx: &egui::Context) {
+    page_title(ui, "Configuration");
+    ui.add_space(14.0);
 
     if let Some(message) = state.error_message.clone() {
-        egui::Frame::group(ui.style())
-            .fill(ui.visuals().error_fg_color.linear_multiply(0.08))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.colored_label(ui.visuals().error_fg_color, message);
-                    if ui.button("Dismiss").clicked() {
-                        state.clear_error();
-                    }
-                });
+        error_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.colored_label(ui.visuals().error_fg_color, message);
+                if ui.button("Dismiss").clicked() {
+                    state.clear_error();
+                }
             });
-        ui.add_space(8.0);
+        });
+        ui.add_space(12.0);
     } else if !state.status_text.is_empty() {
         ui.label(&state.status_text);
-        ui.add_space(8.0);
+        ui.add_space(12.0);
     }
 
-    let path_width = (ui.available_width() - LABEL_WIDTH - BROWSE_WIDTH - 36.0).clamp(420.0, 760.0);
-    let _ = path_row(
-        ui,
-        "Model (.gguf)",
-        &mut state.config.model_path,
-        "Path to model.gguf",
-        path_width,
-        || {
-            rfd::FileDialog::new()
-                .add_filter("GGUF model", &["gguf"])
-                .pick_file()
-        },
-    );
-    if let Some(path) = path_row(
-        ui,
-        "Audio (.wav)",
-        &mut state.config.audio_path,
-        "Path to input.wav",
-        path_width,
-        || {
-            rfd::FileDialog::new()
-                .add_filter("WAV audio", &["wav"])
-                .pick_file()
-        },
-    ) {
-        state.set_audio_path(path);
-    }
+    section_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let path_width =
+            (ui.available_width() - LABEL_WIDTH - BROWSE_WIDTH - 36.0).clamp(420.0, 820.0);
+        let _ = path_row(
+            ui,
+            "Model (.gguf)",
+            &mut state.config.model_path,
+            "Path to model.gguf",
+            path_width,
+            || {
+                rfd::FileDialog::new()
+                    .add_filter("GGUF model", &["gguf"])
+                    .pick_file()
+            },
+        );
+        if let Some(path) = path_row(
+            ui,
+            "Audio (.wav)",
+            &mut state.config.audio_path,
+            "Path to input.wav",
+            path_width,
+            || {
+                rfd::FileDialog::new()
+                    .add_filter("WAV audio", &["wav"])
+                    .pick_file()
+            },
+        ) {
+            state.set_audio_path(path);
+        }
 
-    let output_path_default = state.config.output_path.clone();
-    let audio_path_default = state.config.audio_path.clone();
-    let output_format_default = state.config.output_format;
-    if let Some(path) = path_row(
-        ui,
-        "Output",
-        &mut state.config.output_path,
-        "Path to output.mid",
-        path_width,
-        || {
-            output_dialog_path(
-                &output_path_default,
-                &audio_path_default,
-                output_format_default,
-            )
-        },
-    ) {
-        state.set_output_path(path);
-    }
+        let output_path_default = state.config.output_path.clone();
+        let audio_path_default = state.config.audio_path.clone();
+        let output_format_default = state.config.output_format;
+        if let Some(path) = path_row(
+            ui,
+            "Output",
+            &mut state.config.output_path,
+            "Path to output.mid",
+            path_width,
+            || {
+                output_dialog_path(
+                    &output_path_default,
+                    &audio_path_default,
+                    output_format_default,
+                )
+            },
+        ) {
+            state.set_output_path(path);
+        }
 
-    ui.horizontal(|ui| {
-        row_label(ui, "Format");
-        egui::ComboBox::from_id_salt("output_format")
-            .selected_text(output_format_name(state.config.output_format))
-            .width(160.0)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut state.config.output_format, ExtractFormat::Midi, "MIDI");
-                ui.selectable_value(&mut state.config.output_format, ExtractFormat::Txt, "TXT");
-                ui.selectable_value(&mut state.config.output_format, ExtractFormat::Csv, "CSV");
-            });
+        ui.horizontal(|ui| {
+            row_label(ui, "Format");
+            egui::ComboBox::from_id_salt("output_format")
+                .selected_text(output_format_name(state.config.output_format))
+                .width(160.0)
+                .height(ROW_HEIGHT)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut state.config.output_format,
+                        ExtractFormat::Midi,
+                        "MIDI",
+                    );
+                    ui.selectable_value(&mut state.config.output_format, ExtractFormat::Txt, "TXT");
+                    ui.selectable_value(&mut state.config.output_format, ExtractFormat::Csv, "CSV");
+                });
+        });
     });
 
-    ui.add_space(14.0);
+    ui.add_space(16.0);
     render_device_section(ui, state, ctx);
-    ui.add_space(14.0);
+    ui.add_space(16.0);
     render_inference_section(ui, state);
-    ui.add_space(18.0);
+}
 
+fn render_action_bar(ui: &mut egui::Ui, state: &mut AppState, ctx: &egui::Context) {
     ui.horizontal(|ui| {
         let start = ui.add_enabled(
             !state.is_running,
-            egui::Button::new("Start Extraction").min_size(egui::vec2(170.0, 34.0)),
+            primary_button("Start Extraction").min_size(egui::vec2(178.0, 34.0)),
         );
         if start.clicked() {
             state.start_extraction(ctx);
         }
-        ui.label("Drop .gguf, .wav, .mid, .txt, or .csv files onto this window to fill paths.");
+        ui.label(
+            egui::RichText::new(
+                "Drop .gguf, .wav, .mid, .txt, or .csv files onto this window to fill paths.",
+            )
+            .color(TEXT_SECONDARY),
+        );
     });
 }
 
@@ -122,7 +165,11 @@ fn path_row(
         row_label(ui, label);
         ui.add_sized(
             [path_width, ROW_HEIGHT],
-            egui::TextEdit::singleline(value).hint_text(hint),
+            egui::TextEdit::singleline(value)
+                .hint_text(hint)
+                .background_color(CONTROL_FILL)
+                .frame(control_frame())
+                .margin(egui::Margin::symmetric(4, 4)),
         );
         if ui
             .add_sized([BROWSE_WIDTH, ROW_HEIGHT], egui::Button::new("Browse"))
@@ -140,15 +187,15 @@ fn path_row(
 fn row_label(ui: &mut egui::Ui, text: &str) {
     ui.add_sized(
         [LABEL_WIDTH, ROW_HEIGHT],
-        egui::Label::new(text).selectable(false),
+        egui::Label::new(egui::RichText::new(text).color(TEXT_SECONDARY)).selectable(false),
     );
 }
 
 fn render_device_section(ui: &mut egui::Ui, state: &mut AppState, _ctx: &egui::Context) {
-    egui::Frame::group(ui.style()).show(ui, |ui| {
+    section_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.heading("Device");
-        ui.add_space(4.0);
+        section_title(ui, "Device");
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.radio_value(
                 &mut state.config.device,
@@ -174,9 +221,9 @@ fn render_device_section(ui: &mut egui::Ui, state: &mut AppState, _ctx: &egui::C
         {
             if state.config.device != ExtractDevice::Cpu {
                 state.ensure_gpu_adapter_refresh_started(_ctx);
-                ui.add_space(8.0);
+                ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    ui.label("GPU");
+                    ui.label(egui::RichText::new("GPU").color(TEXT_SECONDARY));
                     let selected = state
                         .config
                         .selected_gpu_index
@@ -187,6 +234,7 @@ fn render_device_section(ui: &mut egui::Ui, state: &mut AppState, _ctx: &egui::C
                     egui::ComboBox::from_id_salt("gpu_adapter")
                         .selected_text(selected)
                         .width(360.0)
+                        .height(ROW_HEIGHT)
                         .show_ui(ui, |ui| {
                             if ui
                                 .selectable_label(
@@ -241,41 +289,42 @@ fn render_device_section(ui: &mut egui::Ui, state: &mut AppState, _ctx: &egui::C
 }
 
 fn render_inference_section(ui: &mut egui::Ui, state: &mut AppState) {
-    egui::Frame::group(ui.style()).show(ui, |ui| {
+    section_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.heading("Inference Parameters");
-        ui.add_space(4.0);
+        section_title(ui, "Inference Parameters");
+        ui.add_space(10.0);
 
         egui::Grid::new("inference_grid")
             .num_columns(2)
             .spacing([24.0, 10.0])
             .min_col_width(168.0)
             .show(ui, |ui| {
-                ui.label("D3PM steps");
+                grid_label(ui, "D3PM steps");
                 ui.add_sized(
                     [110.0, ROW_HEIGHT],
                     egui::DragValue::new(&mut state.config.d3pm_nsteps).range(1..=256),
                 );
                 ui.end_row();
 
-                ui.label("Seed");
+                grid_label(ui, "Seed");
                 ui.add_sized(
                     [110.0, ROW_HEIGHT],
                     egui::DragValue::new(&mut state.config.seed),
                 );
                 ui.end_row();
 
-                ui.label("Language ID");
+                grid_label(ui, "Language ID");
                 ui.add_sized(
                     [110.0, ROW_HEIGHT],
                     egui::DragValue::new(&mut state.config.language),
                 );
                 ui.end_row();
 
-                ui.label("Chunk parallelism");
+                grid_label(ui, "Chunk parallelism");
                 egui::ComboBox::from_id_salt("chunk_parallelism")
                     .selected_text(chunk_parallelism_name(state.config.chunk_parallelism))
                     .width(160.0)
+                    .height(ROW_HEIGHT)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
                             &mut state.config.chunk_parallelism,
@@ -295,28 +344,28 @@ fn render_inference_section(ui: &mut egui::Ui, state: &mut AppState) {
                     });
                 ui.end_row();
 
-                ui.label("Max chunk seconds");
+                grid_label(ui, "Max chunk seconds");
                 ui.add_sized(
                     [110.0, ROW_HEIGHT],
                     egui::DragValue::new(&mut state.config.max_chunk_seconds).range(1..=7200),
                 );
                 ui.end_row();
 
-                ui.label("Boundary threshold");
+                grid_label(ui, "Boundary threshold");
                 ui.add_sized(
                     [360.0, ROW_HEIGHT],
                     egui::Slider::new(&mut state.config.boundary_threshold, 0.0..=1.0),
                 );
                 ui.end_row();
 
-                ui.label("Note threshold");
+                grid_label(ui, "Note threshold");
                 ui.add_sized(
                     [360.0, ROW_HEIGHT],
                     egui::Slider::new(&mut state.config.note_threshold, 0.0..=1.0),
                 );
                 ui.end_row();
 
-                ui.label("Boundary radius");
+                grid_label(ui, "Boundary radius");
                 ui.add_sized(
                     [110.0, ROW_HEIGHT],
                     egui::DragValue::new(&mut state.config.boundary_radius).range(0..=64),
@@ -324,6 +373,10 @@ fn render_inference_section(ui: &mut egui::Ui, state: &mut AppState) {
                 ui.end_row();
             });
     });
+}
+
+fn grid_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).color(TEXT_SECONDARY));
 }
 
 fn apply_dropped_files(state: &mut AppState, ctx: &egui::Context) {
