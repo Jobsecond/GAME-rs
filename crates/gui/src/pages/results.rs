@@ -14,6 +14,70 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState) {
         return;
     };
 
+    // Pin the actions to an always-visible bottom bar so "Extract Again" stays
+    // reachable no matter how tall the (scrollable) summary/notes body grows.
+    egui::Panel::bottom("results_action_bar")
+        .exact_size(58.0)
+        .frame(
+            egui::Frame::NONE
+                .fill(ui.visuals().panel_fill)
+                .inner_margin(egui::Margin::symmetric(0, 10)),
+        )
+        .show_inside(ui, |ui| {
+            render_action_bar(ui, state, &summary);
+        });
+
+    egui::CentralPanel::default()
+        .frame(egui::Frame::NONE)
+        .show_inside(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("results_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    render_results_body(ui, state, &summary);
+                    ui.add_space(8.0);
+                });
+        });
+}
+
+fn render_action_bar(ui: &mut egui::Ui, state: &mut AppState, summary: &ResultSummary) {
+    ui.horizontal(|ui| {
+        if ui
+            .add(primary_button(ui, "Extract Again").min_size(egui::vec2(140.0, 34.0)))
+            .clicked()
+        {
+            state.reset_to_config();
+        }
+
+        if let Some(path) = &summary.output_path {
+            if ui
+                .add(egui::Button::new("Open File").min_size(egui::vec2(120.0, 34.0)))
+                .clicked()
+            {
+                match open_path(path) {
+                    Ok(()) => state.status_text.clear(),
+                    Err(err) => state.status_text = format!("Failed to open output file: {err}"),
+                }
+            }
+
+            if ui
+                .add(egui::Button::new("Open Output Folder").min_size(egui::vec2(170.0, 34.0)))
+                .clicked()
+            {
+                match open_output_folder(path) {
+                    Ok(()) => state.status_text.clear(),
+                    Err(err) => state.status_text = format!("Failed to open output folder: {err}"),
+                }
+            }
+        }
+
+        if !state.status_text.is_empty() {
+            ui.label(egui::RichText::new(&state.status_text).color(ui.visuals().weak_text_color()));
+        }
+    });
+}
+
+fn render_results_body(ui: &mut egui::Ui, state: &AppState, summary: &ResultSummary) {
     page_title(ui, "Extraction Complete");
     ui.add_space(14.0);
 
@@ -56,47 +120,6 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState) {
 
     ui.add_space(16.0);
     render_notes_preview(ui, state);
-
-    if !state.status_text.is_empty() {
-        ui.add_space(8.0);
-        ui.label(&state.status_text);
-    }
-
-    ui.add_space(16.0);
-    ui.horizontal(|ui| {
-        if ui
-            .add(primary_button(ui, "Extract Again").min_size(egui::vec2(130.0, 32.0)))
-            .clicked()
-        {
-            state.reset_to_config();
-        }
-
-        if let Some(path) = &summary.output_path {
-            if ui
-                .add(egui::Button::new("Open File").min_size(egui::vec2(120.0, 32.0)))
-                .clicked()
-            {
-                match open_path(path) {
-                    Ok(()) => state.status_text.clear(),
-                    Err(err) => {
-                        state.status_text = format!("Failed to open output file: {err}");
-                    }
-                }
-            }
-
-            if ui
-                .add(egui::Button::new("Open Output Folder").min_size(egui::vec2(160.0, 32.0)))
-                .clicked()
-            {
-                match open_output_folder(path) {
-                    Ok(()) => state.status_text.clear(),
-                    Err(err) => {
-                        state.status_text = format!("Failed to open output folder: {err}");
-                    }
-                }
-            }
-        }
-    });
 }
 
 fn row(ui: &mut egui::Ui, label: &str, value: &str) {

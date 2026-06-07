@@ -8,6 +8,31 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState) {
     // Animation/refresh while running is driven by `GuiApp::logic` (gated on
     // `is_running`) plus the notifier's per-event repaints, so this page does
     // not need its own unconditional repaint timer.
+    egui::Panel::bottom("progress_action_bar")
+        .exact_size(58.0)
+        .frame(
+            egui::Frame::NONE
+                .fill(ui.visuals().panel_fill)
+                .inner_margin(egui::Margin::symmetric(0, 10)),
+        )
+        .show_inside(ui, |ui| {
+            render_action_bar(ui, state);
+        });
+
+    egui::CentralPanel::default()
+        .frame(egui::Frame::NONE)
+        .show_inside(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("progress_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    render_progress_body(ui, state);
+                    ui.add_space(8.0);
+                });
+        });
+}
+
+fn render_progress_body(ui: &mut egui::Ui, state: &AppState) {
     page_title(
         ui,
         if state.cancel_requested {
@@ -26,7 +51,9 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState) {
     ui.add_space(12.0);
     render_log(ui, state);
     ui.add_space(12.0);
+}
 
+fn render_action_bar(ui: &mut egui::Ui, state: &mut AppState) {
     let cancel = ui.add_enabled(
         state.is_running && !state.cancel_requested,
         egui::Button::new("Cancel").min_size(egui::vec2(110.0, 32.0)),
@@ -46,7 +73,7 @@ fn render_overall(ui: &mut egui::Ui, state: &AppState) {
         None => "Starting".to_owned(),
     };
 
-    progress_header(ui, "Overall", &label, false);
+    progress_header(ui, "Overall", &label, HeaderIndicator::None);
     ui.add_space(4.0);
     progress_track(ui, fraction, accent(ui), 8.0);
 
@@ -77,9 +104,9 @@ fn render_chunks(ui: &mut egui::Ui, state: &AppState) {
                 for (index, chunk) in state.chunk_progress.iter().enumerate() {
                     let fraction = chunk_fraction(chunk);
                     let (detail, fill) = chunk_detail(ui, chunk, fraction);
-                    let active = matches!(chunk.status, ChunkStatus::Running);
+                    let indicator = chunk_indicator(ui, &chunk.status);
 
-                    progress_header(ui, &chunk.label, &detail, active);
+                    progress_header(ui, &chunk.label, &detail, indicator);
                     ui.add_space(4.0);
                     progress_track(ui, fraction, fill, 6.0);
                     if index + 1 < state.chunk_progress.len() {
@@ -90,18 +117,110 @@ fn render_chunks(ui: &mut egui::Ui, state: &AppState) {
     });
 }
 
-fn progress_header(ui: &mut egui::Ui, label: &str, detail: &str, active: bool) {
+fn progress_header(ui: &mut egui::Ui, label: &str, detail: &str, indicator: HeaderIndicator) {
     ui.horizontal(|ui| {
         ui.set_width(ui.available_width());
-        if active {
-            ui.add(egui::Spinner::new().size(14.0));
-            ui.add_space(2.0);
+        match indicator {
+            HeaderIndicator::None => {}
+            HeaderIndicator::Running => {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.add_space(2.0);
+            }
+            HeaderIndicator::Badge(badge) => {
+                render_badge(ui, badge);
+                ui.add_space(4.0);
+            }
         }
         ui.label(egui::RichText::new(label).color(ui.visuals().text_color()));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(egui::RichText::new(detail).color(ui.visuals().weak_text_color()));
         });
     });
+}
+
+#[derive(Clone, Copy)]
+enum HeaderIndicator {
+    None,
+    Running,
+    Badge(BadgeStyle),
+}
+
+#[derive(Clone, Copy)]
+struct BadgeStyle {
+    text: &'static str,
+    fill: egui::Color32,
+    stroke: egui::Color32,
+    text_color: egui::Color32,
+}
+
+fn chunk_indicator(ui: &egui::Ui, status: &ChunkStatus) -> HeaderIndicator {
+    match status {
+        ChunkStatus::Pending => HeaderIndicator::Badge(BadgeStyle {
+            text: "Pending",
+            fill: ui.visuals().faint_bg_color,
+            stroke: ui.visuals().window_stroke.color,
+            text_color: ui.visuals().weak_text_color(),
+        }),
+        ChunkStatus::Running => HeaderIndicator::Running,
+        ChunkStatus::Completed => {
+            let badge = if ui.visuals().dark_mode {
+                BadgeStyle {
+                    text: "Finished",
+                    fill: egui::Color32::from_rgb(22, 64, 42),
+                    stroke: egui::Color32::from_rgb(45, 164, 78),
+                    text_color: egui::Color32::from_rgb(180, 236, 196),
+                }
+            } else {
+                BadgeStyle {
+                    text: "Finished",
+                    fill: egui::Color32::from_rgb(223, 246, 221),
+                    stroke: egui::Color32::from_rgb(16, 124, 16),
+                    text_color: egui::Color32::from_rgb(16, 124, 16),
+                }
+            };
+            HeaderIndicator::Badge(badge)
+        }
+        ChunkStatus::Failed(_) => {
+            let badge = if ui.visuals().dark_mode {
+                BadgeStyle {
+                    text: "Failed",
+                    fill: egui::Color32::from_rgb(64, 26, 28),
+                    stroke: egui::Color32::from_rgb(232, 86, 76),
+                    text_color: egui::Color32::from_rgb(255, 220, 220),
+                }
+            } else {
+                BadgeStyle {
+                    text: "Failed",
+                    fill: egui::Color32::from_rgb(253, 231, 233),
+                    stroke: egui::Color32::from_rgb(196, 43, 28),
+                    text_color: egui::Color32::from_rgb(196, 43, 28),
+                }
+            };
+            HeaderIndicator::Badge(badge)
+        }
+    }
+}
+
+fn render_badge(ui: &mut egui::Ui, badge: BadgeStyle) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(BADGE_WIDTH, BADGE_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let radius = egui::CornerRadius::same(4);
+    ui.painter().rect_filled(rect, radius, badge.fill);
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        egui::Stroke::new(1.0, badge.stroke),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        badge.text,
+        egui::FontId::proportional(12.0),
+        badge.text_color,
+    );
 }
 
 fn progress_track(
@@ -272,3 +391,6 @@ const STAGE_ORDER: &[(&str, &str)] = &[
     ("extract_infer", "Inference"),
     ("output_write", "Output write"),
 ];
+
+const BADGE_WIDTH: f32 = 76.0;
+const BADGE_HEIGHT: f32 = 20.0;
