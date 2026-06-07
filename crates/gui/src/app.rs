@@ -10,87 +10,106 @@ pub struct GuiApp {
 
 impl GuiApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        configure_egui(&cc.egui_ctx);
-        Self {
-            state: AppState::new(),
+        let mut state = AppState::new();
+        if let Some(storage) = cc.storage {
+            crate::state::load_persisted_settings(storage, &mut state);
         }
+        let cjk_loaded = configure_egui(&cc.egui_ctx, state.theme);
+        state.cjk_font_missing = !cjk_loaded;
+        Self { state }
     }
 }
 
-fn configure_egui(ctx: &egui::Context) {
-    let visuals = fluent_visuals();
-    ctx.set_visuals(visuals.clone());
+/// Applies visuals/spacing/fonts. Returns whether a CJK fallback font loaded.
+fn configure_egui(ctx: &egui::Context, theme: crate::state::ThemeChoice) -> bool {
+    // Register a full custom palette for BOTH themes so every widget themes
+    // correctly; egui then renders with whichever the preference resolves to.
+    ctx.set_visuals_of(
+        egui::Theme::Light,
+        make_visuals(&pages::Palette::LIGHT, false),
+    );
+    ctx.set_visuals_of(egui::Theme::Dark, make_visuals(&pages::Palette::DARK, true));
+    ctx.set_theme(theme.to_preference());
 
-    let mut style = (*ctx.global_style()).clone();
-    style.spacing.item_spacing = egui::vec2(12.0, 8.0);
-    style.spacing.button_padding = egui::vec2(12.0, 6.0);
-    style.spacing.interact_size = egui::vec2(72.0, 28.0);
-    style.spacing.window_margin = egui::Margin::symmetric(18, 18);
-    style.text_styles.insert(
-        egui::TextStyle::Body,
-        egui::FontId::new(14.0, egui::FontFamily::Proportional),
-    );
-    style.text_styles.insert(
-        egui::TextStyle::Button,
-        egui::FontId::new(14.0, egui::FontFamily::Proportional),
-    );
-    style.text_styles.insert(
-        egui::TextStyle::Heading,
-        egui::FontId::new(22.0, egui::FontFamily::Proportional),
-    );
-    style.visuals = visuals;
-    ctx.set_global_style(style);
+    // Theme-independent spacing and fonts apply to both styles.
+    ctx.all_styles_mut(|style| {
+        style.spacing.item_spacing = egui::vec2(12.0, 8.0);
+        style.spacing.button_padding = egui::vec2(12.0, 6.0);
+        style.spacing.interact_size = egui::vec2(72.0, 28.0);
+        style.spacing.window_margin = egui::Margin::symmetric(18, 18);
+        style.text_styles.insert(
+            egui::TextStyle::Body,
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Button,
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Heading,
+            egui::FontId::new(22.0, egui::FontFamily::Proportional),
+        );
+    });
 
-    ctx.set_fonts(build_system_fonts());
+    let (fonts, cjk_loaded) = build_system_fonts();
+    ctx.set_fonts(fonts);
+    cjk_loaded
 }
 
-fn fluent_visuals() -> egui::Visuals {
-    let mut visuals = egui::Visuals::light();
-    visuals.panel_fill = pages::APP_BG;
-    visuals.window_fill = pages::SURFACE;
+fn make_visuals(p: &pages::Palette, dark: bool) -> egui::Visuals {
+    let mut visuals = if dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    visuals.panel_fill = p.app_bg;
+    visuals.window_fill = p.surface;
     visuals.window_corner_radius = egui::CornerRadius::same(8);
-    visuals.window_stroke = egui::Stroke::new(1.0, pages::STROKE);
+    visuals.window_stroke = egui::Stroke::new(1.0, p.stroke);
     visuals.menu_corner_radius = egui::CornerRadius::same(4);
-    visuals.faint_bg_color = pages::SUBTLE_SURFACE;
-    visuals.extreme_bg_color = pages::SURFACE;
-    visuals.text_edit_bg_color = Some(pages::SURFACE);
-    visuals.hyperlink_color = pages::ACCENT;
-    visuals.selection.bg_fill = pages::ACCENT;
+    visuals.faint_bg_color = p.subtle_surface;
+    visuals.extreme_bg_color = p.control_fill;
+    visuals.text_edit_bg_color = Some(p.control_fill);
+    visuals.hyperlink_color = p.accent;
+    visuals.selection.bg_fill = p.accent;
     visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-    visuals.weak_text_color = Some(pages::TEXT_SECONDARY);
-    visuals.override_text_color = Some(pages::TEXT_PRIMARY);
+    visuals.weak_text_color = Some(p.text_secondary);
+    visuals.override_text_color = Some(p.text_primary);
     visuals.slider_trailing_fill = true;
 
     let corner = egui::CornerRadius::same(4);
     visuals.widgets.noninteractive.corner_radius = corner;
-    visuals.widgets.noninteractive.bg_fill = pages::SURFACE;
-    visuals.widgets.noninteractive.weak_bg_fill = pages::SUBTLE_SURFACE;
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, pages::STROKE);
-    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, pages::TEXT_PRIMARY);
+    visuals.widgets.noninteractive.bg_fill = p.surface;
+    visuals.widgets.noninteractive.weak_bg_fill = p.subtle_surface;
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, p.stroke);
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, p.text_primary);
 
     visuals.widgets.inactive.corner_radius = corner;
-    visuals.widgets.inactive.bg_fill = pages::SURFACE;
-    visuals.widgets.inactive.weak_bg_fill = pages::SURFACE;
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, pages::CONTROL_STROKE);
-    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, pages::TEXT_PRIMARY);
+    visuals.widgets.inactive.bg_fill = p.surface;
+    visuals.widgets.inactive.weak_bg_fill = p.surface;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, p.control_stroke);
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, p.text_primary);
 
     visuals.widgets.hovered.corner_radius = corner;
-    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(250, 250, 250);
-    visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(250, 250, 250);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(96, 96, 96));
-    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, pages::TEXT_PRIMARY);
+    visuals.widgets.hovered.bg_fill = p.hovered_bg;
+    visuals.widgets.hovered.weak_bg_fill = p.hovered_bg;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, p.hovered_stroke);
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, p.text_primary);
 
     visuals.widgets.active.corner_radius = corner;
-    visuals.widgets.active.bg_fill = pages::SURFACE;
-    visuals.widgets.active.weak_bg_fill = pages::SURFACE;
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, pages::ACCENT_HOVER);
-    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, pages::TEXT_PRIMARY);
+    visuals.widgets.active.bg_fill = p.surface;
+    visuals.widgets.active.weak_bg_fill = p.surface;
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, p.accent_hover);
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, p.text_primary);
 
-    visuals.widgets.open = visuals.widgets.hovered.clone();
+    visuals.widgets.open = visuals.widgets.hovered;
     visuals
 }
 
-fn build_system_fonts() -> egui::FontDefinitions {
+/// Builds the font set and reports whether a CJK fallback font was found.
+/// When `false`, non-Latin glyphs (e.g. CJK file paths) render as tofu and the
+/// UI surfaces a notice.
+fn build_system_fonts() -> (egui::FontDefinitions, bool) {
     let mut fonts = egui::FontDefinitions::default();
 
     #[cfg(windows)]
@@ -106,7 +125,7 @@ fn build_system_fonts() -> egui::FontDefinitions {
             .insert(0, font_name);
     }
 
-    if let Some(cjk_font) = cjk_font_data() {
+    let cjk_loaded = if let Some(cjk_font) = cjk_font_data() {
         let font_name = "system_cjk".to_owned();
         fonts
             .font_data
@@ -118,9 +137,12 @@ fn build_system_fonts() -> egui::FontDefinitions {
                 .or_default()
                 .push(font_name.clone());
         }
-    }
+        true
+    } else {
+        false
+    };
 
-    fonts
+    (fonts, cjk_loaded)
 }
 
 fn cjk_font_data() -> Option<egui::FontData> {
@@ -367,6 +389,10 @@ impl eframe::App for GuiApp {
         visuals.panel_fill.to_normalized_gamma_f32()
     }
 
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        crate::state::save_persisted_settings(storage, &self.state);
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.state.poll_background_work();
         self.state.drain_events();
@@ -378,14 +404,49 @@ impl eframe::App for GuiApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        apply_dropped_files(&ctx, &mut self.state);
+        let panel_fill = ui.visuals().panel_fill;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
-                    .fill(pages::APP_BG)
+                    .fill(panel_fill)
                     .inner_margin(egui::Margin::symmetric(22, 22)),
             )
             .show_inside(ui, |ui| {
                 pages::render_page(ui, &mut self.state, &ctx);
             });
+        paint_drop_overlay(&ctx);
     }
+}
+
+/// Applies any files dropped onto the window this frame, regardless of which
+/// page is showing. Path-typed files route to the matching config field by
+/// extension (see [`AppState::apply_dropped_path`]).
+fn apply_dropped_files(ctx: &egui::Context, state: &mut AppState) {
+    let dropped = ctx.input(|input| input.raw.dropped_files.clone());
+    for file in dropped {
+        if let Some(path) = file.path {
+            state.apply_dropped_path(&path);
+        }
+    }
+}
+
+/// Dims the window and shows guidance while files are dragged over it.
+fn paint_drop_overlay(ctx: &egui::Context) {
+    if ctx.input(|input| input.raw.hovered_files.is_empty()) {
+        return;
+    }
+    let screen = ctx.content_rect();
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("drop_overlay"),
+    ));
+    painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(150));
+    painter.text(
+        screen.center(),
+        egui::Align2::CENTER_CENTER,
+        "Drop a .gguf model, .wav audio, or output file to load",
+        egui::FontId::proportional(22.0),
+        egui::Color32::WHITE,
+    );
 }

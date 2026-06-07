@@ -12,13 +12,45 @@ use game_service::{
     ExtractOutputRequest, ExtractRequest, ExtractResult, GpuSelector, InferParams,
     MidiWriteOptions, TextWriteOptions, extract_with_notifier,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::notifier::GuiNotifier;
 use crate::pages::AppPage;
 
+/// User-facing theme preference, persisted across launches and applied to egui
+/// via [`egui::ThemePreference`]. `System` follows the OS light/dark setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeChoice {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemeChoice {
+    pub fn to_preference(self) -> egui::ThemePreference {
+        match self {
+            ThemeChoice::System => egui::ThemePreference::System,
+            ThemeChoice::Light => egui::ThemePreference::Light,
+            ThemeChoice::Dark => egui::ThemePreference::Dark,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemeChoice::System => "System",
+            ThemeChoice::Light => "Light",
+            ThemeChoice::Dark => "Dark",
+        }
+    }
+}
+
 pub struct AppState {
     pub current_page: AppPage,
     pub config: ExtractConfig,
+    pub theme: ThemeChoice,
+    pub cjk_font_missing: bool,
+    pub font_notice_dismissed: bool,
     pub event_rx: Option<Receiver<CoreEvent>>,
     pub extraction: Option<ExtractionHandle>,
     pub result: Option<ExtractResult>,
@@ -38,6 +70,8 @@ pub struct AppState {
     pub gpu_adapters_loading: bool,
     #[cfg(feature = "gpu")]
     gpu_adapter_rx: Option<Receiver<Vec<GpuAdapterChoice>>>,
+    #[cfg(feature = "gpu")]
+    pub gpu_adapter_error: Option<String>,
     run_started_at: Option<Instant>,
 }
 
@@ -120,6 +154,9 @@ impl AppState {
         Self {
             current_page: AppPage::Config,
             config: ExtractConfig::default(),
+            theme: ThemeChoice::default(),
+            cjk_font_missing: false,
+            font_notice_dismissed: false,
             event_rx: None,
             extraction: None,
             result: None,
@@ -138,6 +175,8 @@ impl AppState {
             gpu_adapters_loading: false,
             #[cfg(feature = "gpu")]
             gpu_adapter_rx: None,
+            #[cfg(feature = "gpu")]
+            gpu_adapter_error: None,
             run_started_at: None,
         }
     }
@@ -164,6 +203,7 @@ impl AppState {
         let (tx, rx) = crossbeam::channel::bounded(1);
         let repaint_ctx = ctx.clone();
         self.gpu_adapters_loading = true;
+        self.gpu_adapter_error = None;
         self.gpu_adapter_rx = Some(rx);
         thread::spawn(move || {
             let adapters = list_gpu_adapters();
@@ -182,6 +222,7 @@ impl AppState {
             Ok(adapters) => {
                 self.gpu_adapters = adapters;
                 self.gpu_adapters_loading = false;
+                self.gpu_adapter_error = None;
                 if self
                     .config
                     .selected_gpu_index
@@ -195,7 +236,12 @@ impl AppState {
                 self.gpu_adapter_rx = Some(rx);
             }
             Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                // The worker thread ended without sending — it panicked while
+                // enumerating adapters. Surface that instead of letting an empty
+                // list masquerade as "no GPUs found".
                 self.gpu_adapters_loading = false;
+                self.gpu_adapter_error =
+                    Some("GPU enumeration worker stopped unexpectedly".to_owned());
             }
         }
     }
@@ -314,7 +360,7 @@ impl AppState {
     pub fn set_output_path(&mut self, path: impl AsRef<Path>) {
         let path = path.as_ref();
         self.config.output_path = path.display().to_string();
-        if let Some(format) = infer_format_from_path(path) {
+        if let Some(format) = game_service::infer_extract_format(path) {
             self.config.output_format = format;
         }
     }
@@ -394,37 +440,38 @@ impl AppState {
         self.append_log(&event);
 
         match &event {
-            CoreEvent::Status { stage, message } => {
-                self.overall_status = friendly_status(stage, message);
-                match *stage {
-                    "extract_infer" => {
-                        if let Some(total) = parse_chunk_count_from_message(message) {
-                            self.init_chunks(total);
+            CoreEvent::ChunkPlan { total } => {
+                self.init_chunks(*total);
+            }
+            CoreEvent::Status {
+                stage,
+                message,
+                chunk,
+            } => {
+                if *stage == "chunk_infer" {
+                    // The service emits every chunk's "infer start" up-front,
+                    // before any chunk runs. Don't let that burst leave the
+                    // overall status reading as the *last* chunk; the real
+                    // active chunk is driven by d3pm_step progress below.
+                    self.overall_status = "Processing chunks...".to_owned();
+                    if let Some(ctx) = chunk {
+                        self.init_chunks(ctx.count);
+                        if let Some(entry) = self.chunk_progress.get_mut(ctx.index) {
+                            entry.label = format_chunk_status(message);
                         }
                     }
-                    "chunk_infer" => {
-                        let (index, total) = parse_chunk_position(message)
-                            .unwrap_or_else(|| (self.chunk_progress.len(), 0));
-                        if total > 0 {
-                            self.init_chunks(total);
-                        } else {
-                            self.ensure_chunk(index, None);
-                        }
-                        if let Some(chunk) = self.chunk_progress.get_mut(index) {
-                            chunk.label = format_chunk_status(message);
-                        }
-                    }
-                    _ => {}
+                } else {
+                    self.overall_status = friendly_status(stage, message);
                 }
             }
             CoreEvent::Progress {
                 stage,
                 current,
                 total,
-                detail,
+                chunk: chunk_ctx,
+                ..
             } if *stage == "d3pm_step" => {
-                let index = detail.as_deref().and_then(parse_chunk_index).unwrap_or(0);
-                self.ensure_chunk(index, None);
+                let index = chunk_ctx.as_ref().map(|c| c.index).unwrap_or(0);
                 if let Some(chunk) = self.chunk_progress.get_mut(index) {
                     chunk.d3pm_current = *current;
                     chunk.d3pm_total = *total;
@@ -439,7 +486,8 @@ impl AppState {
             CoreEvent::Timing {
                 stage,
                 elapsed,
-                detail,
+                chunk: chunk_ctx,
+                ..
             } => {
                 self.stage_timings.insert(
                     stage,
@@ -450,8 +498,7 @@ impl AppState {
                 );
 
                 if *stage == "chunk_infer" {
-                    let index = detail.as_deref().and_then(parse_chunk_index).unwrap_or(0);
-                    self.ensure_chunk(index, None);
+                    let index = chunk_ctx.as_ref().map(|c| c.index).unwrap_or(0);
                     if let Some(chunk) = self.chunk_progress.get_mut(index) {
                         if chunk.d3pm_total > 0 {
                             chunk.d3pm_current = chunk.d3pm_total;
@@ -495,32 +542,6 @@ impl AppState {
             })
             .collect();
         self.overall_progress = Some((0, total));
-    }
-
-    fn ensure_chunk(&mut self, index: usize, total: Option<usize>) {
-        if let Some(total) = total {
-            if total > self.chunk_progress.len() {
-                self.init_chunks(total);
-                return;
-            }
-        }
-        if index < self.chunk_progress.len() {
-            return;
-        }
-
-        let target_len = index + 1;
-        let d3pm_total = usize::try_from(self.config.d3pm_nsteps.max(1)).unwrap_or(1);
-        let total = total.unwrap_or(target_len);
-        while self.chunk_progress.len() < target_len {
-            let current = self.chunk_progress.len();
-            self.chunk_progress.push(ChunkProgress {
-                label: format!("chunk {}/{}", current + 1, total),
-                d3pm_current: 0,
-                d3pm_total,
-                status: ChunkStatus::Pending,
-            });
-        }
-        self.update_overall_completed();
     }
 
     fn update_overall_completed(&mut self) {
@@ -615,6 +636,152 @@ impl ExtractConfig {
     }
 }
 
+/// Subset of the configuration persisted across launches via eframe storage.
+///
+/// Deliberately plain primitives (no foreign enums) so it serializes cleanly and
+/// stays forward/backward compatible; `#[serde(default)]` fills in any field a
+/// future or older build omits. The audio path is intentionally NOT persisted —
+/// reopening with a stale, possibly-missing input file would be surprising.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct PersistedSettings {
+    model_path: String,
+    output_format: u8,
+    device: u8,
+    chunk_parallelism: u8,
+    d3pm_nsteps: i32,
+    seed: u64,
+    max_chunk_seconds: usize,
+    language: i32,
+    boundary_threshold: f32,
+    note_threshold: f32,
+    boundary_radius: i32,
+    theme: u8,
+}
+
+impl Default for PersistedSettings {
+    fn default() -> Self {
+        Self::from_state(&AppState::new())
+    }
+}
+
+impl PersistedSettings {
+    fn from_state(state: &AppState) -> Self {
+        let config = &state.config;
+        Self {
+            model_path: config.model_path.clone(),
+            output_format: format_to_u8(config.output_format),
+            device: device_to_u8(config.device),
+            chunk_parallelism: parallelism_to_u8(config.chunk_parallelism),
+            d3pm_nsteps: config.d3pm_nsteps,
+            seed: config.seed,
+            max_chunk_seconds: config.max_chunk_seconds,
+            language: config.language,
+            boundary_threshold: config.boundary_threshold,
+            note_threshold: config.note_threshold,
+            boundary_radius: config.boundary_radius,
+            theme: theme_to_u8(state.theme),
+        }
+    }
+
+    fn apply_to(&self, state: &mut AppState) {
+        let config = &mut state.config;
+        config.model_path = self.model_path.clone();
+        config.output_format = format_from_u8(self.output_format);
+        config.device = device_from_u8(self.device);
+        config.chunk_parallelism = parallelism_from_u8(self.chunk_parallelism);
+        config.d3pm_nsteps = self.d3pm_nsteps;
+        config.seed = self.seed;
+        config.max_chunk_seconds = self.max_chunk_seconds;
+        config.language = self.language;
+        config.boundary_threshold = self.boundary_threshold;
+        config.note_threshold = self.note_threshold;
+        config.boundary_radius = self.boundary_radius;
+        state.theme = theme_from_u8(self.theme);
+    }
+}
+
+fn format_to_u8(value: ExtractFormat) -> u8 {
+    match value {
+        ExtractFormat::Midi => 0,
+        ExtractFormat::Txt => 1,
+        ExtractFormat::Csv => 2,
+    }
+}
+
+fn format_from_u8(value: u8) -> ExtractFormat {
+    match value {
+        1 => ExtractFormat::Txt,
+        2 => ExtractFormat::Csv,
+        _ => ExtractFormat::Midi,
+    }
+}
+
+fn device_to_u8(value: ExtractDevice) -> u8 {
+    match value {
+        ExtractDevice::Auto => 0,
+        ExtractDevice::Cpu => 1,
+        ExtractDevice::Gpu => 2,
+    }
+}
+
+fn device_from_u8(value: u8) -> ExtractDevice {
+    match value {
+        1 => ExtractDevice::Cpu,
+        2 => ExtractDevice::Gpu,
+        _ => ExtractDevice::Auto,
+    }
+}
+
+fn parallelism_to_u8(value: ChunkParallelism) -> u8 {
+    match value {
+        ChunkParallelism::Auto => 0,
+        ChunkParallelism::On => 1,
+        ChunkParallelism::Off => 2,
+    }
+}
+
+fn parallelism_from_u8(value: u8) -> ChunkParallelism {
+    match value {
+        1 => ChunkParallelism::On,
+        2 => ChunkParallelism::Off,
+        _ => ChunkParallelism::Auto,
+    }
+}
+
+fn theme_to_u8(value: ThemeChoice) -> u8 {
+    match value {
+        ThemeChoice::System => 0,
+        ThemeChoice::Light => 1,
+        ThemeChoice::Dark => 2,
+    }
+}
+
+fn theme_from_u8(value: u8) -> ThemeChoice {
+    match value {
+        1 => ThemeChoice::Light,
+        2 => ThemeChoice::Dark,
+        _ => ThemeChoice::System,
+    }
+}
+
+/// Loads persisted settings (if any) into `state`. Called once at startup from
+/// `GuiApp::new` with the eframe storage handle.
+pub(crate) fn load_persisted_settings(storage: &dyn eframe::Storage, state: &mut AppState) {
+    if let Some(persisted) = eframe::get_value::<PersistedSettings>(storage, eframe::APP_KEY) {
+        persisted.apply_to(state);
+    }
+}
+
+/// Persists the current settings. Called from `eframe::App::save`.
+pub(crate) fn save_persisted_settings(storage: &mut dyn eframe::Storage, state: &AppState) {
+    eframe::set_value(
+        storage,
+        eframe::APP_KEY,
+        &PersistedSettings::from_state(state),
+    );
+}
+
 impl GuiLogLevel {
     fn from_event(event: &CoreEvent) -> Self {
         match event {
@@ -636,18 +803,17 @@ fn run_extraction(
     notifier: GuiNotifier,
     cancel: Arc<AtomicBool>,
 ) -> game_service::Result<ExtractResult> {
+    // The service has no internal cancel hook, so honor a cancel only *before*
+    // the (heavy) run begins. If `extract_with_notifier` returns `Ok`, the whole
+    // pipeline already ran and the output file is written — discarding that
+    // finished result on a late cancel would waste completed work and hide a
+    // valid result from the user, so we let it flow through to the Results page.
     if cancel.load(Ordering::Relaxed) {
         return Err(Error::message("Extraction cancelled"));
     }
 
     let request = config.to_request();
-    let result = extract_with_notifier(&request, &notifier)?;
-
-    if cancel.load(Ordering::Relaxed) {
-        return Err(Error::message("Extraction cancelled"));
-    }
-
-    Ok(result)
+    extract_with_notifier(&request, &notifier)
 }
 
 #[cfg(feature = "gpu")]
@@ -682,50 +848,6 @@ fn default_output_path(audio_path: &Path) -> PathBuf {
     let mut output = audio_path.to_path_buf();
     output.set_extension("mid");
     output
-}
-
-fn infer_format_from_path(path: &Path) -> Option<ExtractFormat> {
-    match path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("mid" | "midi") => Some(ExtractFormat::Midi),
-        Some("txt") => Some(ExtractFormat::Txt),
-        Some("csv") => Some(ExtractFormat::Csv),
-        _ => None,
-    }
-}
-
-fn parse_chunk_count_from_message(message: &str) -> Option<usize> {
-    let parts: Vec<&str> = message.split_whitespace().collect();
-    for (index, part) in parts.iter().enumerate() {
-        if part.starts_with("chunk") && index > 0 {
-            return parts[index - 1].parse().ok();
-        }
-    }
-    None
-}
-
-fn parse_chunk_index(detail: &str) -> Option<usize> {
-    parse_chunk_position(detail).map(|(index, _)| index)
-}
-
-fn parse_chunk_position(detail: &str) -> Option<(usize, usize)> {
-    let rest = detail.strip_prefix("chunk ")?;
-    let digit_end = rest.find(|c: char| !c.is_ascii_digit())?;
-    let index = rest[..digit_end].parse::<usize>().ok()?.saturating_sub(1);
-    let total = rest[digit_end..]
-        .strip_prefix('/')
-        .and_then(|rest| {
-            let total_end = rest
-                .find(|c: char| !c.is_ascii_digit())
-                .unwrap_or(rest.len());
-            rest[..total_end].parse::<usize>().ok()
-        })
-        .unwrap_or(0);
-    Some((index, total))
 }
 
 fn format_chunk_status(message: &str) -> String {

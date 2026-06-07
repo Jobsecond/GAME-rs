@@ -11,22 +11,49 @@ pub enum NotificationLevel {
     Error,
 }
 
+/// Identifies which audio chunk an event belongs to.
+///
+/// This is the authoritative, machine-readable chunk attribution. Frontends
+/// should read it directly rather than parsing chunk identity out of the
+/// human-readable `message`/`detail` strings (which remain purely decorative
+/// for log display). The `game-service` layer fills this in for every event it
+/// forwards from a per-chunk inference (see its `PrefixedNotifier`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkContext {
+    /// Zero-based index of the chunk among all chunks.
+    pub index: usize,
+    /// Total number of chunks after all splitting.
+    pub count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum CoreEvent {
+    /// One-time structural announcement of how many chunks will be processed,
+    /// emitted once before any per-chunk work begins. Lets frontends size their
+    /// progress UI without parsing the `extract_infer` status text.
+    ChunkPlan { total: usize },
     Status {
         stage: &'static str,
         message: String,
+        /// Set when this event belongs to a specific chunk; `None` for
+        /// whole-run stages (model load, audio prep, etc.).
+        chunk: Option<ChunkContext>,
     },
     Progress {
         stage: &'static str,
+        /// For `d3pm_step`, the current step number (1-based). Never carries
+        /// chunk identity — that lives in `chunk`.
         current: usize,
+        /// For `d3pm_step`, the total step count.
         total: usize,
         detail: Option<String>,
+        chunk: Option<ChunkContext>,
     },
     Timing {
         stage: &'static str,
         elapsed: Duration,
         detail: Option<String>,
+        chunk: Option<ChunkContext>,
     },
     ModelLoaded {
         backend: &'static str,

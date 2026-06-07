@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use console::Style;
 use game_core::{
-    BackboneConfig, Backend, CoreEvent, Error, InferParams, LoadedGgufModel, LoadedTensor,
-    NotificationLevel, Notifier, Result, load_gguf,
+    BackboneConfig, Backend, ChunkContext, CoreEvent, Error, InferParams, LoadedGgufModel,
+    LoadedTensor, NotificationLevel, Notifier, Result, load_gguf,
 };
 use game_service::{
     ChunkParallelism as ServiceChunkParallelism, DEFAULT_MAX_CHUNK_SECONDS,
@@ -422,12 +422,12 @@ impl RichNotifier {
         )
     }
 
-    fn handle_d3pm_progress(&self, current: usize, total: usize, detail: Option<&str>) {
+    fn handle_d3pm_progress(&self, current: usize, total: usize, chunk: Option<ChunkContext>) {
         if !self.use_progress {
             return;
         }
 
-        let chunk_idx = detail.and_then(parse_chunk_index).unwrap_or(0);
+        let chunk_idx = chunk.map(|c| c.index).unwrap_or(0);
         let state = self.state();
         let chunk_info = state
             .chunk_labels
@@ -539,32 +539,34 @@ impl Notifier for RichNotifier {
     fn notify(&self, event: CoreEvent) {
         self.log_core_event(&event);
         match event {
+            CoreEvent::ChunkPlan { total } => {
+                let mut state = self.state();
+                state.total_chunks = Some(total);
+                state.completed_chunks = 0;
+                state.chunk_labels.clear();
+                for (_, bar) in state.chunk_status_bars.drain() {
+                    bar.finish_and_clear();
+                }
+                drop(state);
+                self.root.set_position(0);
+                self.root.set_length(total as u64);
+                self.root.reset_elapsed();
+                self.set_root_style(true);
+                self.root.enable_steady_tick(Duration::from_millis(200));
+                self.set_root_message(self.chunk_processing_message());
+            }
             CoreEvent::ModelLoaded { backend, elapsed } => {
                 self.println(&self.format_stage_line("model loaded", backend, elapsed));
             }
 
-            CoreEvent::Status { stage, message } => match stage {
-                "extract_infer" => {
-                    if let Some(count) = parse_chunk_count_from_message(&message) {
-                        let mut state = self.state();
-                        state.total_chunks = Some(count);
-                        state.completed_chunks = 0;
-                        state.chunk_labels.clear();
-                        for (_, bar) in state.chunk_status_bars.drain() {
-                            bar.finish_and_clear();
-                        }
-                        drop(state);
-                        self.root.set_position(0);
-                        self.root.set_length(count as u64);
-                        self.root.reset_elapsed();
-                        self.set_root_style(true);
-                        self.root.enable_steady_tick(Duration::from_millis(200));
-                        self.set_root_message(self.chunk_processing_message());
-                    }
-                }
-                "chunk_infer" => {
+            CoreEvent::Status {
+                stage,
+                message,
+                chunk,
+            } => {
+                if stage == "chunk_infer" {
                     let chunk_info = format_chunk_status(&message);
-                    let idx = parse_chunk_index(&message).unwrap_or(0);
+                    let idx = chunk.map(|c| c.index).unwrap_or(0);
                     {
                         let mut state = self.state();
                         state.chunk_labels.insert(idx, chunk_info.clone());
@@ -581,17 +583,17 @@ impl Notifier for RichNotifier {
                         ));
                     }
                 }
-                _ => {}
-            },
+            }
 
             CoreEvent::Progress {
                 stage,
                 current,
                 total,
-                detail,
+                detail: _,
+                chunk,
             } => {
                 if stage == "d3pm_step" {
-                    self.handle_d3pm_progress(current, total, detail.as_deref());
+                    self.handle_d3pm_progress(current, total, chunk);
                 }
             }
 
@@ -599,6 +601,7 @@ impl Notifier for RichNotifier {
                 stage,
                 elapsed,
                 detail,
+                chunk,
             } => match stage {
                 "audio_prepare" => {
                     let bracket = detail
@@ -640,8 +643,11 @@ impl Notifier for RichNotifier {
                         .unwrap_or_default();
                     self.println(&self.format_stage_line("mel setup", &bracket, elapsed));
                 }
-                "infer_total" => {
-                    let idx = detail.as_deref().and_then(parse_chunk_index).unwrap_or(0);
+                "chunk_infer" => {
+                    // Canonical per-chunk completion (see the emit site in
+                    // game-service). Read the chunk index from the structured
+                    // field rather than parsing the message text.
+                    let idx = chunk.map(|c| c.index).unwrap_or(0);
                     let mut state = self.state();
                     state.chunk_labels.remove(&idx);
                     if let Some(bar) = state.chunk_status_bars.remove(&idx) {
@@ -657,7 +663,6 @@ impl Notifier for RichNotifier {
                         self.set_root_message(self.chunk_processing_message());
                     }
                 }
-                "chunk_infer" => {}
                 "extract_infer" => {
                     let mut state = self.state();
                     for (_, bar) in state.chunk_status_bars.drain() {
@@ -748,25 +753,6 @@ fn display_path_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-fn parse_chunk_count_from_message(message: &str) -> Option<usize> {
-    let parts: Vec<&str> = message.split_whitespace().collect();
-    for (i, part) in parts.iter().enumerate() {
-        if part.starts_with("chunk") && i > 0 {
-            return parts[i - 1].parse().ok();
-        }
-    }
-    None
-}
-
-fn parse_chunk_index(detail: &str) -> Option<usize> {
-    let rest = detail.strip_prefix("chunk ")?;
-    let end = rest.find(|c: char| !c.is_ascii_digit())?;
-    rest[..end]
-        .parse::<usize>()
-        .ok()
-        .map(|n| n.saturating_sub(1))
-}
-
 fn parse_audio_bracket(detail: &str) -> String {
     if let Some(arrow_pos) = detail.find("-> ") {
         let rest = &detail[arrow_pos + 3..];
@@ -828,7 +814,10 @@ fn main() -> ExitCode {
 fn log_event(event: &CoreEvent) {
     use log::{error, info, warn};
     match event {
-        CoreEvent::Status { stage, message } => {
+        CoreEvent::ChunkPlan { total } => {
+            info!("planning {} chunk(s)", total);
+        }
+        CoreEvent::Status { stage, message, .. } => {
             info!("[{}] {}", stage, message);
         }
         CoreEvent::Progress {
@@ -836,6 +825,7 @@ fn log_event(event: &CoreEvent) {
             current,
             total,
             detail,
+            ..
         } => {
             let detail_str = detail
                 .as_ref()
@@ -847,6 +837,7 @@ fn log_event(event: &CoreEvent) {
             stage,
             elapsed,
             detail,
+            ..
         } => {
             let detail_str = detail
                 .as_ref()
@@ -1597,30 +1588,8 @@ mod tests {
 
     use super::{
         ChunkParallelism, Cli, Command, DEFAULT_MAX_CHUNK_SECONDS, format_chunk_status,
-        parse_audio_bracket, parse_chunk_count_from_message, parse_chunk_index, parse_kv_usize,
-        parse_u32_auto,
+        parse_audio_bracket, parse_kv_usize, parse_u32_auto,
     };
-
-    #[test]
-    fn parse_chunk_count_from_inference_message() {
-        assert_eq!(
-            parse_chunk_count_from_message("running inference across 5 chunk(s)"),
-            Some(5)
-        );
-        assert_eq!(
-            parse_chunk_count_from_message("running inference across 1 chunk(s)"),
-            Some(1)
-        );
-        assert_eq!(parse_chunk_count_from_message("unrelated message"), None);
-    }
-
-    #[test]
-    fn parse_chunk_index_from_detail() {
-        assert_eq!(parse_chunk_index("chunk 2/5 notes=42"), Some(1));
-        assert_eq!(parse_chunk_index("chunk 1/1: t=0.000"), Some(0));
-        assert_eq!(parse_chunk_index("chunk 10/10: t=0.500"), Some(9));
-        assert_eq!(parse_chunk_index("no chunk here"), None);
-    }
 
     #[test]
     fn parse_audio_bracket_with_resample() {

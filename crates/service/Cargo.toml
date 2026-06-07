@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "Orchestration layer (audio prep, chunk parallelism, inference, output) for game-crabml"
+description = "Orchestration layer (audio prep, chunk parallelism, inference, output) for game"
 
 [features]
 default = []

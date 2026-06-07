@@ -58,6 +58,25 @@ jobs:
       - name: Check (gpu feature)
         run: cargo check --workspace --locked --features gpu
 
+  # Enforcing gate for the egui GUI crate. It is intentionally excluded from the
+  # workspace (heavier wgpu/winit/eframe deps + higher MSRV than the lean CPU path),
+  # so `--workspace` never builds it. Compile-check it in isolation here so a change
+  # to the shared CoreEvent contract — which the GUI consumes — can't silently break
+  # it. Windows covers the platform-specific font/registry code paths.
+  gui-check:
+    name: gui compile-check (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gui
+      - name: Check (gui crate, CPU)
+        run: cargo check --manifest-path crates/gui/Cargo.toml --target-dir target/gui-isolated-check
+      - name: Check (gui crate, GPU)
+        run: cargo check --manifest-path crates/gui/Cargo.toml --features gpu --target-dir target/gui-isolated-check
+
   # Advisory (non-blocking) for now: the tree has a pre-existing clippy backlog and
   # some deliberately hand-formatted SIMD kernels. This job surfaces findings without
   # failing the build. Once the backlog is cleared, drop `continue-on-error` and add

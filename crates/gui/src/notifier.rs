@@ -2,6 +2,8 @@ use crossbeam::channel::{Receiver, Sender, unbounded};
 use egui::Context;
 use game_core::{CoreEvent, NotificationLevel, Notifier};
 
+use crate::state::format_duration;
+
 #[derive(Clone)]
 pub struct GuiNotifier {
     tx: Sender<CoreEvent>,
@@ -20,12 +22,14 @@ impl GuiNotifier {
 
     pub fn format_event(event: &CoreEvent) -> String {
         match event {
-            CoreEvent::Status { stage, message } => format!("[{stage}] {message}"),
+            CoreEvent::ChunkPlan { total } => format!("planning {total} chunk(s)"),
+            CoreEvent::Status { stage, message, .. } => format!("[{stage}] {message}"),
             CoreEvent::Progress {
                 stage,
                 current,
                 total,
                 detail,
+                ..
             } => {
                 let detail = detail
                     .as_deref()
@@ -37,6 +41,7 @@ impl GuiNotifier {
                 stage,
                 elapsed,
                 detail,
+                ..
             } => {
                 let detail = detail
                     .as_deref()
@@ -70,8 +75,4 @@ fn level_name(level: NotificationLevel) -> &'static str {
         NotificationLevel::Warn => "warn",
         NotificationLevel::Error => "error",
     }
-}
-
-fn format_duration(duration: std::time::Duration) -> String {
-    format!("{:.3}s", duration.as_secs_f64())
 }

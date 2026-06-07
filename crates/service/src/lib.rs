@@ -15,7 +15,8 @@ use game_output::{write_midi_file, write_text_file};
 use rayon::prelude::*;
 
 pub use game_core::{
-    Backend, CoreEvent, Error, InferParams, Note, NotificationLevel, Notifier, NullNotifier, Result,
+    Backend, ChunkContext, CoreEvent, Error, InferParams, Note, NotificationLevel, Notifier,
+    NullNotifier, Result,
 };
 pub use game_output::{MidiWriteOptions, TextOutputFormat, TextWriteOptions};
 
@@ -306,16 +307,26 @@ struct PrefixedNotifier<'a> {
 
 impl Notifier for PrefixedNotifier<'_> {
     fn notify(&self, event: CoreEvent) {
+        // Fill in authoritative chunk identity for every per-chunk event while
+        // keeping the human-readable prefix purely for log display. Consumers
+        // read the `chunk` field; the `"chunk N/M: "` text is decorative only.
+        let ctx = self.ctx();
         self.inner.notify(match event {
-            CoreEvent::Status { stage, message } => CoreEvent::Status {
+            CoreEvent::Status {
+                stage,
+                message,
+                chunk,
+            } => CoreEvent::Status {
                 stage,
                 message: self.prefix_text(&message),
+                chunk: chunk.or(Some(ctx)),
             },
             CoreEvent::Progress {
                 stage,
                 current,
                 total,
                 detail,
+                chunk,
             } => CoreEvent::Progress {
                 stage,
                 current,
@@ -324,11 +335,13 @@ impl Notifier for PrefixedNotifier<'_> {
                     Some(detail) => self.prefix_text(&detail),
                     None => self.chunk_label(),
                 }),
+                chunk: chunk.or(Some(ctx)),
             },
             CoreEvent::Timing {
                 stage,
                 elapsed,
                 detail,
+                chunk,
             } => CoreEvent::Timing {
                 stage,
                 elapsed,
@@ -336,19 +349,25 @@ impl Notifier for PrefixedNotifier<'_> {
                     Some(detail) => self.prefix_text(&detail),
                     None => self.chunk_label(),
                 }),
+                chunk: chunk.or(Some(ctx)),
             },
             CoreEvent::Message { level, message } => CoreEvent::Message {
                 level,
                 message: self.prefix_text(&message),
             },
-            CoreEvent::ModelLoaded { backend, elapsed } => {
-                CoreEvent::ModelLoaded { backend, elapsed }
-            }
+            other @ (CoreEvent::ModelLoaded { .. } | CoreEvent::ChunkPlan { .. }) => other,
         });
     }
 }
 
 impl PrefixedNotifier<'_> {
+    fn ctx(&self) -> ChunkContext {
+        ChunkContext {
+            index: self.chunk_index,
+            count: self.chunk_count,
+        }
+    }
+
     fn chunk_label(&self) -> String {
         format!("chunk {}/{}", self.chunk_index + 1, self.chunk_count)
     }
@@ -478,6 +497,11 @@ pub fn extract_with_notifier(
         Some(format!("frames={total_frames}")),
     );
 
+    // Authoritative chunk-count announcement; consumers size their progress UI
+    // from this rather than parsing the decorative extract_infer status text.
+    notifier.notify(CoreEvent::ChunkPlan {
+        total: chunks.len(),
+    });
     emit_status(
         notifier,
         "extract_infer",
@@ -614,7 +638,7 @@ fn run_chunked_extract_with_notifier(
     for (index, chunk) in chunks.iter().enumerate() {
         let chunk_duration_seconds =
             chunk.waveform.len() as f64 / model.config().inference.audio_sample_rate as f64;
-        emit_status(
+        emit_status_chunk(
             notifier,
             "chunk_infer",
             format!(
@@ -624,6 +648,10 @@ fn run_chunked_extract_with_notifier(
                 chunk.offset_seconds,
                 chunk_duration_seconds
             ),
+            ChunkContext {
+                index,
+                count: chunk_count,
+            },
         );
     }
 
@@ -679,7 +707,11 @@ fn run_chunked_extract_with_notifier(
 
     let mut notes = Vec::new();
     for result in results {
-        emit_timing(
+        // Canonical per-chunk completion signal. Both the CLI and GUI count
+        // chunk completions from this `chunk_infer` Timing (not core's
+        // `infer_total`), so it is emitted exactly once per chunk, in sorted
+        // order, carrying authoritative ChunkContext.
+        emit_timing_chunk(
             notifier,
             "chunk_infer",
             result.elapsed,
@@ -689,6 +721,10 @@ fn run_chunked_extract_with_notifier(
                 chunk_count,
                 result.notes.len()
             )),
+            ChunkContext {
+                index: result.index,
+                count: chunk_count,
+            },
         );
         notes.extend(result.notes);
     }
@@ -951,6 +987,20 @@ fn emit_status(notifier: &dyn Notifier, stage: &'static str, message: impl Into<
     notifier.notify(CoreEvent::Status {
         stage,
         message: message.into(),
+        chunk: None,
+    });
+}
+
+fn emit_status_chunk(
+    notifier: &dyn Notifier,
+    stage: &'static str,
+    message: impl Into<String>,
+    chunk: ChunkContext,
+) {
+    notifier.notify(CoreEvent::Status {
+        stage,
+        message: message.into(),
+        chunk: Some(chunk),
     });
 }
 
@@ -964,6 +1014,22 @@ fn emit_timing(
         stage,
         elapsed,
         detail,
+        chunk: None,
+    });
+}
+
+fn emit_timing_chunk(
+    notifier: &dyn Notifier,
+    stage: &'static str,
+    elapsed: Duration,
+    detail: Option<String>,
+    chunk: ChunkContext,
+) {
+    notifier.notify(CoreEvent::Timing {
+        stage,
+        elapsed,
+        detail,
+        chunk: Some(chunk),
     });
 }
 

@@ -1,16 +1,13 @@
-use std::time::Duration;
-
 use crate::state::{
     AppState, ChunkProgress, ChunkStatus, GuiLogLevel, StageTiming, format_duration,
 };
 
-use super::{
-    ACCENT, STROKE, TEXT_PRIMARY, TEXT_SECONDARY, page_title, section_frame, section_title,
-};
+use super::{accent, page_title, section_frame, section_title, track_bg};
 
 pub fn render(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.ctx().request_repaint_after(Duration::from_millis(100));
-
+    // Animation/refresh while running is driven by `GuiApp::logic` (gated on
+    // `is_running`) plus the notifier's per-event repaints, so this page does
+    // not need its own unconditional repaint timer.
     page_title(
         ui,
         if state.cancel_requested {
@@ -51,17 +48,17 @@ fn render_overall(ui: &mut egui::Ui, state: &AppState) {
 
     progress_header(ui, "Overall", &label, false);
     ui.add_space(4.0);
-    progress_track(ui, fraction, ACCENT, 8.0);
+    progress_track(ui, fraction, accent(ui), 8.0);
 
     ui.add_space(8.0);
-    ui.label(egui::RichText::new(&state.overall_status).color(TEXT_SECONDARY));
+    ui.label(egui::RichText::new(&state.overall_status).color(ui.visuals().weak_text_color()));
     if !state.status_text.is_empty() {
-        ui.label(egui::RichText::new(&state.status_text).color(TEXT_SECONDARY));
+        ui.label(egui::RichText::new(&state.status_text).color(ui.visuals().weak_text_color()));
     }
 }
 
 fn render_chunks(ui: &mut egui::Ui, state: &AppState) {
-    section_frame().show(ui, |ui| {
+    section_frame(ui).show(ui, |ui| {
         ui.set_width(ui.available_width());
         section_title(ui, "Chunks");
         ui.add_space(8.0);
@@ -100,9 +97,9 @@ fn progress_header(ui: &mut egui::Ui, label: &str, detail: &str, active: bool) {
             ui.add(egui::Spinner::new().size(14.0));
             ui.add_space(2.0);
         }
-        ui.label(egui::RichText::new(label).color(TEXT_PRIMARY));
+        ui.label(egui::RichText::new(label).color(ui.visuals().text_color()));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(egui::RichText::new(detail).color(TEXT_SECONDARY));
+            ui.label(egui::RichText::new(detail).color(ui.visuals().weak_text_color()));
         });
     });
 }
@@ -118,8 +115,7 @@ fn progress_track(
     let fraction = fraction.clamp(0.0, 1.0);
     let radius = egui::CornerRadius::same((height / 2.0).round() as u8);
 
-    ui.painter()
-        .rect_filled(rect, radius, egui::Color32::from_rgb(230, 230, 230));
+    ui.painter().rect_filled(rect, radius, track_bg(ui));
 
     let fill_width = rect.width() * fraction;
     if fill_width >= 0.5 {
@@ -130,7 +126,7 @@ fn progress_track(
     ui.painter().rect_stroke(
         rect,
         radius,
-        egui::Stroke::new(1.0, STROKE),
+        egui::Stroke::new(1.0, ui.visuals().window_stroke.color),
         egui::StrokeKind::Inside,
     );
 
@@ -147,7 +143,7 @@ fn chunk_detail(ui: &egui::Ui, chunk: &ChunkProgress, fraction: f32) -> (String,
                 chunk.d3pm_total,
                 (fraction * 100.0).round() as usize
             ),
-            ACCENT,
+            accent(ui),
         ),
         ChunkStatus::Completed => ("Complete".to_owned(), egui::Color32::from_rgb(16, 124, 16)),
         ChunkStatus::Failed(message) => (message.clone(), ui.visuals().error_fg_color),
@@ -189,7 +185,7 @@ fn chunk_fraction(chunk: &ChunkProgress) -> f32 {
 }
 
 fn render_timings(ui: &mut egui::Ui, state: &AppState) {
-    section_frame().show(ui, |ui| {
+    section_frame(ui).show(ui, |ui| {
         ui.set_width(ui.available_width());
         section_title(ui, "Stage Timings");
         ui.add_space(8.0);
@@ -217,9 +213,27 @@ fn render_timings(ui: &mut egui::Ui, state: &AppState) {
 }
 
 fn render_log(ui: &mut egui::Ui, state: &AppState) {
-    section_frame().show(ui, |ui| {
+    section_frame(ui).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        section_title(ui, "Event Log");
+        ui.horizontal(|ui| {
+            section_title(ui, "Event Log");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(!state.event_log.is_empty(), egui::Button::new("Copy"))
+                    .clicked()
+                {
+                    let text = state
+                        .event_log
+                        .iter()
+                        .map(|entry| {
+                            format!("[+{}] {}", format_duration(entry.elapsed), entry.text)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ui.ctx().copy_text(text);
+                }
+            });
+        });
         ui.add_space(8.0);
         egui::ScrollArea::vertical()
             .id_salt("event_log")

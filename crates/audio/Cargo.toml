@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "WAV decode, resample, mono mixdown, and silence-based slicing for game-crabml"
+description = "WAV decode, resample, mono mixdown, and silence-based slicing for game"
 
 [dependencies]
 game-core = { path = "../core" }

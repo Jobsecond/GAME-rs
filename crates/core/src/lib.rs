@@ -27,7 +27,7 @@ pub use model::{
     Backend, EncoderOutputs, EstimatorOutputs, GameModelWeights, Model, SegmenterOutputs,
     bind_model_weights, build_joint_attn_mask, run_encoder, run_estimator, run_segmenter_step,
 };
-pub use notify::{CoreEvent, NotificationLevel, Notifier, NullNotifier};
+pub use notify::{ChunkContext, CoreEvent, NotificationLevel, Notifier, NullNotifier};
 pub use rng::{InjectedRng, Mt19937Rng, RandomSource, random_u64};
 pub use tensor::{CpuDevice, CpuTensor, Tensor};
 #[cfg(feature = "gpu")]

@@ -3,7 +3,7 @@ use std::process::Command;
 
 use crate::state::{AppState, backend_name, format_count, format_duration, output_format_name};
 
-use super::{TEXT_SECONDARY, page_title, primary_button, section_frame, section_title};
+use super::{page_title, primary_button, section_frame, section_title};
 
 pub fn render(ui: &mut egui::Ui, state: &mut AppState) {
     let Some(summary) = ResultSummary::from_state(state) else {
@@ -17,7 +17,7 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState) {
     page_title(ui, "Extraction Complete");
     ui.add_space(14.0);
 
-    section_frame().show(ui, |ui| {
+    section_frame(ui).show(ui, |ui| {
         ui.set_width(ui.available_width());
         egui::Grid::new("result_summary")
             .num_columns(2)
@@ -36,7 +36,7 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState) {
     });
 
     ui.add_space(16.0);
-    section_frame().show(ui, |ui| {
+    section_frame(ui).show(ui, |ui| {
         ui.set_width(ui.available_width());
         section_title(ui, "Timing Breakdown");
         ui.add_space(8.0);
@@ -54,6 +54,9 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState) {
             });
     });
 
+    ui.add_space(16.0);
+    render_notes_preview(ui, state);
+
     if !state.status_text.is_empty() {
         ui.add_space(8.0);
         ui.label(&state.status_text);
@@ -62,13 +65,25 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState) {
     ui.add_space(16.0);
     ui.horizontal(|ui| {
         if ui
-            .add(primary_button("Extract Again").min_size(egui::vec2(130.0, 32.0)))
+            .add(primary_button(ui, "Extract Again").min_size(egui::vec2(130.0, 32.0)))
             .clicked()
         {
             state.reset_to_config();
         }
 
         if let Some(path) = &summary.output_path {
+            if ui
+                .add(egui::Button::new("Open File").min_size(egui::vec2(120.0, 32.0)))
+                .clicked()
+            {
+                match open_path(path) {
+                    Ok(()) => state.status_text.clear(),
+                    Err(err) => {
+                        state.status_text = format!("Failed to open output file: {err}");
+                    }
+                }
+            }
+
             if ui
                 .add(egui::Button::new("Open Output Folder").min_size(egui::vec2(160.0, 32.0)))
                 .clicked()
@@ -85,7 +100,7 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 fn row(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.label(egui::RichText::new(label).color(TEXT_SECONDARY));
+    ui.label(egui::RichText::new(label).color(ui.visuals().weak_text_color()));
     ui.label(value);
     ui.end_row();
 }
@@ -169,21 +184,123 @@ fn open_output_folder(path: &Path) -> std::io::Result<()> {
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
+    open_path(folder)
+}
 
+/// Opens a file or folder with the OS default handler.
+fn open_path(target: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        Command::new("explorer").arg(folder).spawn()?;
+        Command::new("explorer").arg(target).spawn()?;
     }
-
     #[cfg(target_os = "macos")]
     {
-        Command::new("open").arg(folder).spawn()?;
+        Command::new("open").arg(target).spawn()?;
     }
-
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        Command::new("xdg-open").arg(folder).spawn()?;
+        Command::new("xdg-open").arg(target).spawn()?;
     }
-
     Ok(())
+}
+
+const NOTE_PREVIEW_LIMIT: usize = 200;
+
+fn render_notes_preview(ui: &mut egui::Ui, state: &AppState) {
+    let Some(result) = state.result.as_ref() else {
+        return;
+    };
+    let notes = &result.notes;
+
+    section_frame(ui).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        section_title(ui, "Extracted Notes");
+        ui.add_space(8.0);
+
+        if notes.is_empty() {
+            ui.label("No notes were produced.");
+            return;
+        }
+
+        let voiced = notes.iter().filter(|note| note.voiced).count();
+        let range_text = voiced_pitch_range(notes)
+            .map(|(lo, hi)| format!("{} – {}", midi_note_name(lo), midi_note_name(hi)))
+            .unwrap_or_else(|| "—".to_owned());
+        ui.label(
+            egui::RichText::new(format!(
+                "{} notes ({voiced} voiced) · pitch range {range_text}",
+                format_count(notes.len())
+            ))
+            .color(ui.visuals().weak_text_color()),
+        );
+        ui.add_space(8.0);
+
+        egui::ScrollArea::vertical()
+            .id_salt("notes_preview")
+            .max_height(260.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                egui::Grid::new("notes_grid")
+                    .num_columns(4)
+                    .striped(true)
+                    .spacing([24.0, 4.0])
+                    .show(ui, |ui| {
+                        for header in ["#", "Offset", "Duration", "Pitch"] {
+                            ui.label(
+                                egui::RichText::new(header).color(ui.visuals().weak_text_color()),
+                            );
+                        }
+                        ui.end_row();
+
+                        for (index, note) in notes.iter().take(NOTE_PREVIEW_LIMIT).enumerate() {
+                            ui.label(format!("{}", index + 1));
+                            ui.label(format!("{:.3}s", note.offset_seconds));
+                            ui.label(format!("{:.3}s", note.duration_seconds));
+                            if note.voiced {
+                                ui.label(format!(
+                                    "{} ({:.1})",
+                                    midi_note_name(note.pitch_midi),
+                                    note.pitch_midi
+                                ));
+                            } else {
+                                ui.label("rest");
+                            }
+                            ui.end_row();
+                        }
+                    });
+
+                if notes.len() > NOTE_PREVIEW_LIMIT {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "… and {} more",
+                            format_count(notes.len() - NOTE_PREVIEW_LIMIT)
+                        ))
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                }
+            });
+    });
+}
+
+fn voiced_pitch_range(notes: &[game_service::Note]) -> Option<(f32, f32)> {
+    let mut voiced = notes
+        .iter()
+        .filter(|note| note.voiced)
+        .map(|note| note.pitch_midi);
+    let first = voiced.next()?;
+    Some(voiced.fold((first, first), |(lo, hi), pitch| {
+        (lo.min(pitch), hi.max(pitch))
+    }))
+}
+
+fn midi_note_name(midi: f32) -> String {
+    const NAMES: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    let rounded = midi.round() as i32;
+    let name = NAMES[rounded.rem_euclid(12) as usize];
+    let octave = rounded.div_euclid(12) - 1;
+    format!("{name}{octave}")
 }

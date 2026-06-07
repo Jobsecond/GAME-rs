@@ -72,6 +72,7 @@ impl Model {
             emit(CoreEvent::Status {
                 stage: "model_load",
                 message: "loading model".to_owned(),
+                chunk: None,
             });
             let started_at = Instant::now();
             let loaded = load_gguf(path)?;
@@ -102,6 +103,7 @@ impl Model {
             emit(CoreEvent::Status {
                 stage: "model_load",
                 message: "loading model".to_owned(),
+                chunk: None,
             });
             let started_at = Instant::now();
             let loaded = load_gguf(path)?;
@@ -276,6 +278,7 @@ impl<T: Tensor> ModelInner<T> {
             stage: "mel_extraction",
             elapsed: stage_start.elapsed(),
             detail: Some(format!("{seq_len} frames")),
+            chunk: None,
         });
 
         // --- Encoder ---
@@ -290,6 +293,7 @@ impl<T: Tensor> ModelInner<T> {
             stage: "encoder",
             elapsed: stage_start.elapsed(),
             detail: None,
+            chunk: None,
         });
 
         // --- D3PM segmenter loop ---
@@ -329,6 +333,7 @@ impl<T: Tensor> ModelInner<T> {
                 current: step_index + 1,
                 total: n_d3pm_steps,
                 detail: Some(format!("t={t:.3}")),
+                chunk: None,
             });
             let removal_probability = d3pm_time_schedule(t);
             boundaries = remove_mutable_boundaries(&boundaries, &known, removal_probability, rng)?;
@@ -357,6 +362,7 @@ impl<T: Tensor> ModelInner<T> {
             stage: "d3pm_loop",
             elapsed: stage_start.elapsed(),
             detail: Some(format!("{n_d3pm_steps} steps")),
+            chunk: None,
         });
 
         // --- Region assignment ---
@@ -372,11 +378,13 @@ impl<T: Tensor> ModelInner<T> {
                 stage: "region_assignment",
                 elapsed: stage_start.elapsed(),
                 detail: Some("0 regions, skipping estimator".to_owned()),
+                chunk: None,
             });
             emit(CoreEvent::Timing {
                 stage: "infer_total",
                 elapsed: infer_start.elapsed(),
                 detail: None,
+                chunk: None,
             });
             return Ok(result);
         }
@@ -384,6 +392,7 @@ impl<T: Tensor> ModelInner<T> {
             stage: "region_assignment",
             elapsed: stage_start.elapsed(),
             detail: Some(format!("{n_regions} regions")),
+            chunk: None,
         });
 
         // --- Estimator ---
@@ -399,6 +408,7 @@ impl<T: Tensor> ModelInner<T> {
             stage: "estimator",
             elapsed: stage_start.elapsed(),
             detail: None,
+            chunk: None,
         });
 
         // --- Pitch decode ---
@@ -435,12 +445,14 @@ impl<T: Tensor> ModelInner<T> {
             stage: "pitch_decode",
             elapsed: stage_start.elapsed(),
             detail: None,
+            chunk: None,
         });
 
         emit(CoreEvent::Timing {
             stage: "infer_total",
             elapsed: infer_start.elapsed(),
             detail: None,
+            chunk: None,
         });
 
         Ok(result)
