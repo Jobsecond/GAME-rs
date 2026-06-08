@@ -23,8 +23,7 @@ rust-version.workspace = true
 
 [features]
 default = []
-gpu = ["game-core/gpu", "game-service/gpu", "game-gui?/gpu"]
-gui = ["dep:game-gui"]
+gpu = ["game-core/gpu", "game-service/gpu"]
 cpu-attention-gemm-gemm = ["game-core/cpu-attention-gemm-gemm", "game-service/cpu-attention-gemm-gemm"]
 cpu-attention-gemm-matrixmultiply = ["game-core/cpu-attention-gemm-matrixmultiply", "game-service/cpu-attention-gemm-matrixmultiply"]
 
@@ -32,7 +31,6 @@ cpu-attention-gemm-matrixmultiply = ["game-core/cpu-attention-gemm-matrixmultipl
 clap = { version = "4", features = ["derive"] }
 game-core = { path = "crates/core", default-features = false }
 game-service = { path = "crates/service", default-features = false }
-game-gui = { path = "crates/gui", optional = true }
 console = "0.16"
 env_logger = "0.11"
 indicatif = "0.18"
@@ -43,8 +41,3 @@ serde_json = "1"
 lto = "thin"
 codegen-units = 1
 strip = true
-
-[[bin]]
-name = "game-gui"
-path = "src/gui.rs"
-required-features = ["gui"]

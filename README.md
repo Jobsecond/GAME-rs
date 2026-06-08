@@ -37,13 +37,28 @@ The binary is produced at `target/release/game-cli` (`game-cli.exe` on Windows).
 
 > **Note:** Always pass `--no-default-features` for CPU-only builds. The `default` feature set is empty, but omitting the flag can pull in unintended dependencies on some configurations.
 
-### Building with GPU support
+### Building the CLI with GPU support
 
 ```bash
 cargo build --release --features gpu
 ```
 
+This builds the CLI only. The root package does not have a `gui` feature, so `cargo build --release --features gpu,gui` is invalid.
+
 The GPU backend uses WGPU and will pick a Vulkan / Metal / DX12 / GL adapter at runtime.
+
+### Building the GUI
+
+The GUI is a separate package outside the root workspace:
+
+```bash
+cargo build --release --manifest-path crates/gui/Cargo.toml --target-dir target
+
+# Optional GPU-enabled GUI build
+cargo build --release --manifest-path crates/gui/Cargo.toml --features gpu --target-dir target
+```
+
+With `--target-dir target`, the GUI binary is produced at `target/release/game-gui` (`game-gui.exe` on Windows). Without that flag, Cargo uses the standalone GUI package's default `crates/gui/target/release/` directory.
 
 ---
 
@@ -137,7 +152,7 @@ For text formats, timing is in **seconds** and pitch is in **MIDI numbers** (60 
 
 ## Architecture
 
-The project is a Cargo workspace with four library crates plus the CLI binary:
+The root project is a Cargo workspace with four library crates plus the CLI binary. The GUI package is checked separately because it has heavier frontend dependencies and a higher Rust version requirement.
 
 | Crate | Path | Responsibility |
 |---|---|---|
@@ -146,6 +161,7 @@ The project is a Cargo workspace with four library crates plus the CLI binary:
 | `game-output` | `crates/output` | MIDI encoding (via `midly`), TXT/CSV output. |
 | `game-service` | `crates/service` | Orchestration: request → audio prep → chunk parallelism → inference → output. Public API: `extract_with_notifier()`. |
 | `game-cli` | `src/` | CLI with `inspect` and `extract` subcommands. |
+| `game-gui` | `crates/gui` | Standalone egui frontend package, outside the root workspace. |
 
 ### Inference pipeline
 

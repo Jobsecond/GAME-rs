@@ -67,9 +67,6 @@ struct Cli {
 enum Command {
     Inspect(InspectArgs),
     Extract(ExtractArgs),
-    /// Launch the graphical WAV-to-MIDI interface.
-    #[cfg(feature = "gui")]
-    Gui,
 }
 
 #[derive(Debug, Args)]
@@ -892,11 +889,6 @@ fn run() -> Result<()> {
             args.format,
         ),
         Command::Extract(args) => extract(args),
-        #[cfg(feature = "gui")]
-        Command::Gui => {
-            game_gui::run();
-            Ok(())
-        }
     }
 }
 
