@@ -29,8 +29,8 @@ Requires a **stable Rust toolchain (≥ 1.85, edition 2024)**. The repo pins thi
 git clone https://github.com/Jobsecond/GAME-rs.git
 cd GAME-rs
 
-# Build the CPU-only release binary (default)
-cargo build --release --no-default-features
+# Build the CPU-only CLI release binary (default)
+cargo build --release -p game-cli --no-default-features
 ```
 
 The binary is produced at `target/release/game-cli` (`game-cli.exe` on Windows).
@@ -40,10 +40,10 @@ The binary is produced at `target/release/game-cli` (`game-cli.exe` on Windows).
 ### Building the CLI with GPU support
 
 ```bash
-cargo build --release --features gpu
+cargo build --release -p game-cli --features gpu
 ```
 
-This builds the CLI only. The root package does not have a `gui` feature, so `cargo build --release --features gpu,gui` is invalid.
+This builds the CLI only. The root workspace does not have a `gui` feature, so `cargo build --release --features gpu,gui` is invalid.
 
 The GPU backend uses WGPU and will pick a Vulkan / Metal / DX12 / GL adapter at runtime.
 
@@ -52,13 +52,13 @@ The GPU backend uses WGPU and will pick a Vulkan / Metal / DX12 / GL adapter at 
 The GUI is a separate package outside the root workspace:
 
 ```bash
-cargo build --release --manifest-path crates/gui/Cargo.toml --target-dir target
+cargo build --release --manifest-path gui/Cargo.toml --target-dir target
 
 # Optional GPU-enabled GUI build
-cargo build --release --manifest-path crates/gui/Cargo.toml --features gpu --target-dir target
+cargo build --release --manifest-path gui/Cargo.toml --features gpu --target-dir target
 ```
 
-With `--target-dir target`, the GUI binary is produced at `target/release/game-gui` (`game-gui.exe` on Windows). Without that flag, Cargo uses the standalone GUI package's default `crates/gui/target/release/` directory.
+With `--target-dir target`, the GUI binary is produced at `target/release/game-gui` (`game-gui.exe` on Windows). Without that flag, Cargo uses the standalone GUI package's default `gui/target/release/` directory.
 
 ---
 
@@ -152,7 +152,7 @@ For text formats, timing is in **seconds** and pitch is in **MIDI numbers** (60 
 
 ## Architecture
 
-The root project is a Cargo workspace with four library crates plus the CLI binary. The GUI package is checked separately because it has heavier frontend dependencies and a higher Rust version requirement.
+The root project is a virtual Cargo workspace with four reusable library crates plus the CLI package. The GUI package is checked separately because it has heavier frontend dependencies and a higher Rust version requirement.
 
 | Crate | Path | Responsibility |
 |---|---|---|
@@ -160,8 +160,8 @@ The root project is a Cargo workspace with four library crates plus the CLI bina
 | `game-audio` | `crates/audio` | WAV decode, resample, mono mixdown, silence-based slicing, long-chunk splitting. |
 | `game-output` | `crates/output` | MIDI encoding (via `midly`), TXT/CSV output. |
 | `game-service` | `crates/service` | Orchestration: request → audio prep → chunk parallelism → inference → output. Public API: `extract_with_notifier()`. |
-| `game-cli` | `src/` | CLI with `inspect` and `extract` subcommands. |
-| `game-gui` | `crates/gui` | Standalone egui frontend package, outside the root workspace. |
+| `game-cli` | `cli/` | CLI with `inspect` and `extract` subcommands. |
+| `game-gui` | `gui/` | Standalone egui frontend package, outside the root workspace. |
 
 ### Inference pipeline
 
@@ -203,18 +203,17 @@ A `Tensor` trait with two implementations is dispatched at model-load time:
 
 ```bash
 # Fast compile check (no codegen)
-cargo check --no-default-features
+cargo check --workspace --no-default-features
 
-# Run the full test suite (--workspace is REQUIRED — the repo root is itself a
-# package, so a bare `cargo test` only runs the CLI's tests and skips the crates)
+# Run the full root-workspace test suite
 cargo test --workspace --no-default-features
 
 # Run a single test with output
 cargo test --workspace --no-default-features <test_name> -- --nocapture
 
 # GPU compile check / tests
-cargo check --features gpu
-cargo test --features gpu tensor::gpu -- --nocapture
+cargo check --workspace --features gpu
+cargo test --workspace --features gpu tensor::gpu -- --nocapture
 
 # Lint and format (advisory; matches CI)
 cargo fmt --all --check

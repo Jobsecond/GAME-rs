@@ -17,8 +17,8 @@ cpu-attention-gemm-matrixmultiply = ["game-core/cpu-attention-gemm-matrixmultipl
 crossbeam = "0.8"
 eframe = { version = "0.34", default-features = false, features = ["glow", "default_fonts", "persistence"] }
 egui = "0.34"
-game-core = { path = "../core", default-features = false }
-game-service = { path = "../service", default-features = false }
+game-core = { path = "../crates/core", default-features = false }
+game-service = { path = "../crates/service", default-features = false }
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 
